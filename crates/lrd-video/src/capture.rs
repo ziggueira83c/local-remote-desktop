@@ -26,21 +26,23 @@ pub struct RawFrame {
     pub rgba: Vec<u8>,
 }
 
+fn describe(m: &xcap::Monitor) -> Result<Display> {
+    let err = |e: xcap::XCapError| anyhow!("lendo dados do monitor: {e}");
+    Ok(Display {
+        id: m.id().map_err(err)?,
+        name: m.name().unwrap_or_default(),
+        x: m.x().map_err(err)?,
+        y: m.y().map_err(err)?,
+        width: m.width().map_err(err)?,
+        height: m.height().map_err(err)?,
+        scale_factor: m.scale_factor().unwrap_or(1.0),
+        primary: m.is_primary().unwrap_or(false),
+    })
+}
+
 pub fn list_displays() -> Result<Vec<Display>> {
     let monitors = xcap::Monitor::all().map_err(|e| anyhow!("listando monitores: {e}"))?;
-    let mut out: Vec<Display> = monitors
-        .iter()
-        .map(|m| Display {
-            id: m.id(),
-            name: m.name().to_string(),
-            x: m.x(),
-            y: m.y(),
-            width: m.width(),
-            height: m.height(),
-            scale_factor: m.scale_factor(),
-            primary: m.is_primary(),
-        })
-        .collect();
+    let mut out: Vec<Display> = monitors.iter().filter_map(|m| describe(m).ok()).collect();
     out.sort_by_key(|d| (!d.primary, d.x, d.y));
     Ok(out)
 }
@@ -55,22 +57,16 @@ impl Capturer {
     /// Abre o monitor `id`; se não existir, usa o principal.
     pub fn open(id: Option<u32>) -> Result<Self> {
         let monitors = xcap::Monitor::all().map_err(|e| anyhow!("listando monitores: {e}"))?;
+        let mut described: Vec<(xcap::Monitor, Display)> = monitors
+            .into_iter()
+            .filter_map(|m| describe(&m).ok().map(|d| (m, d)))
+            .collect();
         let chosen = id
-            .and_then(|id| monitors.iter().position(|m| m.id() == id))
-            .or_else(|| monitors.iter().position(|m| m.is_primary()))
-            .or(if monitors.is_empty() { None } else { Some(0) })
+            .and_then(|id| described.iter().position(|(_, d)| d.id == id))
+            .or_else(|| described.iter().position(|(_, d)| d.primary))
+            .or(if described.is_empty() { None } else { Some(0) })
             .ok_or_else(|| anyhow!("nenhum monitor encontrado"))?;
-        let monitor = monitors.into_iter().nth(chosen).expect("índice válido");
-        let display = Display {
-            id: monitor.id(),
-            name: monitor.name().to_string(),
-            x: monitor.x(),
-            y: monitor.y(),
-            width: monitor.width(),
-            height: monitor.height(),
-            scale_factor: monitor.scale_factor(),
-            primary: monitor.is_primary(),
-        };
+        let (monitor, display) = described.swap_remove(chosen);
         Ok(Capturer { monitor, display })
     }
 
