@@ -1,0 +1,60 @@
+name: Compilar instaladores
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: mac-apple-silicon
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - name: mac-intel
+            os: macos-latest
+            target: x86_64-apple-darwin
+          - name: windows
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Testes do núcleo
+        if: matrix.name != 'mac-intel'
+        run: cargo test --workspace --exclude lrd-desktop
+
+      - name: Dependências da interface
+        working-directory: apps/desktop
+        run: npm install --no-fund --no-audit
+
+      - name: Compilar e empacotar
+        working-directory: apps/desktop
+        run: npm run tauri build -- --target ${{ matrix.target }}
+
+      - name: Publicar instaladores
+        uses: actions/upload-artifact@v4
+        with:
+          name: LRD-${{ matrix.name }}
+          if-no-files-found: error
+          path: |
+            target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            target/${{ matrix.target }}/release/bundle/nsis/*.exe
+            target/${{ matrix.target }}/release/bundle/msi/*.msi

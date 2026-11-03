@@ -1,0 +1,10 @@
+[package]
+name = "lrd-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+prost.workspace = true
+tokio.workspace = true
+serde.workspace = true

@@ -1,0 +1,77 @@
+// Contrato de referência do protocolo LRD v1.
+// O código Rust declara as mesmas mensagens com `prost` derive (crates/lrd-protocol/src/messages.rs),
+// então não é preciso `protoc` para compilar. Mantenha os dois em sincronia.
+syntax = "proto3";
+package lrd.v1;
+
+message Envelope {
+  uint32 protocol_version = 1;
+  string session_id = 2;
+  uint64 sequence = 3;
+  oneof payload {
+    Hello hello = 10;
+    ConnectRequest connect_request = 11;
+    ConnectResponse connect_response = 12;
+    InputEvent input_event = 13;
+    PermissionUpdate permission_update = 14;
+    SessionClose session_close = 15;
+    SelectDisplay select_display = 16;
+    SetQuality set_quality = 17;
+    RequestKeyframe request_keyframe = 18;
+  }
+}
+
+message Hello {
+  string device_id = 1;
+  string device_name = 2;
+  uint32 min_version = 3;
+  uint32 max_version = 4;
+  repeated string codecs = 5;   // "jpeg-tiles"
+  string platform = 6;          // "windows" | "macos" | "other"
+}
+
+message ConnectRequest {
+  string requested_profile = 1; // "view_only" | "remote_control" | "full_control"
+  string requested_display = 2;
+  bool control_requested = 3;
+}
+
+message DisplayInfo {
+  string id = 1;
+  string name = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+  bool primary = 5;
+}
+
+message ConnectResponse {
+  bool approved = 1;
+  string reason_code = 2;
+  repeated string granted_permissions = 3;
+  repeated DisplayInfo displays = 4;
+  string active_display = 5;
+}
+
+message InputEvent {
+  oneof event {
+    PointerMove pointer_move = 1;
+    MouseButton mouse_button = 2;
+    KeyEvent key_event = 3;
+    MouseScroll mouse_scroll = 4;
+  }
+}
+
+// x e y normalizados de 0 a 65535 dentro do monitor display_id.
+message PointerMove { string display_id = 1; uint32 x = 2; uint32 y = 3; }
+// 0 = esquerdo, 1 = meio, 2 = direito
+message MouseButton { uint32 button = 1; bool pressed = 2; }
+// USB HID usage, página 0x07 (tecla física)
+message KeyEvent { uint32 hid_usage = 1; bool pressed = 2; }
+// cliques de roda; positivo = para baixo / direita
+message MouseScroll { sint32 delta_x = 1; sint32 delta_y = 2; }
+
+message PermissionUpdate { repeated string granted_permissions = 1; }
+message SessionClose { string reason_code = 1; }
+message SelectDisplay { string display_id = 1; }
+message SetQuality { string profile = 1; uint32 max_fps = 2; }
+message RequestKeyframe {}

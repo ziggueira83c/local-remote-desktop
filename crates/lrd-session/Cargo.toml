@@ -1,0 +1,22 @@
+[package]
+name = "lrd-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+gethostname.workspace = true
+quinn.workspace = true
+lrd-protocol.workspace = true
+lrd-security.workspace = true
+lrd-transport.workspace = true
+lrd-discovery.workspace = true
+lrd-storage.workspace = true
+lrd-video.workspace = true
+lrd-input.workspace = true

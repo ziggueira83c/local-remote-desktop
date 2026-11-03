@@ -1,0 +1,13 @@
+[package]
+name = "lrd-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+tracing.workspace = true
+lrd-protocol.workspace = true
+lrd-security.workspace = true
