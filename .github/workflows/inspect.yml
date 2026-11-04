@@ -1,0 +1,30 @@
+name: inspect
+on:
+  push:
+    branches: [inspect]
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: fetch
+        working-directory: tools/inspect
+        run: cargo generate-lockfile && cargo fetch && grep -A1 -E 'name = "(openh264|xcap|cpal|screencapturekit|objc2.*)"' Cargo.lock | head -60
+      - name: dump
+        run: |
+          R=$(ls -d ~/.cargo/registry/src/*/ | head -1)
+          show() { for f in $R$1; do echo "################ $f"; cat "$f"; done; }
+          show "openh264-0.9*/src/encoder.rs"
+          show "openh264-0.9*/src/formats/rgb2yuv.rs"
+          show "openh264-0.9*/src/formats/mod.rs"
+          ls $R | grep -E "openh264|xcap|cpal|screencapturekit"
+          show "xcap-0.9*/src/windows/*video_recorder*.rs"
+          show "xcap-0.9*/src/macos/impl_video_recorder.rs"
+          show "xcap-0.9*/src/video_recorder.rs"
+          ls -R ${R}screencapturekit-*/src | head -150
+          show "screencapturekit-*/examples/03_audio_capture.rs"
+          show "screencapturekit-*/src/cm/sample_buffer*.rs"
+          show "screencapturekit-*/src/cm/mod.rs"
+          show "screencapturekit-*/src/cm/audio*.rs"
+          show "screencapturekit-*/src/stream/configuration/audio.rs"
+          grep -rn "pub fn " ${R}screencapturekit-*/src/cm/ | head -120
