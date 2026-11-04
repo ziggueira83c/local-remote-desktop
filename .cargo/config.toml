@@ -1,0 +1,4 @@
+# O ScreenCaptureKit (crate screencapturekit) usa uma ponte em Swift. Os executáveis precisam
+# saber onde o macOS guarda o runtime Swift do sistema (libswift_Concurrency etc.).
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/lib/swift"]
