@@ -4,7 +4,7 @@ import { api, type AppSettings } from "../lib/api";
 import { codeToHid } from "../lib/keymap";
 import { Enhancer } from "../lib/enhance";
 import type { MediaMode, RtcStats } from "../lib/media";
-import type { CursorState } from "../lib/renderer";
+import { CURSOR_CSS, type CursorState } from "../lib/renderer";
 import { currentEngine } from "../lib/session";
 import { useStore } from "../store";
 
@@ -35,7 +35,9 @@ export function RemoteSessionPage() {
   const viewportRef = useRef<HTMLDivElement>(null);
   const [frame, setFrame] = useState({ w: 0, h: 0 });
   const [cssSize, setCssSize] = useState({ w: 0, h: 0 });
-  const [cursor, setCursor] = useState<CursorState>({ visible: false, x: 0, y: 0 });
+  const [cursor, setCursor] = useState<CursorState>({ visible: true, x: 0, y: 0, kind: 0 });
+  const hostStats = useStore((s) => s.hostStats);
+  const [showDiag, setShowDiag] = useState(false);
   const [mode, setMode] = useState<ScaleMode>("fit");
   const [quality, setQuality] = useState<AppSettings["qualityProfile"]>("balanced");
   const [fps, setFps] = useState(30);
@@ -174,7 +176,8 @@ export function RemoteSessionPage() {
   const pressedKeys = useRef(new Set<number>());
   const pressedButtons = useRef(new Set<number>());
   const pendingMove = useRef<{ x: number; y: number } | null>(null);
-  const rafId = useRef<number | null>(null);
+  const moveTimer = useRef<number | null>(null);
+  const lastMoveSent = useRef(0);
   const wheelAcc = useRef({ x: 0, y: 0 });
   const displayRef = useRef(outbound.activeDisplay);
   displayRef.current = outbound.activeDisplay;
@@ -202,17 +205,30 @@ export function RemoteSessionPage() {
     return { x: Math.round(nx * 65535), y: Math.round(ny * 65535) };
   };
 
+  // Movimento do mouse enviado na hora (até ~250 vezes/s), sem esperar o próximo quadro da tela.
+  const MOVE_INTERVAL_MS = 4;
   const flushMove = () => {
-    rafId.current = null;
+    moveTimer.current = null;
     const m = pendingMove.current;
     pendingMove.current = null;
-    if (m) api.sendInput({ type: "pointer", displayId: displayRef.current, ...m }).catch(() => {});
+    if (!m) return;
+    lastMoveSent.current = performance.now();
+    api.sendInput({ type: "pointer", displayId: displayRef.current, ...m }).catch(() => {});
   };
 
   const onPointerMove = (e: React.PointerEvent) => {
     if (!outbound.permissions.controlMouse) return;
     pendingMove.current = toNormalized(e.clientX, e.clientY);
-    if (rafId.current === null) rafId.current = requestAnimationFrame(flushMove);
+    const since = performance.now() - lastMoveSent.current;
+    if (since >= MOVE_INTERVAL_MS) {
+      if (moveTimer.current !== null) {
+        clearTimeout(moveTimer.current);
+        moveTimer.current = null;
+      }
+      flushMove();
+    } else if (moveTimer.current === null) {
+      moveTimer.current = window.setTimeout(flushMove, MOVE_INTERVAL_MS - since);
+    }
   };
 
   const onPointerDown = (e: React.PointerEvent) => {
@@ -400,6 +416,13 @@ export function RemoteSessionPage() {
                   metrics ? `${metrics.fps.toFixed(0)} fps · ${(metrics.kbps / 1000).toFixed(1)} Mbps · ${metrics.rttMs.toFixed(0)} ms` : "—"
                 }`}
           </span>
+          <button
+            className={showDiag ? "btn btn--small btn--on" : "btn btn--small"}
+            onClick={() => setShowDiag(!showDiag)}
+            title="Diagnóstico de desempenho"
+          >
+            📊
+          </button>
           <button className="btn btn--small btn--danger" onClick={() => api.disconnect()}>
             Desconectar
           </button>
@@ -410,7 +433,16 @@ export function RemoteSessionPage() {
         <div
           ref={stageRef}
           className={focused ? "viewport__stage stage--focused" : "viewport__stage"}
-          style={{ width: cssSize.w || undefined, height: cssSize.h || undefined, cursor: "default" }}
+          style={{
+            width: cssSize.w || undefined,
+            height: cssSize.h || undefined,
+            // Cursor local com o formato do cursor remoto: responde na hora, sem esperar a imagem.
+            cursor: outbound.permissions.controlMouse
+              ? cursor.visible
+                ? CURSOR_CSS[cursor.kind] ?? "default"
+                : "none"
+              : "default",
+          }}
           tabIndex={0}
           onFocus={() => setFocused(true)}
           onBlur={() => {
@@ -472,6 +504,37 @@ export function RemoteSessionPage() {
           )}
         </div>
       </div>
+      {showDiag && (
+        <div className="diag mono small">
+          <div className="diag__title">Diagnóstico</div>
+          <div>Transporte: {hostStats?.transport === "webrtc" ? "WebRTC" : hostStats?.transport === "quic" ? "QUIC (reserva)" : "negociando"}</div>
+          <div>Captura: {hostStats ? `${hostStats.captureSource} · ${hostStats.captureFps.toFixed(0)} quadros/s` : "—"}</div>
+          <div>Codificador: {hostStats?.encoder ?? "—"}</div>
+          <div>
+            Codificação: {hostStats ? `${hostStats.encodeFps.toFixed(0)} fps · ${hostStats.encodeMs.toFixed(1)} ms/quadro` : "—"}
+          </div>
+          <div>Resolução enviada: {hostStats ? `${hostStats.width}×${hostStats.height}` : "—"}</div>
+          <div>Taxa alvo: {hostStats ? `${(hostStats.bitrateKbps / 1000).toFixed(1)} Mbps` : "—"}</div>
+          {rtc && (
+            <>
+              <div>Recebido: {`${rtc.fps.toFixed(0)} fps · ${(rtc.kbps / 1000).toFixed(1)} Mbps`}</div>
+              <div>
+                Rede: {`${(rtc.rttMs ?? 0).toFixed(0)} ms ida e volta · perda ${rtc.lossPct.toFixed(1)}%`}
+                {rtc.jitterMs != null ? ` · buffer ${rtc.jitterMs.toFixed(0)} ms` : ""}
+              </div>
+            </>
+          )}
+          <div className="diag__hint">
+            {hostStats && hostStats.captureFps < 20 && hostStats.captureSource === "cópia"
+              ? "A captura está no modo por cópia (lento). A captura contínua não iniciou nesse computador."
+              : hostStats && hostStats.encodeMs > 25
+                ? "A codificação está lenta: o codificador de hardware não está ativo."
+                : rtc && rtc.lossPct > 2
+                  ? "Há perda de pacotes na rede: prefira cabo ou Wi‑Fi 5 GHz."
+                  : ""}
+          </div>
+        </div>
+      )}
       {canControl && !focused && frame.w > 0 && (
         <div className="hint">Clique na tela remota para enviar mouse e teclado.</div>
       )}

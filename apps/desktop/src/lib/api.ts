@@ -65,6 +65,7 @@ export interface LocalDeviceInfo {
   screenPermission: boolean;
   accessibilityPermission: boolean;
   inboundSession: string | null;
+  hasAccessPassword: boolean;
 }
 
 export interface DiscoveredDevice {
@@ -88,6 +89,7 @@ export interface DeviceRecord {
   favorite: boolean;
   lastSeenAt: string | null;
   createdAt: string;
+  savedPassword: boolean;
 }
 
 export interface SessionRecord {
@@ -123,6 +125,7 @@ export interface AppSettings {
   receiveAudio: boolean;
   enhanceImage: boolean;
   enhanceStrength: number;
+  passwordAccess: boolean;
 }
 
 export type NodeEvent =
@@ -164,6 +167,7 @@ export type NodeEvent =
     }
   | { type: "outboundEnded"; sessionId: string; reason: string }
   | { type: "webRtcOffer"; sessionId: string; sdp: string }
+  | ({ type: "hostStats"; sessionId: string } & HostStats)
   | { type: "permissionsChanged"; sessionId: string; permissions: Permissions }
   | { type: "metrics"; sessionId: string; fps: number; kbps: number; rttMs: number }
   | { type: "notice"; level: "info" | "warning" | "error"; message: string };
@@ -181,6 +185,20 @@ export interface ConnectParams {
   profile: Profile;
   codecs?: string[];
   audio?: boolean;
+  password?: string;
+  rememberPassword?: boolean;
+}
+
+export interface HostStats {
+  captureSource: string;
+  encoder: string;
+  width: number;
+  height: number;
+  captureFps: number;
+  encodeFps: number;
+  encodeMs: number;
+  bitrateKbps: number;
+  transport: string;
 }
 
 export const api = {
@@ -198,6 +216,8 @@ export const api = {
   requestKeyframe: () => invoke<void>("request_keyframe"),
   setAudio: (enabled: boolean) => invoke<void>("set_audio", { enabled }),
   webrtcAnswer: (sdp: string) => invoke<void>("webrtc_answer", { sdp }),
+  setAccessPassword: (password: string | null) => invoke<void>("set_access_password", { password }),
+  forgetSavedPassword: (deviceId: string) => invoke<void>("forget_saved_password", { deviceId }),
   approve: (sessionId: string, permissions: Permissions) => invoke<void>("approve_session", { sessionId, permissions }),
   reject: (sessionId: string) => invoke<void>("reject_session", { sessionId }),
   endInbound: () => invoke<void>("end_inbound_session"),

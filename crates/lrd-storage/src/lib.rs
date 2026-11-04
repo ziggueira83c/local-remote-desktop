@@ -26,6 +26,9 @@ pub struct DeviceRecord {
     pub favorite: bool,
     pub last_seen_at: Option<String>,
     pub created_at: String,
+    /// Há uma senha deste dispositivo lembrada no cofre do sistema (preenchido pela sessão).
+    #[serde(default)]
+    pub saved_password: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,6 +295,7 @@ fn row_to_device(r: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceRecord> {
         favorite: fav != 0,
         last_seen_at: r.get(8)?,
         created_at: r.get(9)?,
+        saved_password: false,
     })
 }
 

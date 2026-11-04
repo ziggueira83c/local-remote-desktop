@@ -80,6 +80,16 @@ pub async fn set_video_quality(state: State<'_, AppState>, profile: String, max_
 }
 
 #[tauri::command]
+pub async fn set_access_password(state: State<'_, AppState>, password: Option<String>) -> CmdResult<()> {
+    state.node.set_access_password(password).map_err(err)
+}
+
+#[tauri::command]
+pub async fn forget_saved_password(state: State<'_, AppState>, device_id: String) -> CmdResult<()> {
+    state.node.forget_saved_password(&device_id).map_err(err)
+}
+
+#[tauri::command]
 pub async fn webrtc_answer(state: State<'_, AppState>, sdp: String) -> CmdResult<()> {
     state.node.webrtc_answer(sdp).map_err(err)
 }

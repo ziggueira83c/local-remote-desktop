@@ -170,6 +170,65 @@ pub fn cursor_position() -> Option<(i32, i32)> {
     }
 }
 
+/// Formato e visibilidade do cursor (ver `lrd_protocol::video::cursor_kind`).
+/// No Windows identifica os cursores padrão do sistema; nos demais, seta padrão.
+pub fn cursor_shape() -> (u8, bool) {
+    #[cfg(target_os = "windows")]
+    {
+        win_cursor::shape()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        (0, true)
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod win_cursor {
+    use std::sync::OnceLock;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetCursorInfo, LoadCursorW, CURSORINFO, CURSOR_SHOWING, IDC_APPSTARTING, IDC_ARROW, IDC_CROSS, IDC_HAND,
+        IDC_HELP, IDC_IBEAM, IDC_NO, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IDC_WAIT,
+    };
+
+    fn table() -> &'static Vec<(usize, u8)> {
+        static T: OnceLock<Vec<(usize, u8)>> = OnceLock::new();
+        T.get_or_init(|| {
+            let ids = [
+                (IDC_ARROW, 0u8),
+                (IDC_IBEAM, 1),
+                (IDC_HAND, 2),
+                (IDC_WAIT, 3),
+                (IDC_APPSTARTING, 4),
+                (IDC_CROSS, 5),
+                (IDC_SIZEWE, 6),
+                (IDC_SIZENS, 7),
+                (IDC_SIZENWSE, 8),
+                (IDC_SIZENESW, 9),
+                (IDC_SIZEALL, 10),
+                (IDC_NO, 11),
+                (IDC_HELP, 12),
+            ];
+            ids.iter()
+                .map(|(id, kind)| (unsafe { LoadCursorW(std::ptr::null_mut(), *id) } as usize, *kind))
+                .filter(|(h, _)| *h != 0)
+                .collect()
+        })
+    }
+
+    pub fn shape() -> (u8, bool) {
+        let mut ci: CURSORINFO = unsafe { std::mem::zeroed() };
+        ci.cbSize = std::mem::size_of::<CURSORINFO>() as u32;
+        if unsafe { GetCursorInfo(&mut ci) } == 0 {
+            return (0, true);
+        }
+        let visible = ci.flags & CURSOR_SHOWING != 0;
+        let handle = ci.hCursor as usize;
+        let kind = table().iter().find(|(h, _)| *h == handle).map(|(_, k)| *k).unwrap_or(0);
+        (kind, visible)
+    }
+}
+
 /// macOS: o app tem permissão de Acessibilidade (necessária para controlar mouse/teclado)?
 pub fn has_accessibility_permission() -> bool {
     #[cfg(target_os = "macos")]

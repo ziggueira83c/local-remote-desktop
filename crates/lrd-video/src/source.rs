@@ -67,15 +67,6 @@ impl Source {
         }
     }
 
-    /// O cursor já vem desenhado na imagem?
-    pub fn draws_cursor(&self) -> bool {
-        match self {
-            #[cfg(target_os = "macos")]
-            Source::Sck(_) => true,
-            _ => false,
-        }
-    }
-
     /// O áudio vem desta fonte (macOS)?
     pub fn provides_audio(&self) -> bool {
         match self {

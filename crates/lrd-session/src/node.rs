@@ -16,6 +16,8 @@ use crate::viewer::OutboundHandle;
 use crate::{platform_name, AppSettings, EventSink, NodeConfig, NodeEvent};
 
 const SETTINGS_KEY: &str = "app";
+const PASSWORD_KEY: &str = "access_password";
+const PEER_KEYRING_SERVICE: &str = "dev.lrd.localremotedesktop.peer";
 
 pub(crate) enum Decision {
     Approve(Permissions),
@@ -52,6 +54,7 @@ pub struct LocalDeviceInfo {
     pub screen_permission: bool,
     pub accessibility_permission: bool,
     pub inbound_session: Option<String>,
+    pub has_access_password: bool,
 }
 
 pub struct Node {
@@ -220,6 +223,7 @@ impl Node {
             screen_permission: lrd_video::permissions::has_screen_capture_permission(),
             accessibility_permission: lrd_input::has_accessibility_permission(),
             inbound_session: self.inbound.lock().unwrap().as_ref().map(|h| h.session_id.clone()),
+            has_access_password: self.password_hash().is_some(),
         }
     }
 
@@ -231,8 +235,77 @@ impl Node {
         let mut list = self.storage.list_devices()?;
         for d in &mut list {
             d.fingerprint = format_fingerprint(&d.fingerprint);
+            d.saved_password = self.has_saved_password(&d.id);
         }
         Ok(list)
+    }
+
+    // ---------- senha de acesso (este computador) ----------
+
+    pub(crate) fn password_hash(&self) -> Option<String> {
+        self.storage
+            .get_setting::<String>(PASSWORD_KEY)
+            .ok()
+            .flatten()
+            .filter(|h| !h.is_empty())
+    }
+
+    /// Define (ou remove, com `None`) a senha de acesso deste computador.
+    pub fn set_access_password(&self, password: Option<String>) -> Result<()> {
+        match password {
+            Some(p) => {
+                if p.chars().count() < 6 {
+                    anyhow::bail!("A senha precisa ter pelo menos 6 caracteres.");
+                }
+                let hash = lrd_security::hash_password(&p).ok_or_else(|| anyhow::anyhow!("falha ao gerar o hash"))?;
+                self.storage.put_setting(PASSWORD_KEY, &hash)?;
+                self.storage.audit(None, "access_password_set", serde_json::json!({}));
+            }
+            None => {
+                self.storage.put_setting(PASSWORD_KEY, &String::new())?;
+                let mut s = self.settings();
+                s.password_access = false;
+                self.storage.put_setting(SETTINGS_KEY, &s)?;
+                *self.settings.write().unwrap() = s;
+                self.storage.audit(None, "access_password_removed", serde_json::json!({}));
+            }
+        }
+        Ok(())
+    }
+
+    // ---------- senhas lembradas (outros computadores) ----------
+
+    fn saved_flag_key(device_id: &str) -> String {
+        format!("saved_pw:{device_id}")
+    }
+
+    pub(crate) fn has_saved_password(&self, device_id: &str) -> bool {
+        self.storage.get_setting::<bool>(&Self::saved_flag_key(device_id)).ok().flatten().unwrap_or(false)
+    }
+
+    /// Senha guardada no cofre do sistema (Keychain / Credential Manager).
+    pub(crate) fn load_saved_password(&self, device_id: &str) -> Option<String> {
+        if !self.has_saved_password(device_id) {
+            return None;
+        }
+        keyring::Entry::new(PEER_KEYRING_SERVICE, device_id).and_then(|e| e.get_password()).ok()
+    }
+
+    pub(crate) fn save_password(&self, device_id: &str, password: &str) {
+        match keyring::Entry::new(PEER_KEYRING_SERVICE, device_id).and_then(|e| e.set_password(password)) {
+            Ok(()) => {
+                let _ = self.storage.put_setting(&Self::saved_flag_key(device_id), &true);
+            }
+            Err(e) => tracing::warn!("não foi possível guardar a senha no cofre do sistema: {e}"),
+        }
+    }
+
+    pub fn forget_saved_password(&self, device_id: &str) -> Result<()> {
+        if let Ok(e) = keyring::Entry::new(PEER_KEYRING_SERVICE, device_id) {
+            let _ = e.delete_credential();
+        }
+        self.storage.put_setting(&Self::saved_flag_key(device_id), &false)?;
+        Ok(())
     }
 
     pub fn set_favorite(&self, device_id: &str, favorite: bool) -> Result<()> {

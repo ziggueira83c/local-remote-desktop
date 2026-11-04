@@ -148,29 +148,59 @@ impl Node {
         self.storage.insert_session(&session_id, "inbound", "awaiting_approval", Some(&device_name), Some(&address))?;
         let requested = Profile::parse(&req.requested_profile).unwrap_or(Profile::ViewOnly);
 
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(session_id.clone(), tx);
-        self.events.emit(NodeEvent::IncomingRequest {
-            session_id: session_id.clone(),
-            device_id: hello.device_id.clone(),
-            device_name: device_name.clone(),
-            platform: hello.platform.clone(),
-            address: address.clone(),
-            fingerprint: format_fingerprint(&peer_fp),
-            sas: sas_code(&self.identity.fingerprint, &peer_fp),
-            known_device: known.is_some(),
-            requested_profile: requested,
-        });
+        // Acesso com senha (opcional): senha correta = aprovado sem perguntar.
+        let mut password_login = false;
+        if !req.password.is_empty() && self.settings().password_access {
+            if let Some(hash) = self.password_hash() {
+                let pw = req.password.clone();
+                let ok = tokio::task::spawn_blocking(move || lrd_security::verify_password(&pw, &hash))
+                    .await
+                    .unwrap_or(false);
+                if !ok {
+                    self.rate.lock().unwrap().record_failure(remote.ip());
+                    self.storage.audit(
+                        Some(&session_id),
+                        "wrong_password",
+                        serde_json::json!({ "device": device_name, "ip": address }),
+                    );
+                    self.storage.session_ended(&session_id, "failed", Some(reason::WRONG_PASSWORD))?;
+                    self.notice("warning", &format!("Tentativa de acesso com senha incorreta de \"{device_name}\" ({address})."));
+                    return reject(&conn, &mut send, &session_id, reason::WRONG_PASSWORD).await;
+                }
+                password_login = true;
+            }
+        }
 
-        let outcome = tokio::select! {
-            r = timeout(APPROVAL_TIMEOUT, rx) => match r {
-                Ok(Ok(d)) => Outcome::Decided(d),
-                Ok(Err(_)) => Outcome::Decided(Decision::Reject),
-                Err(_) => Outcome::Timeout,
-            },
-            _ = conn.closed() => Outcome::PeerGone,
+        let outcome = if password_login {
+            self.storage.audit(Some(&session_id), "password_login", serde_json::json!({ "device": device_name }));
+            self.notice("info", &format!("\"{device_name}\" entrou com a senha de acesso."));
+            Outcome::Decided(Decision::Approve(Permissions::for_profile(Profile::RemoteControl)))
+        } else {
+            let (tx, rx) = oneshot::channel();
+            self.pending.lock().unwrap().insert(session_id.clone(), tx);
+            self.events.emit(NodeEvent::IncomingRequest {
+                session_id: session_id.clone(),
+                device_id: hello.device_id.clone(),
+                device_name: device_name.clone(),
+                platform: hello.platform.clone(),
+                address: address.clone(),
+                fingerprint: format_fingerprint(&peer_fp),
+                sas: sas_code(&self.identity.fingerprint, &peer_fp),
+                known_device: known.is_some(),
+                requested_profile: requested,
+            });
+
+            let o = tokio::select! {
+                r = timeout(APPROVAL_TIMEOUT, rx) => match r {
+                    Ok(Ok(d)) => Outcome::Decided(d),
+                    Ok(Err(_)) => Outcome::Decided(Decision::Reject),
+                    Err(_) => Outcome::Timeout,
+                },
+                _ = conn.closed() => Outcome::PeerGone,
+            };
+            self.pending.lock().unwrap().remove(&session_id);
+            o
         };
-        self.pending.lock().unwrap().remove(&session_id);
 
         let granted = match outcome {
             Outcome::PeerGone => {
@@ -307,7 +337,12 @@ impl Node {
                 display_id: Some(active.id),
                 quality,
                 codec: media.codec,
-                cursor: Some(Box::new(lrd_input::cursor_position)),
+                cursor: Some(Box::new(|| {
+                    lrd_input::cursor_position().map(|(x, y)| {
+                        let (kind, visible) = lrd_input::cursor_shape();
+                        lrd_video::CursorInfo { x, y, kind, visible }
+                    })
+                })),
                 audio: if media.audio_allowed { Some(audio_tx) } else { None },
                 audio_enabled: media.audio_on,
             },
@@ -490,6 +525,42 @@ impl Node {
         let conn_c = conn.clone();
         let perms_c = perms.clone();
         let geometry_c = geometry.clone();
+        // Diagnóstico para o controlador, a cada segundo.
+        let stats_src = capture.stats.clone();
+        let route_s = route.clone();
+        let ctrl_s = ctrl_tx.clone();
+        let sid_s = session_id.clone();
+        let stats_task = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            let mut prev = lrd_video::PipelineStats::default();
+            loop {
+                tick.tick().await;
+                let cur = stats_src.lock().map(|s| s.clone()).unwrap_or_default();
+                let encoded = cur.encoded.saturating_sub(prev.encoded);
+                let encode_us = cur.encode_us.saturating_sub(prev.encode_us);
+                let transport = match &*route_s.lock().unwrap() {
+                    Route::Pending => "negociando",
+                    Route::Rtc(_) => "webrtc",
+                    Route::Quic => "quic",
+                };
+                let msg = lrd_protocol::HostStats {
+                    capture_source: cur.source.clone(),
+                    encoder: cur.encoder.clone(),
+                    width: cur.width,
+                    height: cur.height,
+                    capture_fps: cur.captured.saturating_sub(prev.captured) as f32,
+                    encode_fps: encoded as f32,
+                    encode_ms: if encoded > 0 { encode_us as f32 / encoded as f32 / 1000.0 } else { 0.0 },
+                    bitrate_kbps: cur.bitrate_bps / 1000,
+                    transport: transport.into(),
+                };
+                prev = cur;
+                if ctrl_s.send(Envelope::new(&sid_s, 0, Payload::HostStats(msg))).await.is_err() {
+                    break;
+                }
+            }
+        });
+
         let control = tokio::spawn(async move {
             loop {
                 let env = match read_envelope(&mut recv).await {
@@ -533,6 +604,7 @@ impl Node {
         video.abort();
         audio_task.abort();
         rtc_task.abort();
+        stats_task.abort();
         if let Route::Rtc(rtc) = route.lock().unwrap().clone() {
             tokio::spawn(async move { rtc.close().await });
         }

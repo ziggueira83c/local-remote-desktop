@@ -11,7 +11,7 @@ pub struct Envelope {
     pub session_id: String,
     #[prost(uint64, tag = "3")]
     pub sequence: u64,
-    #[prost(oneof = "envelope::Payload", tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20")]
+    #[prost(oneof = "envelope::Payload", tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21")]
     pub payload: Option<envelope::Payload>,
 }
 
@@ -40,6 +40,8 @@ pub mod envelope {
         SetAudio(super::SetAudio),
         #[prost(message, tag = "20")]
         WebRtcSignal(super::WebRtcSignal),
+        #[prost(message, tag = "21")]
+        HostStats(super::HostStats),
     }
 }
 
@@ -72,6 +74,9 @@ pub struct ConnectRequest {
     /// O controlador quer receber o áudio do sistema.
     #[prost(bool, tag = "4")]
     pub want_audio: bool,
+    /// Senha de acesso (opcional). Trafega só dentro do TLS; o host guarda apenas o hash.
+    #[prost(string, tag = "5")]
+    pub password: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -206,6 +211,30 @@ pub struct WebRtcSignal {
     pub kind: String,
     #[prost(string, tag = "2")]
     pub sdp: String,
+}
+
+/// Diagnóstico do host, enviado a cada segundo.
+#[derive(Clone, PartialEq, Message)]
+pub struct HostStats {
+    #[prost(string, tag = "1")]
+    pub capture_source: String,
+    #[prost(string, tag = "2")]
+    pub encoder: String,
+    #[prost(uint32, tag = "3")]
+    pub width: u32,
+    #[prost(uint32, tag = "4")]
+    pub height: u32,
+    #[prost(float, tag = "5")]
+    pub capture_fps: f32,
+    #[prost(float, tag = "6")]
+    pub encode_fps: f32,
+    #[prost(float, tag = "7")]
+    pub encode_ms: f32,
+    #[prost(uint32, tag = "8")]
+    pub bitrate_kbps: u32,
+    /// "webrtc" | "quic" | "negociando"
+    #[prost(string, tag = "9")]
+    pub transport: String,
 }
 
 /// Liga/desliga o envio de áudio durante a sessão.

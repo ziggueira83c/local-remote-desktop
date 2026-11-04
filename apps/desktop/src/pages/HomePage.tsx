@@ -20,6 +20,8 @@ export function HomePage() {
   const [address, setAddress] = useState("");
   const [port, setPort] = useState("");
   const [profile, setProfile] = useState<Profile>("remote_control");
+  const [password, setPassword] = useState("");
+  const [remember, setRemember] = useState(true);
   const [known, setKnown] = useState<DeviceRecord[]>([]);
 
   const loadKnown = () => api.listKnownDevices().then(setKnown).catch(() => {});
@@ -34,7 +36,11 @@ export function HomePage() {
       toast("error", "Porta inválida.");
       return;
     }
-    connectTo({ address: address.trim(), port: p, label: address.trim() }, profile);
+    connectTo(
+      { address: address.trim(), port: p, label: address.trim(), password, rememberPassword: remember && !!password },
+      profile,
+    );
+    setPassword("");
   };
 
   const connectDiscovered = (d: DiscoveredDevice) => {
@@ -105,6 +111,22 @@ export function HomePage() {
               Conectar
             </button>
           </form>
+          <div className="connect connect--secondary">
+            <label className="field field--grow">
+              <span className="field__label">Senha de acesso (opcional)</span>
+              <input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="Sem senha: o outro computador precisa aceitar"
+                autoComplete="off"
+              />
+            </label>
+            <label className="check">
+              <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />
+              Lembrar senha
+            </label>
+          </div>
         </div>
 
         <div className="card">
@@ -158,6 +180,7 @@ export function HomePage() {
                   <div className="device__info">
                     <div className="device__name">
                       {d.displayName} {onlineIds.has(d.id) && <span className="pill pill--ok">online</span>}
+                      {d.savedPassword && <span className="pill">🔑 senha salva</span>}
                     </div>
                     <div className="device__meta">
                       {platformLabel(d.osType)} · {d.lastIp ?? "IP desconhecido"}
@@ -169,6 +192,18 @@ export function HomePage() {
                     <button className="btn btn--small" onClick={() => connectKnown(d)} disabled={!d.lastIp}>
                       Conectar
                     </button>
+                    {d.savedPassword && (
+                      <button
+                        className="btn btn--small btn--ghost"
+                        onClick={async () => {
+                          await api.forgetSavedPassword(d.id).catch((e) => toast("error", errorMessage(e)));
+                          loadKnown();
+                        }}
+                        title="Apagar a senha lembrada"
+                      >
+                        Esquecer senha
+                      </button>
+                    )}
                     <button className="btn btn--small btn--ghost" onClick={() => forget(d)} title="Esquecer identidade">
                       Esquecer
                     </button>

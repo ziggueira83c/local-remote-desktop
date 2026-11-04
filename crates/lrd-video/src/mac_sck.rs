@@ -121,7 +121,7 @@ impl SckSource {
             .with_width(tw)
             .with_height(th)
             .with_pixel_format(PixelFormat::BGRA)
-            .with_shows_cursor(true)
+            .with_shows_cursor(false) // o controlador desenha o cursor localmente
             .with_fps(q.max_fps)
             .with_queue_depth(5);
         let audio_on = audio.is_some();

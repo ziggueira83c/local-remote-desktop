@@ -13,7 +13,7 @@
 //! ```
 //! Cursor (`type = 2`):
 //! ```text
-//! u8 type = 2, u8 visible, u16 x, u16 y     (coordenadas em pixels do quadro)
+//! u8 type = 2, u8 visible, u16 x, u16 y, [u8 kind]   (pixels do quadro; kind opcional)
 //! ```
 //! Vídeo H.264 (`type = 3`):
 //! ```text
@@ -76,6 +76,30 @@ pub fn build_cursor_frame(visible: bool, x: u16, y: u16) -> Vec<u8> {
     out
 }
 
+/// Formatos de cursor (mapeados para `cursor` do CSS no controlador).
+pub mod cursor_kind {
+    pub const DEFAULT: u8 = 0;
+    pub const TEXT: u8 = 1;
+    pub const POINTER: u8 = 2;
+    pub const WAIT: u8 = 3;
+    pub const PROGRESS: u8 = 4;
+    pub const CROSSHAIR: u8 = 5;
+    pub const EW_RESIZE: u8 = 6;
+    pub const NS_RESIZE: u8 = 7;
+    pub const NWSE_RESIZE: u8 = 8;
+    pub const NESW_RESIZE: u8 = 9;
+    pub const MOVE: u8 = 10;
+    pub const NOT_ALLOWED: u8 = 11;
+    pub const HELP: u8 = 12;
+}
+
+/// Cursor com formato.
+pub fn build_cursor_frame_kind(visible: bool, x: u16, y: u16, kind: u8) -> Vec<u8> {
+    let mut out = build_cursor_frame(visible, x, y);
+    out.push(kind);
+    out
+}
+
 /// Monta um quadro H.264.
 pub fn build_h264_frame(width: u16, height: u16, keyframe: bool, timestamp_us: u64, sequence: u32, bitstream: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(H264_HEADER_LEN + bitstream.len());
@@ -105,7 +129,7 @@ pub fn build_audio_frame(sample_rate: u32, channels: u8, timestamp_us: u64, samp
 /// Validação estrutural de um quadro recebido (o visualizador não confia no par remoto).
 pub fn validate_frame(buf: &[u8]) -> bool {
     match buf.first() {
-        Some(&FRAME_CURSOR) => buf.len() == 6,
+        Some(&FRAME_CURSOR) => buf.len() == 6 || buf.len() == 7,
         Some(&FRAME_H264) => buf.len() > H264_HEADER_LEN,
         Some(&FRAME_AUDIO) => {
             buf.len() >= AUDIO_HEADER_LEN

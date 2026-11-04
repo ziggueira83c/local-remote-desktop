@@ -254,3 +254,14 @@ input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px v
 video.remote { background: #000; object-fit: fill; pointer-events: none; }
 canvas.remote { pointer-events: none; }
 .audio-unlock { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); z-index: 3; }
+
+.diag {
+  position: absolute; right: 12px; top: 52px; z-index: 5; min-width: 300px;
+  background: rgba(22, 27, 34, 0.94); color: #d7dee7; border: 1px solid #343d48; border-radius: 10px;
+  padding: 10px 12px; line-height: 1.7; pointer-events: none;
+}
+.diag__title { font-weight: 700; color: #fff; margin-bottom: 2px; }
+.diag__hint { color: #e8a83a; margin-top: 4px; max-width: 320px; white-space: normal; }
+
+.connect--secondary { margin-top: 12px; align-items: center; }
+.connect--secondary .check { margin-top: 18px; }

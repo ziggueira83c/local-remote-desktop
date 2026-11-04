@@ -43,6 +43,12 @@ pub struct ConnectParams {
     /// Receber o áudio do outro computador.
     #[serde(default)]
     pub audio: bool,
+    /// Senha de acesso do outro computador (opcional).
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Guardar a senha no cofre do sistema para as próximas conexões.
+    #[serde(default)]
+    pub remember_password: bool,
 }
 
 /// Evento de entrada vindo da interface.
@@ -62,6 +68,13 @@ pub(crate) struct OutboundHandle {
     pub ctrl_tx: Option<mpsc::Sender<Envelope>>,
     pub input_tx: Option<mpsc::Sender<InputEvent>>,
     pub permissions: Permissions,
+}
+
+struct MediaRequest {
+    codecs: Vec<String>,
+    audio: bool,
+    password: Option<String>,
+    remember: bool,
 }
 
 #[derive(Default)]
@@ -144,7 +157,12 @@ impl Node {
         if !codecs.iter().any(|c| c == lrd_protocol::codec::JPEG_TILES) {
             codecs.push(lrd_protocol::codec::JPEG_TILES.into());
         }
-        let media = (codecs, params.audio);
+        let media = MediaRequest {
+            codecs,
+            audio: params.audio,
+            password: params.password.clone().filter(|p| !p.is_empty()),
+            remember: params.remember_password,
+        };
         match self.clone().establish(conn.clone(), session_id.clone(), addr, params.profile, media, seen, sink).await {
             Ok(()) => Ok(session_id),
             Err(e) => {
@@ -168,11 +186,11 @@ impl Node {
         session_id: String,
         addr: SocketAddr,
         profile: Profile,
-        media: (Vec<String>, bool),
+        media: MediaRequest,
         seen: Arc<Mutex<Option<Vec<u8>>>>,
         sink: FrameSink,
     ) -> Result<()> {
-        let (codecs, want_audio) = media;
+        let MediaRequest { codecs, audio: want_audio, password: typed_password, remember } = media;
         let server_cert = seen.lock().unwrap().clone().ok_or_else(|| anyhow!("certificado do servidor ausente"))?;
         let server_fp = fingerprint_of(&server_cert);
         self.emit_outbound_state("authenticating", None, Some(format_fingerprint(&server_fp)), None);
@@ -238,11 +256,18 @@ impl Node {
             Some(sas.clone()),
         );
 
+        // Senha: a digitada agora ou a lembrada para este computador.
+        let saved_password = if typed_password.is_none() { self.load_saved_password(&hello.device_id) } else { None };
+        let password = typed_password.clone().or(saved_password.clone()).unwrap_or_default();
+        if !password.is_empty() {
+            self.emit_outbound_state("authenticating", Some(remote_name.clone()), Some(format_fingerprint(&server_fp)), Some(sas.clone()));
+        }
         let req = ConnectRequest {
             requested_profile: profile.as_str().into(),
             requested_display: String::new(),
             control_requested: profile != Profile::ViewOnly,
             want_audio,
+            password,
         };
         write_envelope(&mut send, &Envelope::new("", 2, Payload::ConnectRequest(req))).await?;
 
@@ -256,7 +281,16 @@ impl Node {
             },
         };
         if !resp.approved {
+            if resp.reason_code == reason::WRONG_PASSWORD && saved_password.is_some() {
+                let _ = self.forget_saved_password(&hello.device_id);
+                bail!("A senha lembrada para este computador não vale mais. Digite a senha nova.");
+            }
             bail!(describe_reason(&resp.reason_code));
+        }
+        if remember {
+            if let Some(p) = &typed_password {
+                self.save_password(&hello.device_id, p);
+            }
         }
         let permissions = Permissions::from_list(&resp.granted_permissions);
 
@@ -332,6 +366,20 @@ impl Node {
                     }
                     Some(Payload::SessionClose(c)) => {
                         *note_c.lock().unwrap() = Some(c.reason_code);
+                    }
+                    Some(Payload::HostStats(st)) => {
+                        node_c.events.emit(NodeEvent::HostStats {
+                            session_id: sid_c.clone(),
+                            capture_source: st.capture_source,
+                            encoder: st.encoder,
+                            width: st.width,
+                            height: st.height,
+                            capture_fps: st.capture_fps,
+                            encode_fps: st.encode_fps,
+                            encode_ms: st.encode_ms,
+                            bitrate_kbps: st.bitrate_kbps,
+                            transport: st.transport,
+                        });
                     }
                     Some(Payload::WebRtcSignal(sig)) if sig.kind == "offer" => {
                         node_c.events.emit(NodeEvent::WebRtcOffer { session_id: sid_c.clone(), sdp: sig.sdp });

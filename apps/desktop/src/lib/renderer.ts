@@ -9,7 +9,26 @@ export interface CursorState {
   visible: boolean;
   x: number;
   y: number;
+  /** Formato do cursor remoto (ver CURSOR_CSS). */
+  kind: number;
 }
+
+/** Formatos enviados pelo host → valor de `cursor` no CSS. */
+export const CURSOR_CSS = [
+  "default",
+  "text",
+  "pointer",
+  "wait",
+  "progress",
+  "crosshair",
+  "ew-resize",
+  "ns-resize",
+  "nwse-resize",
+  "nesw-resize",
+  "move",
+  "not-allowed",
+  "help",
+];
 
 export class FrameRenderer {
   private ctx: CanvasRenderingContext2D | null = null;
@@ -37,7 +56,12 @@ export class FrameRenderer {
     const type = view.getUint8(0);
 
     if (type === FRAME_CURSOR && bytes.length >= 6) {
-      this.onCursor({ visible: view.getUint8(1) === 1, x: view.getUint16(2, true), y: view.getUint16(4, true) });
+      this.onCursor({
+        visible: view.getUint8(1) === 1,
+        x: view.getUint16(2, true),
+        y: view.getUint16(4, true),
+        kind: bytes.length >= 7 ? view.getUint8(6) : 0,
+      });
       return;
     }
     if (type !== FRAME_TILES) return;

@@ -17,6 +17,17 @@ lrd-protocol.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 cpal.workspace = true
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+] }
+windows-sys.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 screencapturekit.workspace = true
+core-foundation = "0.9"
+core-foundation-sys = "0.8"

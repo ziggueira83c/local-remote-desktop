@@ -56,10 +56,11 @@ openh264-sys2 = "0.9"
 webrtc = "0.17"
 opus = "0.4"
 bytes = "1"
+argon2 = "0.5"
 cpal = "0.16"
 screencapturekit = "11"
 enigo = "0.2"
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Power", "Win32_Media", "Win32_System_Threading"] }
 core-graphics = "0.23"
 
 [profile.release]

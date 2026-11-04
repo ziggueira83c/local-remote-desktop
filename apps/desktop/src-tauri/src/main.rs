@@ -59,6 +59,8 @@ fn main() {
             commands::request_keyframe,
             commands::set_audio,
             commands::webrtc_answer,
+            commands::set_access_password,
+            commands::forget_saved_password,
             commands::approve_session,
             commands::reject_session,
             commands::end_inbound_session,

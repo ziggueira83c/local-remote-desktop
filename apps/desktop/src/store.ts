@@ -2,6 +2,7 @@
 import { create } from "zustand";
 import type {
   DiscoveredDevice,
+  HostStats,
   LocalDeviceInfo,
   NodeEvent,
   Permissions,
@@ -76,6 +77,7 @@ interface State {
   progress: OutboundProgress | null;
   outbound: OutboundSession | null;
   metrics: Metrics | null;
+  hostStats: HostStats | null;
   toasts: Toast[];
   knownVersion: number;
 
@@ -103,6 +105,7 @@ export const useStore = create<State>((set, get) => ({
   progress: null,
   outbound: null,
   metrics: null,
+  hostStats: null,
   toasts: [],
   knownVersion: 0,
 
@@ -207,9 +210,12 @@ export const useStore = create<State>((set, get) => ({
       case "outboundEnded":
         if (s.outbound?.sessionId === e.sessionId) {
           endMedia();
-          set({ outbound: null, metrics: null, page: s.page === "session" ? "home" : s.page });
+          set({ outbound: null, metrics: null, hostStats: null, page: s.page === "session" ? "home" : s.page });
           s.toast("info", e.reason);
         }
+        break;
+      case "hostStats":
+        if (s.outbound?.sessionId === e.sessionId) set({ hostStats: e });
         break;
       case "webRtcOffer": {
         const engine = currentEngine();

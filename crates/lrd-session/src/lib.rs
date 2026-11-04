@@ -44,6 +44,8 @@ pub struct AppSettings {
     pub enhance_image: bool,
     /// Intensidade da melhoria de imagem, de 0.0 a 1.0.
     pub enhance_strength: f32,
+    /// Aceitar conexões com a senha de acesso sem pedir aprovação (exige senha definida).
+    pub password_access: bool,
 }
 
 impl Default for AppSettings {
@@ -53,13 +55,14 @@ impl Default for AppSettings {
             listen_port: lrd_protocol::DEFAULT_PORT,
             discovery_enabled: true,
             quality_profile: "balanced".into(),
-            max_fps: 30,
+            max_fps: 60,
             swap_ctrl_cmd: true,
             require_approval: true,
             share_audio: true,
             receive_audio: true,
             enhance_image: false,
             enhance_strength: 0.5,
+            password_access: false,
         }
     }
 }
@@ -131,6 +134,19 @@ pub enum NodeEvent {
         session_id: String,
         reason: String,
     },
+    /// Diagnóstico do computador acessado (a cada segundo).
+    HostStats {
+        session_id: String,
+        capture_source: String,
+        encoder: String,
+        width: u32,
+        height: u32,
+        capture_fps: f32,
+        encode_fps: f32,
+        encode_ms: f32,
+        bitrate_kbps: u32,
+        transport: String,
+    },
     /// Oferta WebRTC do host; a interface responde com `webrtc_answer`.
     WebRtcOffer {
         session_id: String,
@@ -179,6 +195,7 @@ pub fn describe_reason(code: &str) -> String {
         BUSY => "O outro computador já está em uma sessão.".into(),
         VERSION => "Versões incompatíveis do aplicativo.".into(),
         IDENTITY_MISMATCH => "A identidade deste computador não confere com a registrada no outro lado.".into(),
+        WRONG_PASSWORD => "Senha incorreta.".into(),
         USER_CLOSED => "Sessão encerrada.".into(),
         REVOKED => "O acesso foi revogado no computador controlado.".into(),
         "connection_lost" => "Conexão perdida.".into(),

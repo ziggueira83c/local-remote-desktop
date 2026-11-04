@@ -10,16 +10,22 @@
 
 pub mod audio;
 pub mod capture;
+pub mod color;
 pub mod encoder;
 pub mod frame;
 pub mod h264;
 #[cfg(target_os = "macos")]
+mod hw_mac;
+#[cfg(target_os = "windows")]
+mod hw_win;
+#[cfg(target_os = "macos")]
 mod mac_sck;
 pub mod permissions;
 pub mod pipeline;
+mod power;
 pub mod source;
 
 pub use capture::{list_displays, Display};
 pub use encoder::{QualitySettings, TileEncoder};
 pub use frame::{PixelFormat, RawFrame};
-pub use pipeline::{spawn_capture, CaptureCmd, CaptureHandle, CaptureParams, VideoCodec};
+pub use pipeline::{spawn_capture, CaptureCmd, CaptureHandle, CaptureParams, CursorInfo, PipelineStats, VideoCodec};

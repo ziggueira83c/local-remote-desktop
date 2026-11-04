@@ -1,17 +1,17 @@
 //! Thread de captura: fonte de quadros → redimensionamento → H.264 (ou tiles JPEG) → rede.
 //!
 //! - O quadro mais recente sempre vence: se a rede ou o codificador atrasarem, quadros
-//!   intermediários são descartados antes da codificação (latência baixa e constante).
-//! - A entrega usa um canal de capacidade 1 com `blocking_send`; a taxa de quadros se
-//!   adapta sozinha à banda disponível.
-//! - A última imagem fica guardada para gerar um quadro completo quando o controlador pede,
-//!   mesmo com a tela parada.
+//!   intermediários são descartados ANTES da codificação (latência baixa e constante).
+//! - Tela parada por ~350 ms → um quadro completo em alta qualidade (texto nítido).
+//! - Banda baixa → a resolução cai antes de a imagem borrar.
+//! - Estatísticas por etapa alimentam o painel de diagnóstico.
 
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use lrd_protocol::video::build_cursor_frame;
+use lrd_protocol::video::build_cursor_frame_kind;
 use tokio::sync::mpsc;
 
 use crate::encoder::{QualitySettings, TileEncoder};
@@ -37,21 +37,44 @@ pub enum VideoCodec {
     JpegTiles,
 }
 
-pub type CursorFn = Box<dyn Fn() -> Option<(i32, i32)> + Send>;
+/// Cursor do computador acessado: posição global (coordenadas do SO), formato e visibilidade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorInfo {
+    pub x: i32,
+    pub y: i32,
+    /// Formato (ver `lrd_protocol::video::cursor_kind`).
+    pub kind: u8,
+    pub visible: bool,
+}
+
+pub type CursorFn = Box<dyn Fn() -> Option<CursorInfo> + Send>;
 
 pub struct CaptureParams {
     pub display_id: Option<u32>,
     pub quality: QualitySettings,
     pub codec: VideoCodec,
-    /// Posição global do cursor no sistema de coordenadas do SO (opcional).
     pub cursor: Option<CursorFn>,
     /// Destino dos blocos de áudio (`None` = sessão sem áudio).
     pub audio: Option<mpsc::Sender<Vec<u8>>>,
     pub audio_enabled: bool,
 }
 
+/// Números do pipeline, lidos a cada segundo para o painel de diagnóstico.
+#[derive(Debug, Clone, Default)]
+pub struct PipelineStats {
+    pub source: String,
+    pub encoder: String,
+    pub width: u32,
+    pub height: u32,
+    pub captured: u64,
+    pub encoded: u64,
+    pub encode_us: u64,
+    pub bitrate_bps: u32,
+}
+
 pub struct CaptureHandle {
     pub commands: Sender<CaptureCmd>,
+    pub stats: Arc<Mutex<PipelineStats>>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -70,16 +93,30 @@ impl Drop for CaptureHandle {
 
 pub fn spawn_capture(params: CaptureParams, out: mpsc::Sender<Vec<u8>>) -> CaptureHandle {
     let (tx, rx) = std::sync::mpsc::channel();
+    let stats = Arc::new(Mutex::new(PipelineStats::default()));
+    let stats_t = stats.clone();
     let join = std::thread::Builder::new()
         .name("lrd-capture".into())
-        .spawn(move || run(params, rx, out))
+        .spawn(move || {
+            let _power = crate::power::SessionPower::begin();
+            run(params, rx, out, stats_t)
+        })
         .expect("criando thread de captura");
-    CaptureHandle { commands: tx, join: Some(join) }
+    CaptureHandle { commands: tx, stats, join: Some(join) }
 }
 
 enum Encoder {
     H264(H264Encoder),
     Tiles(TileEncoder),
+}
+
+impl Encoder {
+    fn name(&self) -> String {
+        match self {
+            Encoder::H264(e) => format!("H.264 · {}", e.name()),
+            Encoder::Tiles(_) => "JPEG (tiles)".into(),
+        }
+    }
 }
 
 fn make_encoder(codec: VideoCodec, q: &QualitySettings) -> Encoder {
@@ -92,23 +129,36 @@ fn make_encoder(codec: VideoCodec, q: &QualitySettings) -> Encoder {
     Encoder::Tiles(TileEncoder::new())
 }
 
-fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8>>) {
+/// Largura máxima efetiva: com pouca banda, menos pixels em vez de imagem borrada.
+fn effective_max_width(q: &QualitySettings, bitrate: Option<u32>) -> u32 {
+    match bitrate {
+        Some(b) if b < 900_000 => q.max_width.min(960),
+        Some(b) if b < 1_800_000 => q.max_width.min(1280),
+        Some(b) if b < 3_000_000 => q.max_width.min(1600),
+        _ => q.max_width,
+    }
+}
+
+const IDLE_REFINE_AFTER: Duration = Duration::from_millis(350);
+
+fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8>>, stats: Arc<Mutex<PipelineStats>>) {
     let CaptureParams { display_id, quality, codec, cursor, audio, audio_enabled } = params;
     let mut codec = codec;
-    let mut bitrate_override: Option<u32> = None;
     let mut quality = quality;
+    let mut bitrate_override: Option<u32> = None;
     let mut display_id = display_id;
     let mut audio_enabled = audio_enabled && audio.is_some();
     let mut encoder = make_encoder(codec, &quality);
     let mut source: Option<Source> = None;
     let mut win_audio: Option<crate::audio::AudioCapture> = None;
 
-    // Quadro mais novo ainda não codificado, e o último já codificado (para keyframes).
     let mut pending: Option<RawFrame> = None;
     let mut last_encoded: Option<RawFrame> = None;
     let mut want_keyframe = true;
     let mut last_sent = Instant::now() - Duration::from_secs(1);
-    let mut last_cursor: Option<(u16, u16)> = None;
+    let mut last_change = Instant::now();
+    let mut refined = true;
+    let mut last_cursor: Option<(u16, u16, u8, bool)> = None;
     let mut failures = 0u32;
 
     loop {
@@ -127,9 +177,8 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
                         quality = q;
                         encoder = make_encoder(codec, &quality);
                         bitrate_override = None;
-                        // No macOS o tamanho e o FPS são aplicados pelo próprio ScreenCaptureKit.
                         if cfg!(target_os = "macos") {
-                            source = None;
+                            source = None; // o ScreenCaptureKit aplica tamanho e FPS
                         }
                         last_encoded = None;
                         want_keyframe = true;
@@ -137,9 +186,13 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
                 }
                 Ok(CaptureCmd::Keyframe) => want_keyframe = true,
                 Ok(CaptureCmd::SetBitrate(bps)) => {
+                    let before = effective_max_width(&quality, bitrate_override);
                     bitrate_override = Some(bps);
                     if let Encoder::H264(enc) = &mut encoder {
                         enc.set_bitrate(bps);
+                    }
+                    if effective_max_width(&quality, bitrate_override) != before && cfg!(target_os = "macos") {
+                        source = None;
                     }
                 }
                 Ok(CaptureCmd::SetCodec(c)) => {
@@ -155,7 +208,7 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
                     if on != audio_enabled {
                         audio_enabled = on;
                         if cfg!(target_os = "macos") {
-                            source = None; // reabre o stream com ou sem áudio
+                            source = None;
                         }
                         if !on {
                             win_audio = None;
@@ -183,13 +236,20 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
             }
         }
 
+        let max_width = effective_max_width(&quality, bitrate_override);
+
         // ---- fonte ----
         if source.is_none() {
             let audio_for_source = if audio_enabled { audio.clone() } else { None };
-            match Source::open(display_id, &quality, audio_for_source) {
+            let mut q = quality;
+            q.max_width = max_width;
+            match Source::open(display_id, &q, audio_for_source) {
                 Ok(s) => {
                     tracing::info!("captura: {} ({}x{})", s.name(), s.display().width, s.display().height);
                     display_id = Some(s.display().id);
+                    if let Ok(mut st) = stats.lock() {
+                        st.source = s.name().to_string();
+                    }
                     source = Some(s);
                     want_keyframe = true;
                     failures = 0;
@@ -207,6 +267,8 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
         let since = last_sent.elapsed();
         let wait = if pending.is_some() || want_keyframe {
             interval.saturating_sub(since).max(Duration::from_millis(1))
+        } else if !refined {
+            IDLE_REFINE_AFTER.saturating_sub(last_change.elapsed()).max(Duration::from_millis(1)).min(interval)
         } else {
             interval
         };
@@ -215,6 +277,11 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
             Ok(Some(frame)) => {
                 pending = Some(frame);
                 failures = 0;
+                last_change = Instant::now();
+                refined = false;
+                if let Ok(mut st) = stats.lock() {
+                    st.captured += 1;
+                }
             }
             Ok(None) => {}
             Err(e) => {
@@ -234,10 +301,20 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
             continue;
         }
 
+        // Tela parada: refina com um quadro completo em alta qualidade.
+        let mut refine_now = false;
+        if pending.is_none() && !want_keyframe && !refined && last_change.elapsed() >= IDLE_REFINE_AFTER {
+            refined = true;
+            if last_encoded.is_some() && matches!(encoder, Encoder::H264(_)) {
+                refine_now = true;
+                want_keyframe = true;
+            }
+        }
+
         // ---- codificação ----
         let to_encode = match pending.take() {
             Some(raw) => {
-                let (tw, th) = target_size(raw.width, raw.height, quality.max_width);
+                let (tw, th) = target_size(raw.width, raw.height, max_width);
                 Some(resize(raw, tw, th))
             }
             None if want_keyframe => last_encoded.take(),
@@ -245,15 +322,21 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
         };
         let Some(frame) = to_encode else { continue };
 
+        let started = Instant::now();
         let encoded = match &mut encoder {
             Encoder::H264(enc) => {
-                if let Some(bps) = bitrate_override {
-                    enc.set_bitrate(bps);
+                let normal = enc.bitrate();
+                if refine_now {
+                    enc.set_bitrate((normal.saturating_mul(3)).min(40_000_000));
                 }
                 if want_keyframe {
                     enc.force_keyframe();
                 }
-                enc.encode(&frame)
+                let r = enc.encode(&frame);
+                if refine_now {
+                    enc.set_bitrate(normal);
+                }
+                r
             }
             Encoder::Tiles(enc) => {
                 if want_keyframe {
@@ -262,8 +345,23 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
                 enc.encode(&frame, quality.jpeg_quality)
             }
         };
+        let took = started.elapsed();
         want_keyframe = false;
         last_sent = Instant::now();
+
+        if let Ok(mut st) = stats.lock() {
+            st.encoder = encoder.name();
+            st.width = frame.width;
+            st.height = frame.height;
+            if encoded.is_some() {
+                st.encoded += 1;
+                st.encode_us += took.as_micros() as u64;
+            }
+            st.bitrate_bps = match &encoder {
+                Encoder::H264(e) => e.bitrate(),
+                Encoder::Tiles(_) => 0,
+            };
+        }
 
         if let Some(bytes) = encoded {
             if out.blocking_send(bytes).is_err() {
@@ -271,29 +369,25 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
             }
         }
 
-        // ---- cursor (quando a imagem não traz o cursor desenhado) ----
+        // ---- cursor: posição (modo só visualizar) e formato (cursor local no controlador) ----
         if let (Some(cursor_fn), Some(src)) = (&cursor, source.as_ref()) {
-            if !src.draws_cursor() {
-                let d = src.display();
-                let cur = cursor_fn().and_then(|(cx, cy)| {
-                    let (rx_, ry_) = (cx - d.x, cy - d.y);
-                    if rx_ < 0 || ry_ < 0 || rx_ >= d.width as i32 || ry_ >= d.height as i32 {
-                        return None;
-                    }
-                    let px = (rx_ as f64 / d.width as f64 * frame.width as f64) as u16;
-                    let py = (ry_ as f64 / d.height as f64 * frame.height as f64) as u16;
-                    Some((px, py))
-                });
-                if cur != last_cursor {
-                    let msg = match cur {
-                        Some((x, y)) => build_cursor_frame(true, x, y),
-                        None => build_cursor_frame(false, 0, 0),
-                    };
-                    if out.blocking_send(msg).is_err() {
-                        return;
-                    }
-                    last_cursor = cur;
+            let d = src.display();
+            let cur = cursor_fn().map(|c| {
+                let (rx_, ry_) = (c.x - d.x, c.y - d.y);
+                let inside = rx_ >= 0 && ry_ >= 0 && rx_ < d.width as i32 && ry_ < d.height as i32;
+                let px = (rx_.max(0) as f64 / d.width.max(1) as f64 * frame.width as f64) as u16;
+                let py = (ry_.max(0) as f64 / d.height.max(1) as f64 * frame.height as f64) as u16;
+                (px, py, c.kind, c.visible && inside)
+            });
+            if cur != last_cursor {
+                let msg = match cur {
+                    Some((x, y, kind, visible)) => build_cursor_frame_kind(visible, x, y, kind),
+                    None => build_cursor_frame_kind(false, 0, 0, 0),
+                };
+                if out.blocking_send(msg).is_err() {
+                    return;
                 }
+                last_cursor = cur;
             }
         }
 

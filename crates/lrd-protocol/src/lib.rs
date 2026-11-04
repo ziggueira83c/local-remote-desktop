@@ -34,6 +34,7 @@ pub mod reason {
     pub const BUSY: &str = "busy";
     pub const VERSION: &str = "unsupported_version";
     pub const IDENTITY_MISMATCH: &str = "identity_mismatch";
+    pub const WRONG_PASSWORD: &str = "wrong_password";
     pub const USER_CLOSED: &str = "closed_by_user";
     pub const REVOKED: &str = "revoked";
     pub const PROTOCOL_ERROR: &str = "protocol_error";

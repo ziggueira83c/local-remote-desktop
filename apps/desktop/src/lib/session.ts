@@ -22,6 +22,8 @@ export interface ConnectTarget {
   port?: number;
   expectedFingerprint?: string;
   label: string;
+  password?: string;
+  rememberPassword?: boolean;
 }
 
 export async function connectTo(target: ConnectTarget, profile: Profile) {
@@ -65,6 +67,8 @@ export async function connectTo(target: ConnectTarget, profile: Profile) {
         profile,
         codecs,
         audio: receiveAudio && !!audioCtx,
+        password: target.password || undefined,
+        rememberPassword: !!target.rememberPassword,
       },
       channel,
     );
