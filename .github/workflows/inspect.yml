@@ -9,20 +9,33 @@ jobs:
       - uses: actions/checkout@v4
       - name: fetch
         working-directory: tools/inspect
-        run: cargo generate-lockfile && cargo fetch && grep -A1 -E 'name = "(openh264|xcap|cpal|screencapturekit|objc2.*)"' Cargo.lock | head -60
+        run: cargo generate-lockfile && cargo fetch && grep -A2 -E 'name = "(webrtc|opus|audiopus_sys|interceptor|rtcp|bytes|openh264-sys2)"' Cargo.lock | head -60
       - name: dump
         run: |
           R=$(ls -d ~/.cargo/registry/src/*/ | head -1)
-          show() { for f in $R$1; do echo "################ $f"; cat "$f"; done; }
-          ls $R | grep -E "apple|screencapture|cpal|openh264"
-          show "openh264-0.9*/src/formats/yuv.rs"
-          show "openh264-0.9*/src/formats/rgb.rs" | grep -nE "pub fn new|impl.*for|pub struct" | head -40
-          ls -R ${R}apple-cf-*/src | head -80
-          show "apple-cf-*/src/cm/audio.rs"
-          grep -rn "pub fn \|pub unsafe fn " ${R}apple-cf-*/src/cm/sample_buffer*.rs ${R}apple-cf-*/src/cv/*.rs | head -120
-          grep -rn "pub fn " ${R}screencapturekit-11*/src/stream/configuration/*.rs | head -120
-          grep -rn "pub fn " ${R}screencapturekit-11*/src/shareable_content/*.rs | head -60
-          grep -rn "pub fn \|pub enum\|^    [A-Z0-9]*," ${R}screencapturekit-11*/src/stream/configuration/pixel_format.rs | head -40
-          show "screencapturekit-11*/src/prelude.rs"
-          show "screencapturekit-11*/Cargo.toml" | head -80
-          grep -n "fn build_input_stream" -A12 ${R}cpal-0.16*/src/traits.rs
+          W=$(ls -d ${R}webrtc-0.* | sort -V | tail -1)
+          echo "WEBRTC DIR $W"
+          show() { for f in $1; do echo "################ $f"; cat "$f"; done; }
+          show "$W/examples/*play-from-disk*/*.rs" 2>/dev/null | head -400 || true
+          ls $W/examples | head -60
+          show "$W/src/api/interceptor_registry/mod.rs"
+          grep -n "pub fn \|pub async fn " $W/src/api/media_engine/mod.rs | head -40
+          grep -n "pub fn \|pub async fn " $W/src/peer_connection/mod.rs | head -80
+          grep -n "pub fn \|pub async fn \|pub struct" $W/src/track/track_local/track_local_static_sample.rs | head
+          grep -n "pub fn \|pub async fn " $W/src/rtp_transceiver/rtp_receiver/mod.rs $W/src/rtp_transceiver/rtp_sender/mod.rs | head -40
+          grep -n "pub fn \|pub async fn \|pub struct" $W/src/api/setting_engine/mod.rs | head -60
+          grep -rn "pub struct Sample" -A20 ${R}webrtc-media-*/src/lib.rs | head -40
+          ls ${R} | grep -E "rtcp|interceptor|webrtc|opus|audiopus|bytes"
+          RT=$(ls -d ${R}rtcp-* | sort -V | tail -1)
+          grep -n "pub struct\|pub [a-z_]*:" $RT/src/payload_feedbacks/receiver_estimated_maximum_bitrate/mod.rs $RT/src/payload_feedbacks/picture_loss_indication/mod.rs $RT/src/payload_feedbacks/full_intra_request/mod.rs | head -30
+          grep -n "pub struct\|pub [a-z_]*:" $RT/src/receiver_report/mod.rs $RT/src/reception_report.rs | head -30
+          O=$(ls -d ${R}opus-0.* | sort -V | tail -1)
+          grep -n "pub fn \|pub enum\|^    [A-Z][a-zA-Z]*,\|^    [A-Z][a-zA-Z]* = " $O/src/lib.rs | head -80
+          cat $O/Cargo.toml | grep -A5 "dependencies"
+          A=$(ls -d ${R}audiopus_sys-* | sort -V | tail -1)
+          cat $A/Cargo.toml | sed -n '/features/,$p' | head -30
+          grep -n "static\|cmake\|pkg_config\|LIBOPUS" $A/build.rs | head -40
+          S=$(ls -d ${R}openh264-sys2-0.9* | sort -V | tail -1)
+          grep -rn "ENCODER_OPTION_BITRATE\|pub struct TagBitrateInfo\|pub type SBitrateInfo\|SPATIAL_LAYER_ALL\|pub type LAYER_NUM\|ENCODER_OPTION_FRAME_RATE" $S/src/*.rs | head -20
+          grep -n "pub struct TagBitrateInfo" -A6 $S/src/generated/*.rs | head -10
+          grep -n "pub use\|pub mod" $S/src/lib.rs | head
