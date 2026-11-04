@@ -265,3 +265,5 @@ canvas.remote { pointer-events: none; }
 
 .connect--secondary { margin-top: 12px; align-items: center; }
 .connect--secondary .check { margin-top: 18px; }
+
+.banner--update { background: var(--accent); }

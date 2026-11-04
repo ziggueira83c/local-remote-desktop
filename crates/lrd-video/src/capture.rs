@@ -73,6 +73,6 @@ impl Capturer {
         if rgba.len() != (width as usize) * (height as usize) * 4 {
             return Err(anyhow!("quadro com tamanho inesperado"));
         }
-        Ok(RawFrame { width, height, data: rgba, format: PixelFormat::Rgba, timestamp_us: lrd_protocol::now_us() })
+        Ok(RawFrame::cpu(width, height, rgba, PixelFormat::Rgba, lrd_protocol::now_us()))
     }
 }

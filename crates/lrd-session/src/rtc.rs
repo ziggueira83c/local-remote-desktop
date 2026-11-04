@@ -7,8 +7,12 @@
 //!   a taxa do H.264 é ajustada sem reiniciar o codificador.
 //! - A sinalização (SDP) passa pelo canal QUIC autenticado, então o fingerprint DTLS do
 //!   WebRTC fica amarrado à identidade já verificada do par.
+//! - Mouse e teclado chegam por **canais de dados** direto do JavaScript do controlador
+//!   ("pointer": sem ordem e sem retransmissão, para movimentos; "input": confiável, para
+//!   cliques, teclas e rolagem). Evita o caminho JS → Tauri → Rust → QUIC.
+//! - Vídeo enviado pela faixa própria de `rtp_video` (pacing + FEC + carimbo de captura).
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -16,6 +20,9 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use webrtc::api::interceptor_registry::{configure_nack, configure_rtcp_reports};
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS};
+use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
+use webrtc::data_channel::data_channel_message::DataChannelMessage;
+use webrtc::data_channel::RTCDataChannel;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::interceptor::registry::Registry;
@@ -34,10 +41,26 @@ use webrtc::rtp_transceiver::RTCPFeedback;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 
-use lrd_protocol::video::{AUDIO_HEADER_LEN, FRAME_AUDIO, FRAME_H264, H264_HEADER_LEN};
+use lrd_protocol::video::{AUDIO_HEADER_LEN, FLAG_HEVC, FRAME_AUDIO, FRAME_H264, H264_HEADER_LEN};
 use lrd_video::CaptureCmd;
 
+use crate::rtp_video::{OutFrame, Pacer, VideoTrack};
+
 const H264_FMTP: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
+const H265_FMTP: &str = "level-id=93;profile-id=1;tier-flag=0;tx-mode=SRST";
+const PT_H264: u8 = 102;
+const PT_H265: u8 = 104;
+const PT_RED: u8 = 116;
+const PT_ULPFEC: u8 = 117;
+
+/// Trata uma mensagem de entrada vinda do canal de dados; pode devolver uma resposta.
+pub type InputHandler = Arc<dyn Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync>;
+
+/// Codecs extras que o controlador declarou suportar no WebRTC.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RtcCodecs {
+    pub hevc: bool,
+}
 const OPUS_RATE: u32 = 48_000;
 const OPUS_FRAME: usize = 960; // 20 ms por canal
 
@@ -49,10 +72,11 @@ pub enum RtcState {
 
 pub struct RtcSender {
     pc: Arc<RTCPeerConnection>,
-    video: Arc<TrackLocalStaticSample>,
+    video: Arc<VideoTrack>,
+    pacer: Pacer,
     audio: Arc<TrackLocalStaticSample>,
-    last_video: Mutex<Option<Instant>>,
     opus: tokio::sync::Mutex<OpusState>,
+    _channels: Vec<Arc<RTCDataChannel>>,
 }
 
 struct OpusState {
@@ -71,28 +95,38 @@ impl RtcSender {
         cap_cmds: std::sync::mpsc::Sender<CaptureCmd>,
         max_bitrate: u32,
         state_tx: mpsc::UnboundedSender<RtcState>,
+        input: InputHandler,
+        codecs: RtcCodecs,
     ) -> Result<(Arc<Self>, String)> {
         let mut media = MediaEngine::default();
         // Sem transport-cc: o navegador então estima a banda e manda REMB.
-        media.register_codec(
-            RTCRtpCodecParameters {
-                capability: RTCRtpCodecCapability {
-                    mime_type: MIME_TYPE_H264.to_owned(),
-                    clock_rate: 90_000,
-                    channels: 0,
-                    sdp_fmtp_line: H264_FMTP.to_owned(),
-                    rtcp_feedback: vec![
-                        feedback("goog-remb", ""),
-                        feedback("ccm", "fir"),
-                        feedback("nack", ""),
-                        feedback("nack", "pli"),
-                    ],
+        let video_fb = || {
+            vec![feedback("goog-remb", ""), feedback("ccm", "fir"), feedback("nack", ""), feedback("nack", "pli")]
+        };
+        let mut video_codecs: Vec<(&str, u8, &str, Vec<RTCPFeedback>)> =
+            vec![(MIME_TYPE_H264, PT_H264, H264_FMTP, video_fb())];
+        if codecs.hevc {
+            video_codecs.push(("video/H265", PT_H265, H265_FMTP, video_fb()));
+        }
+        // Proteção contra perdas (FEC): RED como envelope + ULPFEC como paridade.
+        video_codecs.push(("video/red", PT_RED, "", vec![]));
+        video_codecs.push(("video/ulpfec", PT_ULPFEC, "", vec![]));
+        for (mime, pt, fmtp, fb) in video_codecs {
+            media.register_codec(
+                RTCRtpCodecParameters {
+                    capability: RTCRtpCodecCapability {
+                        mime_type: mime.to_owned(),
+                        clock_rate: 90_000,
+                        channels: 0,
+                        sdp_fmtp_line: fmtp.to_owned(),
+                        rtcp_feedback: fb,
+                    },
+                    payload_type: pt,
+                    ..Default::default()
                 },
-                payload_type: 102,
-                ..Default::default()
-            },
-            RTPCodecType::Video,
-        )?;
+                RTPCodecType::Video,
+            )?;
+        }
         media.register_codec(
             RTCRtpCodecParameters {
                 capability: RTCRtpCodecCapability {
@@ -122,17 +156,7 @@ impl RtcSender {
             .build();
         let pc = Arc::new(api.new_peer_connection(RTCConfiguration { ice_servers: vec![], ..Default::default() }).await?);
 
-        let video = Arc::new(TrackLocalStaticSample::new(
-            RTCRtpCodecCapability {
-                mime_type: MIME_TYPE_H264.to_owned(),
-                clock_rate: 90_000,
-                channels: 0,
-                sdp_fmtp_line: H264_FMTP.to_owned(),
-                rtcp_feedback: vec![],
-            },
-            "video".to_owned(),
-            "lrd".to_owned(),
-        ));
+        let video = Arc::new(VideoTrack::new());
         let audio = Arc::new(TrackLocalStaticSample::new(
             RTCRtpCodecCapability {
                 mime_type: MIME_TYPE_OPUS.to_owned(),
@@ -147,7 +171,32 @@ impl RtcSender {
         let video_sender = pc.add_track(Arc::clone(&video) as Arc<dyn TrackLocal + Send + Sync>).await?;
         let audio_sender = pc.add_track(Arc::clone(&audio) as Arc<dyn TrackLocal + Send + Sync>).await?;
 
-        tokio::spawn(rate_control(video_sender, cap_cmds, max_bitrate));
+        let pacer = Pacer::start(video.clone(), max_bitrate);
+        tokio::spawn(rate_control(video_sender, cap_cmds, max_bitrate, pacer.target_bps.clone()));
+
+        // Canais de dados para a entrada (criados aqui para entrarem na oferta).
+        let pointer = pc
+            .create_data_channel(
+                "pointer",
+                Some(RTCDataChannelInit { ordered: Some(false), max_retransmits: Some(0), ..Default::default() }),
+            )
+            .await?;
+        let reliable = pc
+            .create_data_channel("input", Some(RTCDataChannelInit { ordered: Some(true), ..Default::default() }))
+            .await?;
+        for dc in [&pointer, &reliable] {
+            let handler = input.clone();
+            let weak = Arc::downgrade(dc);
+            dc.on_message(Box::new(move |msg: DataChannelMessage| {
+                let reply = handler(&msg.data[..]);
+                let weak = weak.clone();
+                Box::pin(async move {
+                    if let (Some(r), Some(dc)) = (reply, weak.upgrade()) {
+                        let _ = dc.send(&Bytes::from(r)).await;
+                    }
+                })
+            }));
+        }
         tokio::spawn(async move {
             // O RTCP do áudio precisa ser lido para os interceptadores funcionarem.
             while audio_sender.read_rtcp().await.is_ok() {}
@@ -178,9 +227,10 @@ impl RtcSender {
         let sender = Arc::new(RtcSender {
             pc,
             video,
+            pacer,
             audio,
-            last_video: Mutex::new(None),
             opus: tokio::sync::Mutex::new(OpusState { encoder: None, pending: Vec::new(), resampler: Resampler::default() }),
+            _channels: vec![pointer, reliable],
         });
         Ok((sender, local.sdp))
     }
@@ -190,26 +240,25 @@ impl RtcSender {
         Ok(())
     }
 
-    /// Envia um quadro H.264 no formato de `lrd_protocol::video` (o cabeçalho é removido).
+    /// (H.264, H.265, FEC) negociados com o navegador. Válido depois de conectar.
+    pub async fn negotiated(&self) -> (bool, bool, bool) {
+        self.video.negotiated().await
+    }
+
+    /// Envia um quadro H.264/H.265 no formato de `lrd_protocol::video` (o cabeçalho é removido).
+    /// Fila cheia = espera; a captura descarta quadros enquanto isso (o mais novo vence).
     pub async fn write_video(&self, frame: &[u8]) {
         if frame.len() <= H264_HEADER_LEN || frame[0] != FRAME_H264 {
             return;
         }
-        let now = Instant::now();
-        let duration = {
-            let mut last = self.last_video.lock().unwrap();
-            let d = last.map(|t| now.duration_since(t)).unwrap_or(Duration::from_millis(33));
-            *last = Some(now);
-            d.clamp(Duration::from_millis(1), Duration::from_millis(500))
-        };
-        let sample = Sample {
-            data: Bytes::copy_from_slice(&frame[H264_HEADER_LEN..]),
-            duration,
-            ..Default::default()
-        };
-        if let Err(e) = self.video.write_sample(&sample).await {
-            tracing::debug!("WebRTC vídeo: {e}");
-        }
+        let capture_us = u64::from_le_bytes(frame[6..14].try_into().unwrap());
+        self.pacer
+            .send(OutFrame {
+                annexb: Bytes::copy_from_slice(&frame[H264_HEADER_LEN..]),
+                hevc: frame[1] & FLAG_HEVC != 0,
+                capture_us,
+            })
+            .await;
     }
 
     /// Recebe PCM (formato de `lrd_protocol::video`), converte para 48 kHz estéreo e envia em Opus.
@@ -277,7 +326,12 @@ impl RtcSender {
 }
 
 /// Lê o RTCP do vídeo: PLI/FIR pedem quadro completo; REMB e perdas ajustam a taxa.
-async fn rate_control(sender: Arc<RTCRtpSender>, cap: std::sync::mpsc::Sender<CaptureCmd>, max_bitrate: u32) {
+async fn rate_control(
+    sender: Arc<RTCRtpSender>,
+    cap: std::sync::mpsc::Sender<CaptureCmd>,
+    max_bitrate: u32,
+    pacing: Arc<std::sync::atomic::AtomicU32>,
+) {
     let min_bitrate = 400_000u32;
     let mut target = max_bitrate;
     let mut remb_cap = max_bitrate;
@@ -319,6 +373,7 @@ async fn rate_control(sender: Arc<RTCRtpSender>, cap: std::sync::mpsc::Sender<Ca
             last_change = Instant::now();
             tracing::debug!("taxa de vídeo → {} kbps", target / 1000);
             let _ = cap.send(CaptureCmd::SetBitrate(target));
+            pacing.store(target, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }

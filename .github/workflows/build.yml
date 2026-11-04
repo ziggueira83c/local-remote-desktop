@@ -3,7 +3,11 @@ name: Compilar instaladores
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   workflow_dispatch: {}
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -22,6 +26,10 @@ jobs:
             target: x86_64-pc-windows-msvc
             rust_targets: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
+    env:
+      # Chave que assina as atualizações (o app só instala o que tiver esta assinatura).
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
@@ -46,7 +54,15 @@ jobs:
 
       - name: Compilar e empacotar
         working-directory: apps/desktop
-        run: npm run tauri build -- --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "Gerando também os pacotes de atualização assinados."
+            npm run tauri build -- --target ${{ matrix.target }} --config '{"bundle":{"createUpdaterArtifacts":true}}'
+          else
+            echo "::warning::Segredo TAURI_SIGNING_PRIVATE_KEY ausente: sem pacotes de atualização."
+            npm run tauri build -- --target ${{ matrix.target }}
+          fi
 
       - name: Publicar instaladores
         uses: actions/upload-artifact@v4
@@ -57,3 +73,78 @@ jobs:
             target/${{ matrix.target }}/release/bundle/dmg/*.dmg
             target/${{ matrix.target }}/release/bundle/nsis/*.exe
             target/${{ matrix.target }}/release/bundle/msi/*.msi
+
+      - name: Separar arquivos da versão
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -e
+          B="target/${{ matrix.target }}/release/bundle"
+          V=$(node -p "require('./apps/desktop/src-tauri/tauri.conf.json').version")
+          mkdir -p release
+          if [ "${{ matrix.name }}" = "windows" ]; then
+            EXE=$(ls "$B"/nsis/*-setup.exe | head -1)
+            cp "$EXE" "release/LRD_${V}_windows_x64-setup.exe"
+            cp "$EXE.sig" "release/LRD_${V}_windows_x64-setup.exe.sig"
+          else
+            cp "$B/macos/Local Remote Desktop.app.tar.gz" "release/LRD_${V}_mac_universal.app.tar.gz"
+            cp "$B/macos/Local Remote Desktop.app.tar.gz.sig" "release/LRD_${V}_mac_universal.app.tar.gz.sig"
+            cp "$(ls "$B"/dmg/*.dmg | head -1)" "release/LRD_${V}_mac_universal.dmg"
+          fi
+          ls -la release
+
+      - name: Guardar arquivos da versão
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.name }}
+          path: release/*
+
+  release:
+    name: publicar versão
+    needs: build
+    if: always() && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+      - name: Montar latest.json e publicar
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          ls -la release
+          TAG="${GITHUB_REF_NAME}"
+          python3 - "$TAG" <<'PY'
+          import json, os, sys, glob, datetime
+          tag = sys.argv[1]
+          version = tag.lstrip("v")
+          base = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/{tag}/"
+          platforms = {}
+          def add(keys, pattern):
+              files = glob.glob(os.path.join("release", pattern))
+              if not files:
+                  return
+              f = files[0]
+              sig = open(f + ".sig").read().strip()
+              for k in keys:
+                  platforms[k] = {"signature": sig, "url": base + os.path.basename(f)}
+          add(["windows-x86_64", "windows-x86_64-nsis"], "*_windows_x64-setup.exe")
+          add(["darwin-x86_64", "darwin-aarch64", "darwin-x86_64-app", "darwin-aarch64-app"], "*_mac_universal.app.tar.gz")
+          if not platforms:
+              sys.exit("nenhum pacote de atualização encontrado (segredo de assinatura configurado?)")
+          json.dump({
+              "version": version,
+              "notes": f"Local Remote Desktop {version}",
+              "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "platforms": platforms,
+          }, open("release/latest.json", "w"), indent=2)
+          print(open("release/latest.json").read())
+          PY
+          gh release create "$TAG" release/* --title "Local Remote Desktop $TAG" \
+            --notes "Instaladores: Windows (*_windows_x64-setup.exe) e Mac (*_mac_universal.dmg). Quem já tem o app instalado recebe esta versão automaticamente." \
+            || gh release upload "$TAG" release/* --clobber

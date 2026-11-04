@@ -18,6 +18,8 @@ pub mod h264;
 mod hw_mac;
 #[cfg(target_os = "windows")]
 mod hw_win;
+#[cfg(target_os = "windows")]
+mod win_gpu;
 #[cfg(target_os = "macos")]
 mod mac_sck;
 pub mod permissions;
@@ -27,5 +29,5 @@ pub mod source;
 
 pub use capture::{list_displays, Display};
 pub use encoder::{QualitySettings, TileEncoder};
-pub use frame::{PixelFormat, RawFrame};
+pub use frame::{NativeFrame, PixelFormat, RawFrame};
 pub use pipeline::{spawn_capture, CaptureCmd, CaptureHandle, CaptureParams, CursorInfo, PipelineStats, VideoCodec};

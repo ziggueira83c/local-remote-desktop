@@ -1,11 +1,12 @@
-//! Codificador H.264 com escolha automática do motor:
+//! Codificador de vídeo (H.264, ou H.265 quando os dois lados suportam) com escolha
+//! automática do motor:
 //! 1. placa de vídeo — Media Foundation no Windows (NVENC, QuickSync, AMF) e VideoToolbox no
 //!    macOS: 2–5 ms por quadro e quase nada de CPU;
 //! 2. OpenH264 por software como reserva.
 //! Se o motor de hardware falhar a qualquer momento, a sessão continua com o OpenH264.
 
 use anyhow::{anyhow, Result};
-use lrd_protocol::video::build_h264_frame;
+use lrd_protocol::video::build_video_frame;
 use openh264::encoder::{
     BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, RateControlMode, UsageType,
 };
@@ -25,6 +26,18 @@ pub trait Backend: Send {
     fn encode(&mut self, frame: &RawFrame, force_keyframe: bool) -> Result<Option<Encoded>>;
     fn set_bitrate(&mut self, bps: u32);
     fn name(&self) -> &'static str;
+    /// Aceita quadros na GPU (`RawFrame::native`).
+    fn accepts_native(&self) -> bool {
+        false
+    }
+    /// Aceita quadros na memória.
+    fn accepts_cpu(&self) -> bool {
+        true
+    }
+    /// Produz H.265 em vez de H.264.
+    fn hevc(&self) -> bool {
+        false
+    }
 }
 
 pub struct H264Encoder {
@@ -35,6 +48,12 @@ pub struct H264Encoder {
     force_key: bool,
     sequence: u32,
     hardware_failed: bool,
+    /// H.265 desejado (o controlador decodifica); cai para H.264 se não houver hardware.
+    want_hevc: bool,
+    hevc_failed: bool,
+    native_failed: bool,
+    /// Dispositivo do modo GPU em uso (`None` = modo CPU).
+    native_key: Option<usize>,
 }
 
 impl H264Encoder {
@@ -48,7 +67,75 @@ impl H264Encoder {
             force_key: true,
             sequence: 0,
             hardware_failed: false,
+            want_hevc: false,
+            hevc_failed: false,
+            native_failed: false,
+            native_key: None,
         })
+    }
+
+    pub fn set_hevc(&mut self, on: bool) {
+        if on != self.want_hevc {
+            self.want_hevc = on;
+            self.hevc_failed = false;
+            self.dims = (0, 0); // recria o motor no próximo quadro
+        }
+    }
+
+    pub fn is_hevc(&self) -> bool {
+        self.backend.hevc()
+    }
+
+    /// O motor atual lê direto da GPU.
+    pub fn zero_copy(&self) -> bool {
+        self.native_key.is_some()
+    }
+
+    /// Decide se `frame` (na GPU) pode ir direto ao codificador com saída `(tw, th)`;
+    /// (re)abre o motor no modo GPU se preciso. `false` = use o caminho da CPU.
+    pub fn prepare_native(&mut self, frame: &RawFrame, tw: u32, th: u32) -> bool {
+        let Some(native) = &frame.native else { return false };
+        if self.hardware_failed || self.native_failed {
+            return false;
+        }
+        // O VideoToolbox não reduz a imagem: só usa o caminho direto no tamanho exato
+        // (o ScreenCaptureKit já entrega reduzido).
+        if cfg!(target_os = "macos") && (frame.width, frame.height) != (tw, th) {
+            return false;
+        }
+        let key = native.device_key();
+        if self.dims == (tw, th) && self.native_key == Some(key) && self.backend.accepts_native() {
+            return true;
+        }
+        match self.open_native(tw, th, native) {
+            Ok(b) => {
+                tracing::info!("vídeo direto da GPU: {} ({tw}x{th}, H.265: {})", b.name(), b.hevc());
+                self.backend = b;
+                self.dims = (tw, th);
+                self.native_key = Some(key);
+                self.force_key = true;
+                true
+            }
+            Err(e) => {
+                tracing::info!("caminho direto da GPU indisponível ({e:#}); usando cópia");
+                self.native_failed = true;
+                false
+            }
+        }
+    }
+
+    fn open_native(&mut self, w: u32, h: u32, native: &crate::frame::NativeFrame) -> Result<Box<dyn Backend>> {
+        let fps = self.quality.max_fps;
+        if self.want_hevc && !self.hevc_failed {
+            match open_hardware(w, h, fps, self.bitrate, true, Some(native)) {
+                Ok(b) => return Ok(b),
+                Err(e) => {
+                    tracing::info!("H.265 por hardware indisponível ({e:#}); usando H.264");
+                    self.hevc_failed = true;
+                }
+            }
+        }
+        open_hardware(w, h, fps, self.bitrate, false, Some(native))
     }
 
     pub fn name(&self) -> &'static str {
@@ -72,10 +159,25 @@ impl H264Encoder {
     }
 
     fn open_backend(&mut self, w: u32, h: u32) {
+        self.native_key = None;
         if !self.hardware_failed {
-            match open_hardware(w, h, self.quality.max_fps, self.bitrate) {
+            let mut opened = None;
+            if self.want_hevc && !self.hevc_failed {
+                match open_hardware(w, h, self.quality.max_fps, self.bitrate, true, None) {
+                    Ok(b) => opened = Some(b),
+                    Err(e) => {
+                        tracing::info!("H.265 por hardware indisponível ({e:#}); usando H.264");
+                        self.hevc_failed = true;
+                    }
+                }
+            }
+            let opened = match opened {
+                Some(b) => Ok(b),
+                None => open_hardware(w, h, self.quality.max_fps, self.bitrate, false, None),
+            };
+            match opened {
                 Ok(b) => {
-                    tracing::info!("H.264 por hardware: {} ({w}x{h})", b.name());
+                    tracing::info!("vídeo por hardware: {} ({w}x{h}, H.265: {})", b.name(), b.hevc());
                     self.backend = b;
                     return;
                 }
@@ -94,13 +196,15 @@ impl H264Encoder {
         }
     }
 
-    /// Codifica um quadro (dimensões pares) e devolve o quadro de rede pronto.
+    /// Codifica um quadro e devolve o quadro de rede pronto. `frame` vem da CPU no tamanho
+    /// final (dimensões pares), ou da GPU depois de `prepare_native` devolver `true`.
     pub fn encode(&mut self, frame: &RawFrame) -> Option<Vec<u8>> {
-        let (w, h) = (frame.width, frame.height);
+        let native = frame.native.is_some() && self.native_key.is_some() && self.backend.accepts_native();
+        let (w, h) = if native { self.dims } else { (frame.width, frame.height) };
         if w % 2 != 0 || h % 2 != 0 || w > 4096 || h > 4096 {
             return None;
         }
-        if self.dims != (w, h) {
+        if !native && (self.dims != (w, h) || !self.backend.accepts_cpu() || self.native_key.is_some()) {
             self.dims = (w, h);
             self.open_backend(w, h);
             self.force_key = true;
@@ -109,8 +213,14 @@ impl H264Encoder {
         let out = match self.backend.encode(frame, force) {
             Ok(o) => o,
             Err(e) => {
-                if self.backend.name() != "OpenH264" {
-                    tracing::warn!("falha no H.264 por hardware ({e:#}); trocando para OpenH264");
+                if native {
+                    tracing::warn!("falha no caminho direto da GPU ({e:#}); usando cópia");
+                    self.native_failed = true;
+                    self.native_key = None;
+                    self.dims = (0, 0);
+                    self.force_key = true;
+                } else if self.backend.name() != "OpenH264" {
+                    tracing::warn!("falha no codificador de hardware ({e:#}); trocando para OpenH264");
                     self.hardware_failed = true;
                     self.dims = (0, 0);
                     self.force_key = true;
@@ -124,7 +234,7 @@ impl H264Encoder {
             return None;
         }
         self.sequence = self.sequence.wrapping_add(1);
-        Some(build_h264_frame(w as u16, h as u16, out.keyframe, frame.timestamp_us, self.sequence, &out.annexb))
+        Some(build_video_frame(w as u16, h as u16, out.keyframe, self.backend.hevc(), frame.timestamp_us, self.sequence, &out.annexb))
     }
 }
 
@@ -141,23 +251,52 @@ impl Backend for NullBackend {
 }
 
 #[cfg(target_os = "windows")]
-fn open_hardware(w: u32, h: u32, fps: u32, bitrate: u32) -> Result<Box<dyn Backend>> {
-    Ok(Box::new(crate::hw_win::MfEncoder::new(w, h, fps, bitrate)?))
+fn open_hardware(
+    w: u32,
+    h: u32,
+    fps: u32,
+    bitrate: u32,
+    hevc: bool,
+    native: Option<&crate::frame::NativeFrame>,
+) -> Result<Box<dyn Backend>> {
+    let gpu = match native {
+        Some(crate::frame::NativeFrame::D3d(f)) => Some(&f.gpu),
+        _ => None,
+    };
+    Ok(Box::new(crate::hw_win::MfEncoder::new(w, h, fps, bitrate, hevc, gpu)?))
 }
 
 #[cfg(target_os = "macos")]
-fn open_hardware(w: u32, h: u32, fps: u32, bitrate: u32) -> Result<Box<dyn Backend>> {
-    Ok(Box::new(crate::hw_mac::VtEncoder::new(w, h, fps, bitrate)?))
+fn open_hardware(
+    w: u32,
+    h: u32,
+    fps: u32,
+    bitrate: u32,
+    hevc: bool,
+    _native: Option<&crate::frame::NativeFrame>,
+) -> Result<Box<dyn Backend>> {
+    Ok(Box::new(crate::hw_mac::VtEncoder::new(w, h, fps, bitrate, hevc)?))
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-fn open_hardware(_w: u32, _h: u32, _fps: u32, _bitrate: u32) -> Result<Box<dyn Backend>> {
+fn open_hardware(
+    _w: u32,
+    _h: u32,
+    _fps: u32,
+    _bitrate: u32,
+    _hevc: bool,
+    _native: Option<&crate::frame::NativeFrame>,
+) -> Result<Box<dyn Backend>> {
     Err(anyhow!("sem codificador de hardware nesta plataforma"))
 }
 
-/// Verifica se o bitstream Annex B contém um SPS (NAL tipo 7).
-pub(crate) fn has_sps(annexb: &[u8]) -> bool {
-    annexb.windows(4).any(|w| w[0] == 0 && w[1] == 0 && w[2] == 1 && (w[3] & 0x1f) == 7)
+/// Verifica se o bitstream Annex B traz os conjuntos de parâmetros (SPS: NAL 7 no H.264,
+/// 33 no H.265).
+#[allow(dead_code)]
+pub(crate) fn has_param_sets(annexb: &[u8], hevc: bool) -> bool {
+    annexb.windows(4).any(|w| {
+        w[0] == 0 && w[1] == 0 && w[2] == 1 && if hevc { (w[3] >> 1) & 0x3f == 33 } else { (w[3] & 0x1f) == 7 }
+    })
 }
 
 // ---------------------------------------------------------------------------------------

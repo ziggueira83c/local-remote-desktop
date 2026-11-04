@@ -17,7 +17,7 @@
 //! ```
 //! Vídeo H.264 (`type = 3`):
 //! ```text
-//! u8 type = 3, u8 flags (bit 0 = keyframe), u16 width, u16 height, u64 timestamp_us,
+//! u8 type = 3, u8 flags (bit 0 = keyframe, bit 1 = HEVC), u16 width, u16 height, u64 timestamp_us,
 //! u32 sequence, [bitstream Annex B]
 //! ```
 //! Áudio PCM (`type = 4`):
@@ -33,6 +33,8 @@ pub const FRAME_AUDIO: u8 = 4;
 pub const H264_HEADER_LEN: usize = 18;
 pub const AUDIO_HEADER_LEN: usize = 14;
 pub const FLAG_KEYFRAME: u8 = 1;
+/// Quadro tipo 3 com bitstream H.265/HEVC em vez de H.264.
+pub const FLAG_HEVC: u8 = 2;
 pub const TILES_HEADER_LEN: usize = 12;
 pub const TILE_HEADER_LEN: usize = 12;
 
@@ -102,9 +104,22 @@ pub fn build_cursor_frame_kind(visible: bool, x: u16, y: u16, kind: u8) -> Vec<u
 
 /// Monta um quadro H.264.
 pub fn build_h264_frame(width: u16, height: u16, keyframe: bool, timestamp_us: u64, sequence: u32, bitstream: &[u8]) -> Vec<u8> {
+    build_video_frame(width, height, keyframe, false, timestamp_us, sequence, bitstream)
+}
+
+/// Monta um quadro de vídeo comprimido (H.264 ou, com `hevc`, H.265).
+pub fn build_video_frame(
+    width: u16,
+    height: u16,
+    keyframe: bool,
+    hevc: bool,
+    timestamp_us: u64,
+    sequence: u32,
+    bitstream: &[u8],
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(H264_HEADER_LEN + bitstream.len());
     out.push(FRAME_H264);
-    out.push(if keyframe { FLAG_KEYFRAME } else { 0 });
+    out.push(if keyframe { FLAG_KEYFRAME } else { 0 } | if hevc { FLAG_HEVC } else { 0 });
     out.extend_from_slice(&width.to_le_bytes());
     out.extend_from_slice(&height.to_le_bytes());
     out.extend_from_slice(&timestamp_us.to_le_bytes());

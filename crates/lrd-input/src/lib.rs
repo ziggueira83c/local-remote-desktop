@@ -3,13 +3,15 @@
 //! - Teclado: teclas FÍSICAS (USB HID usage) convertidas em scancodes (Windows, `SendInput`
 //!   com `KEYEVENTF_SCANCODE`) ou keycodes virtuais (macOS, `CGEvent`). Assim o layout do
 //!   computador controlado (ABNT2, US...) decide o caractere produzido.
-//! - Mouse: posição absoluta em coordenadas do SO; botões e rolagem via `enigo`.
+//! - Mouse: posição absoluta em coordenadas do SO. No macOS, movimento e botões vão direto
+//!   por `CGEvent` (com eventos de arrasto e clique duplo corretos); rolagem via `enigo`.
+//! - Movimentos acumulados na fila são fundidos: só o mais recente é aplicado.
 //! - Ao encerrar a sessão, tudo que ficou pressionado é liberado (RN-014).
 
 pub mod hid;
 mod keyboard;
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use anyhow::Result;
@@ -63,10 +65,40 @@ fn run(rx: Receiver<InjectCmd>, ready: Sender<Result<(), String>>) {
 
     let mut keys_down: HashSet<u32> = HashSet::new();
     let mut buttons_down: HashSet<u32> = HashSet::new();
+    #[cfg(target_os = "macos")]
+    let mut mouse = mac_mouse::Mouse::new();
+    let mut queue: VecDeque<InjectCmd> = VecDeque::new();
 
-    while let Ok(cmd) = rx.recv() {
+    loop {
+        let cmd = match queue.pop_front() {
+            Some(c) => c,
+            None => match rx.recv() {
+                Ok(c) => c,
+                Err(_) => break,
+            },
+        };
+        while let Ok(c) = rx.try_recv() {
+            queue.push_back(c);
+        }
+        // Movimento seguido de outro movimento: pula direto para o mais novo.
+        if matches!(cmd, InjectCmd::MoveAbs { .. }) && matches!(queue.front(), Some(InjectCmd::MoveAbs { .. })) {
+            continue;
+        }
         let result: Result<(), String> = match cmd {
+            #[cfg(target_os = "macos")]
+            InjectCmd::MoveAbs { x, y } => mouse.move_to(x, y),
+            #[cfg(target_os = "macos")]
+            InjectCmd::Button { button, pressed } => {
+                if pressed {
+                    buttons_down.insert(button);
+                } else {
+                    buttons_down.remove(&button);
+                }
+                mouse.button(button, pressed)
+            }
+            #[cfg(not(target_os = "macos"))]
             InjectCmd::MoveAbs { x, y } => move_abs(&mut enigo, x, y),
+            #[cfg(not(target_os = "macos"))]
             InjectCmd::Button { button, pressed } => {
                 let b = match button {
                     1 => Button::Middle,
@@ -110,12 +142,17 @@ fn run(rx: Receiver<InjectCmd>, ready: Sender<Result<(), String>>) {
                     let _ = kb.key(hid, false);
                 }
                 for b in buttons_down.drain() {
-                    let btn = match b {
-                        1 => Button::Middle,
-                        2 => Button::Right,
-                        _ => Button::Left,
-                    };
-                    let _ = enigo.button(btn, Direction::Release);
+                    #[cfg(target_os = "macos")]
+                    let _ = mouse.button(b, false);
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        let btn = match b {
+                            1 => Button::Middle,
+                            2 => Button::Right,
+                            _ => Button::Left,
+                        };
+                        let _ = enigo.button(btn, Direction::Release);
+                    }
                 }
                 Ok(())
             }
@@ -138,7 +175,7 @@ fn move_abs(_enigo: &mut Enigo, x: i32, y: i32) -> Result<(), String> {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn move_abs(driver: &mut Enigo, x: i32, y: i32) -> Result<(), String> {
     driver.move_mouse(x, y, enigo::Coordinate::Abs).map_err(|e| format!("{e:?}"))
 }
@@ -262,5 +299,79 @@ pub fn open_screen_recording_settings() {
         let _ = std::process::Command::new("open")
             .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
             .spawn();
+    }
+}
+
+/// macOS: mouse direto pelo Quartz (sem atrasos e com arrasto/clique duplo nativos).
+#[cfg(target_os = "macos")]
+mod mac_mouse {
+    use std::time::{Duration, Instant};
+
+    use core_graphics::event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, EventField};
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+    use core_graphics::geometry::CGPoint;
+
+    const DOUBLE_CLICK: Duration = Duration::from_millis(450);
+
+    pub struct Mouse {
+        pos: CGPoint,
+        down: [bool; 3],
+        last_click: Option<(Instant, u32, CGPoint)>,
+        clicks: i64,
+    }
+
+    impl Mouse {
+        pub fn new() -> Self {
+            let (x, y) = crate::cursor_position().unwrap_or((0, 0));
+            Mouse { pos: CGPoint::new(x as f64, y as f64), down: [false; 3], last_click: None, clicks: 1 }
+        }
+
+        fn post(&self, kind: CGEventType, button: CGMouseButton, clicks: Option<i64>) -> Result<(), String> {
+            let src = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+                .map_err(|_| "CGEventSource indisponível".to_string())?;
+            let ev = CGEvent::new_mouse_event(src, kind, self.pos, button)
+                .map_err(|_| "falha ao criar evento de mouse".to_string())?;
+            if let Some(c) = clicks {
+                ev.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, c);
+            }
+            ev.post(CGEventTapLocation::HID);
+            Ok(())
+        }
+
+        pub fn move_to(&mut self, x: i32, y: i32) -> Result<(), String> {
+            self.pos = CGPoint::new(x as f64, y as f64);
+            let (kind, button) = if self.down[0] {
+                (CGEventType::LeftMouseDragged, CGMouseButton::Left)
+            } else if self.down[2] {
+                (CGEventType::RightMouseDragged, CGMouseButton::Right)
+            } else if self.down[1] {
+                (CGEventType::OtherMouseDragged, CGMouseButton::Center)
+            } else {
+                (CGEventType::MouseMoved, CGMouseButton::Left)
+            };
+            self.post(kind, button, None)
+        }
+
+        pub fn button(&mut self, button: u32, pressed: bool) -> Result<(), String> {
+            let b = (button as usize).min(2);
+            self.down[b] = pressed;
+            if pressed {
+                let near = |p: CGPoint| (p.x - self.pos.x).abs() < 5.0 && (p.y - self.pos.y).abs() < 5.0;
+                self.clicks = match self.last_click {
+                    Some((t, lb, p)) if lb == button && t.elapsed() < DOUBLE_CLICK && near(p) => self.clicks + 1,
+                    _ => 1,
+                };
+                self.last_click = Some((Instant::now(), button, self.pos));
+            }
+            let (kind, cg) = match (b, pressed) {
+                (0, true) => (CGEventType::LeftMouseDown, CGMouseButton::Left),
+                (0, false) => (CGEventType::LeftMouseUp, CGMouseButton::Left),
+                (2, true) => (CGEventType::RightMouseDown, CGMouseButton::Right),
+                (2, false) => (CGEventType::RightMouseUp, CGMouseButton::Right),
+                (_, true) => (CGEventType::OtherMouseDown, CGMouseButton::Center),
+                (_, false) => (CGEventType::OtherMouseUp, CGMouseButton::Center),
+            };
+            self.post(kind, cg, Some(self.clicks))
+        }
     }
 }

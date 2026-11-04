@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { api, errorMessage, type AppSettings } from "../lib/api";
 import { useStore } from "../store";
+import { checkForUpdate, installUpdate, subscribe, type UpdateState } from "../lib/updater";
+import { getVersion } from "@tauri-apps/api/app";
 
 export function SettingsPage() {
   const toast = useStore((s) => s.toast);
@@ -10,6 +12,12 @@ export function SettingsPage() {
   const [saving, setSaving] = useState(false);
   const [pw1, setPw1] = useState("");
   const [pw2, setPw2] = useState("");
+  const [upd, setUpd] = useState<UpdateState>({ kind: "idle" });
+  const [version, setVersion] = useState("");
+  useEffect(() => subscribe(setUpd), []);
+  useEffect(() => {
+    getVersion().then(setVersion).catch(() => {});
+  }, []);
 
   useEffect(() => {
     api.getSettings().then(setS).catch((e) => toast("error", errorMessage(e)));
@@ -191,6 +199,35 @@ export function SettingsPage() {
           Permitir acesso com a senha sem pedir aprovação {local?.hasAccessPassword ? "" : "(defina uma senha primeiro)"}
         </label>
         <span className="field__help">Lembre de clicar em “Salvar” no fim da página para ativar ou desativar.</span>
+      </div>
+
+      <div className="card">
+        <h2 className="card__title">Atualizações</h2>
+        <p className="field__help">
+          Versão instalada: <strong>{version || "—"}</strong>. O app procura versões novas sozinho ao abrir e a cada
+          6 horas; cada atualização é conferida pela assinatura digital antes de ser instalada.
+        </p>
+        <div className="row">
+          {upd.kind === "available" ? (
+            <button className="btn btn--primary" onClick={() => installUpdate()}>
+              Instalar a versão {upd.version}
+            </button>
+          ) : (
+            <button
+              className="btn"
+              onClick={() => checkForUpdate(false)}
+              disabled={upd.kind === "checking" || upd.kind === "downloading"}
+            >
+              {upd.kind === "checking" ? "Procurando…" : "Procurar atualizações"}
+            </button>
+          )}
+          <span className="small">
+            {upd.kind === "none" && "Você já está na versão mais recente."}
+            {upd.kind === "downloading" && `Baixando${upd.percent != null ? ` ${upd.percent.toFixed(0)}%` : "…"}`}
+            {upd.kind === "ready" && "Instalando…"}
+            {upd.kind === "error" && `Não foi possível verificar: ${upd.message}`}
+          </span>
+        </div>
       </div>
 
       <div className="card">

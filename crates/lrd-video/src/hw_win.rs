@@ -1,6 +1,9 @@
-//! Windows: H.264 pela placa de vídeo via Media Foundation (MFT de hardware: NVIDIA NVENC,
-//! Intel QuickSync ou AMD AMF). MFTs de hardware são assíncronos: pedem entrada
+//! Windows: H.264/H.265 pela placa de vídeo via Media Foundation (MFT de hardware: NVIDIA
+//! NVENC, Intel QuickSync ou AMD AMF). MFTs de hardware são assíncronos: pedem entrada
 //! (METransformNeedInput) e avisam quando há saída (METransformHaveOutput).
+//!
+//! Modo GPU: o MFT recebe o dispositivo D3D11 da captura (IMFDXGIDeviceManager) e lê
+//! texturas NV12 preparadas pelo processador de vídeo (`win_gpu`). Sem cópias pela CPU.
 
 use std::mem::ManuallyDrop;
 use std::time::{Duration, Instant};
@@ -12,8 +15,10 @@ use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHR
 use windows::Win32::System::Variant::VARIANT;
 
 use crate::color::to_nv12;
-use crate::frame::RawFrame;
-use crate::h264::{has_sps, Backend, Encoded};
+use crate::frame::{NativeFrame, RawFrame};
+use crate::h264::{has_param_sets, Backend, Encoded};
+use crate::win_gpu::{Gpu, GpuConverter};
+use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 
 const MF_EVENT_FLAG_NO_WAIT: u32 = 1;
 const MFT_OUTPUT_STREAM_PROVIDES_SAMPLES: u32 = 0x100;
@@ -32,6 +37,10 @@ pub struct MfEncoder {
     output_size: u32,
     name: &'static str,
     frame_index: i64,
+    hevc: bool,
+    gpu: Option<Gpu>,
+    converter: Option<GpuConverter>,
+    _manager: Option<IMFDXGIDeviceManager>,
 }
 
 // SAFETY: o codificador é usado só pela thread de captura que o criou (MTA).
@@ -42,14 +51,16 @@ fn frame_pair(a: u32, b: u32) -> u64 {
 }
 
 impl MfEncoder {
-    pub fn new(width: u32, height: u32, fps: u32, bitrate: u32) -> Result<Self> {
+    /// `gpu`: modo GPU (entrada em texturas do dispositivo da captura).
+    pub fn new(width: u32, height: u32, fps: u32, bitrate: u32, hevc: bool, gpu: Option<&Gpu>) -> Result<Self> {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             MFStartup(MF_VERSION, MFSTARTUP_FULL).context("MFStartup")?;
 
-            // Procura MFTs de hardware NV12 → H.264.
+            // Procura MFTs de hardware NV12 → H.264/H.265.
+            let subtype = if hevc { MFVideoFormat_HEVC } else { MFVideoFormat_H264 };
             let input = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_NV12 };
-            let output = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_H264 };
+            let output = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: subtype };
             let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
             let mut count = 0u32;
             MFTEnumEx(
@@ -65,7 +76,7 @@ impl MfEncoder {
                 if !activates.is_null() {
                     CoTaskMemFree(Some(activates as *const _));
                 }
-                return Err(anyhow!("nenhum codificador H.264 de hardware encontrado"));
+                return Err(anyhow!("nenhum codificador {} de hardware encontrado", if hevc { "H.265" } else { "H.264" }));
             }
             let list: Vec<Option<IMFActivate>> =
                 (0..count as usize).map(|i| std::ptr::read(activates.add(i))).collect();
@@ -73,7 +84,7 @@ impl MfEncoder {
 
             let mut last_err = anyhow!("nenhum codificador utilizável");
             for activate in list.into_iter().flatten() {
-                match Self::from_activate(&activate, width, height, fps, bitrate) {
+                match Self::from_activate(&activate, width, height, fps, bitrate, hevc, gpu) {
                     Ok(enc) => return Ok(enc),
                     Err(e) => {
                         tracing::debug!("codificador de hardware recusado: {e:#}");
@@ -85,7 +96,16 @@ impl MfEncoder {
         }
     }
 
-    unsafe fn from_activate(activate: &IMFActivate, width: u32, height: u32, fps: u32, bitrate: u32) -> Result<Self> {
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn from_activate(
+        activate: &IMFActivate,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate: u32,
+        hevc: bool,
+        gpu: Option<&Gpu>,
+    ) -> Result<Self> {
         let name = unsafe { vendor_name(activate) };
         let transform: IMFTransform = unsafe { activate.ActivateObject() }.context("ActivateObject")?;
         unsafe {
@@ -94,15 +114,36 @@ impl MfEncoder {
             let _ = attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1);
             let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
 
+            // Modo GPU: entrega o dispositivo D3D11 ao codificador (antes dos tipos de mídia).
+            let mut manager = None;
+            if let Some(g) = gpu {
+                if attrs.GetUINT32(&MF_SA_D3D11_AWARE).unwrap_or(0) == 0 {
+                    return Err(anyhow!("codificador não aceita texturas D3D11"));
+                }
+                let mut token = 0u32;
+                let mut m: Option<IMFDXGIDeviceManager> = None;
+                MFCreateDXGIDeviceManager(&mut token, &mut m).context("MFCreateDXGIDeviceManager")?;
+                let m = m.ok_or_else(|| anyhow!("sem IMFDXGIDeviceManager"))?;
+                m.ResetDevice(&g.device, token).context("ResetDevice")?;
+                transform
+                    .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, m.as_raw() as usize)
+                    .context("MFT_MESSAGE_SET_D3D_MANAGER")?;
+                manager = Some(m);
+            }
+
             let out_type = MFCreateMediaType()?;
             out_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-            out_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+            out_type.SetGUID(&MF_MT_SUBTYPE, if hevc { &MFVideoFormat_HEVC } else { &MFVideoFormat_H264 })?;
             out_type.SetUINT32(&MF_MT_AVG_BITRATE, bitrate)?;
             out_type.SetUINT64(&MF_MT_FRAME_SIZE, frame_pair(width, height))?;
             out_type.SetUINT64(&MF_MT_FRAME_RATE, frame_pair(fps.max(1), 1))?;
             out_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, frame_pair(1, 1))?;
             out_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-            out_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32)?;
+            if hevc {
+                out_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH265VProfile_Main_420_8.0 as u32)?;
+            } else {
+                out_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32)?;
+            }
             transform.SetOutputType(0, &out_type, 0).context("SetOutputType")?;
 
             let in_type = MFCreateMediaType()?;
@@ -144,6 +185,10 @@ impl MfEncoder {
                 output_size: info.cbSize.max(width * height * 2),
                 name,
                 frame_index: 0,
+                hevc,
+                gpu: gpu.cloned(),
+                converter: None,
+                _manager: manager,
             })
         }
     }
@@ -208,7 +253,7 @@ impl MfEncoder {
         let _ = unsafe { buffer.Unlock() };
 
         // Alguns codificadores só informam SPS/PPS no tipo de saída: anexa nos quadros completos.
-        if keyframe && !has_sps(&data) {
+        if keyframe && !has_param_sets(&data, self.hevc) {
             if self.sequence_header.is_empty() {
                 if let Ok(t) = unsafe { self.transform.GetOutputCurrentType(0) } {
                     if let Ok(size) = unsafe { t.GetBlobSize(&MF_MT_MPEG_SEQUENCE_HEADER) } {
@@ -234,7 +279,7 @@ impl MfEncoder {
 
 impl Backend for MfEncoder {
     fn encode(&mut self, frame: &RawFrame, force_keyframe: bool) -> Result<Option<Encoded>> {
-        if frame.width != self.width || frame.height != self.height {
+        if self.gpu.is_none() && (frame.width != self.width || frame.height != self.height) {
             return Err(anyhow!("dimensões mudaram"));
         }
         unsafe {
@@ -256,13 +301,34 @@ impl Backend for MfEncoder {
                 }
             }
 
-            let nv12 = to_nv12(frame);
-            let buffer = MFCreateMemoryBuffer(nv12.len() as u32)?;
-            let mut ptr: *mut u8 = std::ptr::null_mut();
-            buffer.Lock(&mut ptr, None, None)?;
-            std::ptr::copy_nonoverlapping(nv12.as_ptr(), ptr, nv12.len());
-            buffer.Unlock()?;
-            buffer.SetCurrentLength(nv12.len() as u32)?;
+            let buffer = if let Some(gpu) = self.gpu.clone() {
+                let Some(NativeFrame::D3d(g)) = &frame.native else {
+                    return Err(anyhow!("modo GPU recebeu quadro da CPU"));
+                };
+                let input = (g.width, g.height);
+                let output = (self.width, self.height);
+                if !self.converter.as_ref().is_some_and(|c| c.matches(&g.gpu, input, output)) {
+                    self.converter = Some(GpuConverter::new(&gpu, input, output, self.fps)?);
+                }
+                let tex = self.converter.as_mut().unwrap().convert(g)?;
+                let buffer = MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, &tex, 0, false)
+                    .context("MFCreateDXGISurfaceBuffer")?;
+                if let Ok(b2) = buffer.cast::<IMF2DBuffer>() {
+                    if let Ok(len) = b2.GetContiguousLength() {
+                        let _ = buffer.SetCurrentLength(len);
+                    }
+                }
+                buffer
+            } else {
+                let nv12 = to_nv12(frame);
+                let buffer = MFCreateMemoryBuffer(nv12.len() as u32)?;
+                let mut ptr: *mut u8 = std::ptr::null_mut();
+                buffer.Lock(&mut ptr, None, None)?;
+                std::ptr::copy_nonoverlapping(nv12.as_ptr(), ptr, nv12.len());
+                buffer.Unlock()?;
+                buffer.SetCurrentLength(nv12.len() as u32)?;
+                buffer
+            };
             let sample = MFCreateSample()?;
             sample.AddBuffer(&buffer)?;
             let duration = 10_000_000i64 / self.fps as i64;
@@ -304,6 +370,18 @@ impl Backend for MfEncoder {
 
     fn name(&self) -> &'static str {
         self.name
+    }
+
+    fn accepts_native(&self) -> bool {
+        self.gpu.is_some()
+    }
+
+    fn accepts_cpu(&self) -> bool {
+        self.gpu.is_none()
+    }
+
+    fn hevc(&self) -> bool {
+        self.hevc
     }
 }
 

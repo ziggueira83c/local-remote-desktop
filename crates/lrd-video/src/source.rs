@@ -19,6 +19,9 @@ pub enum Source {
         rx: std::sync::mpsc::Receiver<xcap::Frame>,
         display: Display,
     },
+    /// Windows: DXGI Desktop Duplication próprio, com o quadro mantido na GPU.
+    #[cfg(target_os = "windows")]
+    Gpu(crate::win_gpu::DuplSource),
     /// macOS: ScreenCaptureKit (vídeo e, opcionalmente, áudio).
     #[cfg(target_os = "macos")]
     Sck(crate::mac_sck::SckSource),
@@ -42,6 +45,12 @@ impl Source {
 
         #[cfg(target_os = "windows")]
         {
+            if std::env::var_os("LRD_NO_GPU_CAPTURE").is_none() {
+                match crate::win_gpu::DuplSource::open(&capturer.display) {
+                    Ok(s) => return Ok(Source::Gpu(s)),
+                    Err(e) => tracing::warn!("captura na GPU indisponível ({e:#}); usando DXGI com cópia"),
+                }
+            }
             match capturer.monitor.video_recorder() {
                 Ok((recorder, rx)) => match recorder.start() {
                     Ok(()) => {
@@ -62,6 +71,8 @@ impl Source {
             Source::Poll(c) => &c.display,
             #[cfg(target_os = "windows")]
             Source::Dxgi { display, .. } => display,
+            #[cfg(target_os = "windows")]
+            Source::Gpu(s) => &s.display,
             #[cfg(target_os = "macos")]
             Source::Sck(s) => &s.display,
         }
@@ -81,6 +92,8 @@ impl Source {
             Source::Poll(_) => "cópia",
             #[cfg(target_os = "windows")]
             Source::Dxgi { .. } => "DXGI",
+            #[cfg(target_os = "windows")]
+            Source::Gpu(_) => "DXGI (GPU)",
             #[cfg(target_os = "macos")]
             Source::Sck(_) => "ScreenCaptureKit",
         }
@@ -113,14 +126,16 @@ impl Source {
                 }
                 let mut data = latest.raw;
                 data.truncate(expected);
-                Ok(Some(RawFrame {
-                    width: latest.width,
-                    height: latest.height,
+                Ok(Some(RawFrame::cpu(
+                    latest.width,
+                    latest.height,
                     data,
-                    format: crate::frame::PixelFormat::Rgba,
-                    timestamp_us: lrd_protocol::now_us(),
-                }))
+                    crate::frame::PixelFormat::Rgba,
+                    lrd_protocol::now_us(),
+                )))
             }
+            #[cfg(target_os = "windows")]
+            Source::Gpu(s) => s.next_frame(timeout),
             #[cfg(target_os = "macos")]
             Source::Sck(s) => s.next_frame(timeout),
         }

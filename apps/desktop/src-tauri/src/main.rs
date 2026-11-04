@@ -33,6 +33,8 @@ fn main() {
         .init();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             // LRD_DATA_DIR permite rodar duas instâncias na mesma máquina para testes.
             let data_dir = match std::env::var_os("LRD_DATA_DIR") {

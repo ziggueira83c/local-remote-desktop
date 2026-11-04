@@ -7,6 +7,7 @@ import { InboundBanner } from "./components/InboundBanner";
 import { IncomingRequestDialog } from "./components/IncomingRequestDialog";
 import { ConnectingDialog } from "./components/ConnectingDialog";
 import { Toasts } from "./components/Toasts";
+import { UpdateBanner } from "./components/UpdateBanner";
 import { HomePage } from "./pages/HomePage";
 import { RemoteSessionPage } from "./pages/RemoteSessionPage";
 import { SettingsPage } from "./pages/SettingsPage";
@@ -36,6 +37,7 @@ export default function App() {
     <div className={inSession ? "app app--session" : "app"}>
       {!inSession && <Header />}
       <InboundBanner />
+      {!inSession && <UpdateBanner />}
       <main className="app__main">
         {page === "home" && <HomePage />}
         {page === "session" && (outbound ? <RemoteSessionPage /> : <HomePage />)}

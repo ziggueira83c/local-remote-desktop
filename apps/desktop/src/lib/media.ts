@@ -17,6 +17,22 @@ export interface RtcStats {
   lossPct: number;
 }
 
+/** Atraso medido de ponta a ponta. */
+export interface LatencyStats {
+  /** Captura no host → quadro na tela daqui (mediana dos últimos quadros). */
+  glassMs: number | null;
+  /** Ida e volta de um comando (canal de entrada). */
+  inputRttMs: number | null;
+  /** Comandos indo pelo canal direto do WebRTC (e não pelo caminho de reserva). */
+  directInput: boolean;
+}
+
+export type InputMsg =
+  | { type: "pointer"; displayId?: string; x: number; y: number }
+  | { type: "button"; button: number; pressed: boolean }
+  | { type: "scroll"; dx: number; dy: number }
+  | { type: "key"; hid: number; pressed: boolean };
+
 export interface MediaCallbacks {
   onMode: (m: MediaMode) => void;
   /** O áudio do WebRTC precisa de um clique para tocar (política de autoplay). */
@@ -30,7 +46,16 @@ export interface MediaCallbacks {
 /** Codecs que esta interface consegue decodificar, em ordem de preferência. */
 export async function supportedCodecs(): Promise<string[]> {
   const out = ["jpeg-tiles"];
-  if (typeof RTCPeerConnection !== "undefined") out.unshift("webrtc");
+  if (typeof RTCPeerConnection !== "undefined") {
+    out.unshift("webrtc");
+    try {
+      // H.265 no WebRTC só quando o navegador sabe decodificar (normalmente por hardware).
+      const caps = RTCRtpReceiver.getCapabilities?.("video");
+      if (caps?.codecs.some((c) => c.mimeType.toLowerCase() === "video/h265")) out.push("webrtc-h265");
+    } catch {
+      /* sem getCapabilities */
+    }
+  }
   try {
     if (typeof VideoDecoder !== "undefined") {
       const r = await VideoDecoder.isConfigSupported({ codec: "avc1.42E033", optimizeForLatency: true });
@@ -72,6 +97,16 @@ export class MediaEngine {
   private stream: MediaStream | null = null;
   private video: HTMLVideoElement | null = null;
   mode: MediaMode = "pending";
+  // Entrada direta (canais de dados do WebRTC) e medição de atraso.
+  private dcPointer: RTCDataChannel | null = null;
+  private dcInput: RTCDataChannel | null = null;
+  private moveSeq = 0;
+  private buttonsDown = 0;
+  private heldPointer: Uint8Array | null = null;
+  private pingTimer = 0;
+  private clock: { offsetMs: number; rttMs: number; at: number }[] = [];
+  private inputRtt: number[] = [];
+  private glass: number[] = [];
   private lastStats: { bytes: number; time: number; lost: number; recv: number } | null = null;
 
   constructor(audioCtx: AudioContext | null) {
@@ -110,6 +145,7 @@ export class MediaEngine {
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === "failed" && this.mode === "webrtc") this.setMode("pending");
     };
+    pc.ondatachannel = (ev) => this.bindChannel(ev.channel);
     await pc.setRemoteDescription({ type: "offer", sdp });
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
@@ -124,6 +160,138 @@ export class MediaEngine {
       setTimeout(done, 1500);
     });
     return pc.localDescription?.sdp ?? answer.sdp ?? "";
+  }
+
+  private bindChannel(dc: RTCDataChannel) {
+    dc.binaryType = "arraybuffer";
+    if (dc.label === "pointer") {
+      this.dcPointer = dc;
+      dc.bufferedAmountLowThreshold = 512;
+      dc.onbufferedamountlow = () => {
+        const held = this.heldPointer;
+        this.heldPointer = null;
+        if (held && dc.readyState === "open") dc.send(held as unknown as ArrayBuffer);
+      };
+    } else if (dc.label === "input") {
+      this.dcInput = dc;
+      dc.onmessage = (ev) => this.onControlMessage(new Uint8Array(ev.data as ArrayBuffer));
+      const start = () => {
+        // Sincroniza os relógios: rajada inicial e depois a cada segundo.
+        for (let i = 0; i < 5; i++) setTimeout(() => this.ping(), i * 60);
+        clearInterval(this.pingTimer);
+        this.pingTimer = window.setInterval(() => this.ping(), 1000);
+      };
+      if (dc.readyState === "open") start();
+      else dc.onopen = start;
+    }
+  }
+
+  private ping() {
+    const dc = this.dcInput;
+    if (!dc || dc.readyState !== "open") return;
+    const b = new Uint8Array(9);
+    const v = new DataView(b.buffer);
+    v.setUint8(0, 5);
+    v.setFloat64(1, performance.timeOrigin + performance.now(), true);
+    dc.send(b);
+  }
+
+  private onControlMessage(b: Uint8Array) {
+    if (b.length < 17 || b[0] !== 6) return;
+    const v = new DataView(b.buffer, b.byteOffset, b.byteLength);
+    const t0 = v.getFloat64(1, true);
+    const hostMs = Number(v.getBigUint64(9, true)) / 1000;
+    const now = performance.timeOrigin + performance.now();
+    const rtt = now - t0;
+    if (rtt < 0 || rtt > 2000) return;
+    // O instante do host corresponde, em média, ao meio da ida e volta.
+    this.clock.push({ offsetMs: hostMs - (t0 + rtt / 2), rttMs: rtt, at: now });
+    this.clock = this.clock.filter((c) => now - c.at < 30_000).slice(-30);
+    this.inputRtt.push(rtt);
+    if (this.inputRtt.length > 10) this.inputRtt.shift();
+  }
+
+  /** Diferença relógio do host − relógio local (ms), da amostra com menor ida e volta. */
+  private clockOffset(): number | null {
+    if (this.clock.length === 0) return null;
+    let best = this.clock[0];
+    for (const c of this.clock) if (c.rttMs < best.rttMs) best = c;
+    return best.offsetMs;
+  }
+
+  /**
+   * Chamado para cada quadro apresentado (requestVideoFrameCallback). O carimbo RTP do host
+   * é o instante da captura (90 kHz), então dá para medir captura → tela.
+   */
+  noteVideoFrame(meta: { rtpTimestamp?: number; expectedDisplayTime?: number; presentationTime?: number }) {
+    const off = this.clockOffset();
+    if (off == null || meta.rtpTimestamp == null) return;
+    const shown = performance.timeOrigin + (meta.expectedDisplayTime ?? meta.presentationTime ?? performance.now());
+    const hostTicks = Math.round((shown + off) * 90) % 4294967296;
+    let diff = hostTicks - (meta.rtpTimestamp >>> 0);
+    if (diff < 0) diff += 4294967296;
+    const ms = diff / 90;
+    if (ms > 5000) return; // fora da faixa (relógio ainda não sincronizado)
+    this.glass.push(ms);
+    if (this.glass.length > 60) this.glass.shift();
+  }
+
+  latency(): LatencyStats {
+    const median = (a: number[]) => {
+      if (a.length === 0) return null;
+      const s = [...a].sort((x, y) => x - y);
+      return s[Math.floor(s.length / 2)];
+    };
+    return {
+      glassMs: this.mode === "webrtc" ? median(this.glass) : null,
+      inputRttMs: median(this.inputRtt),
+      directInput: this.dcInput?.readyState === "open",
+    };
+  }
+
+  /**
+   * Envia um comando direto ao host pelo WebRTC (sem passar pelo processo do app).
+   * Retorna `false` se o canal não estiver aberto (o chamador usa o caminho de reserva).
+   */
+  sendInput(m: InputMsg): boolean {
+    const rel = this.dcInput;
+    if (!rel || rel.readyState !== "open") return false;
+    switch (m.type) {
+      case "pointer": {
+        const b = new Uint8Array(7);
+        const v = new DataView(b.buffer);
+        v.setUint8(0, 1);
+        v.setUint16(1, m.x, true);
+        v.setUint16(3, m.y, true);
+        this.moveSeq = (this.moveSeq + 1) & 0xffff;
+        v.setUint16(5, this.moveSeq, true);
+        const fast = this.dcPointer;
+        // Arrastando: vai pelo canal confiável para chegar na ordem certa em relação ao soltar.
+        if (this.buttonsDown === 0 && fast && fast.readyState === "open") {
+          if (fast.bufferedAmount > 2048) this.heldPointer = b; // rede ocupada: só o mais novo
+          else fast.send(b);
+        } else {
+          rel.send(b);
+        }
+        return true;
+      }
+      case "button": {
+        const bit = 1 << (m.button & 7);
+        this.buttonsDown = m.pressed ? this.buttonsDown | bit : this.buttonsDown & ~bit;
+        rel.send(Uint8Array.of(2, m.button & 0xff, m.pressed ? 1 : 0));
+        return true;
+      }
+      case "key": {
+        rel.send(Uint8Array.of(3, m.hid & 0xff, (m.hid >> 8) & 0xff, m.pressed ? 1 : 0));
+        return true;
+      }
+      case "scroll": {
+        const clamp = (n: number) => Math.max(-127, Math.min(127, n)) & 0xff;
+        rel.send(Uint8Array.of(4, clamp(m.dx), clamp(m.dy)));
+        return true;
+      }
+    }
+    return false;
   }
 
   /** Liga o elemento <video> que mostra a mídia do WebRTC. */
@@ -237,6 +405,9 @@ export class MediaEngine {
     }
     this.decoder = null;
     this.audio?.close();
+    clearInterval(this.pingTimer);
+    this.dcInput = null;
+    this.dcPointer = null;
     this.pc?.close();
     this.pc = null;
     if (this.video) this.video.srcObject = null;

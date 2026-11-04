@@ -103,6 +103,9 @@ impl Node {
         // WebRTC sempre usa H.264. Sem WebRTC: H.264 via WebCodecs se possível, senão JPEG.
         let viewer_webrtc = hello.codecs.iter().any(|c| c == lrd_protocol::codec::WEBRTC);
         let viewer_h264 = hello.codecs.iter().any(|c| c == lrd_protocol::codec::H264);
+        let rtc_codecs = crate::rtc::RtcCodecs {
+            hevc: hello.codecs.iter().any(|c| c == lrd_protocol::codec::WEBRTC_H265),
+        };
         let codec = if viewer_webrtc || viewer_h264 {
             VideoCodec::H264
         } else {
@@ -303,7 +306,7 @@ impl Node {
         };
         write_envelope(&mut send, &Envelope::new(&session_id, 2, Payload::ConnectResponse(resp))).await?;
 
-        let media = MediaOptions { codec, webrtc: viewer_webrtc, viewer_h264, audio_allowed, audio_on };
+        let media = MediaOptions { codec, webrtc: viewer_webrtc, viewer_h264, audio_allowed, audio_on, rtc_codecs };
         self.run_inbound(conn, send, recv, session_id, device_name, address, granted, displays, active, injector, media)
             .await
     }
@@ -447,6 +450,14 @@ impl Node {
         let ctrl_r = ctrl_tx.clone();
         let sid_r = session_id.clone();
         let max_bitrate = quality.bitrate_bps;
+        let perms_dc = perms.clone();
+        let geometry_dc = geometry.clone();
+        let injector_dc = injector.clone();
+        let last_move = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
+        let dc_handler: crate::rtc::InputHandler = Arc::new(move |b: &[u8]| {
+            handle_dc_input(b, &perms_dc, &geometry_dc, injector_dc.as_deref(), &last_move)
+        });
+        let rtc_codecs = media.rtc_codecs;
         let rtc_task = tokio::spawn(async move {
             if !media.webrtc {
                 return;
@@ -454,13 +465,15 @@ impl Node {
             let fallback = |why: &str| {
                 tracing::warn!("WebRTC indisponível ({why}); usando QUIC");
                 *route_r.lock().unwrap() = Route::Quic;
+                // O caminho QUIC (WebCodecs) decodifica só H.264.
+                let _ = cap_r.send(CaptureCmd::SetHevc(false));
                 if !media.viewer_h264 {
                     let _ = cap_r.send(CaptureCmd::SetCodec(VideoCodec::JpegTiles));
                 }
                 let _ = cap_r.send(CaptureCmd::Keyframe);
             };
             let (state_tx, mut state_rx) = mpsc::unbounded_channel();
-            let (rtc, offer) = match RtcSender::start(cap_r.clone(), max_bitrate, state_tx).await {
+            let (rtc, offer) = match RtcSender::start(cap_r.clone(), max_bitrate, state_tx, dc_handler, rtc_codecs).await {
                 Ok(v) => v,
                 Err(e) => return fallback(&format!("{e:#}")),
             };
@@ -481,7 +494,11 @@ impl Node {
             }
             match timeout(Duration::from_secs(10), state_rx.recv()).await {
                 Ok(Some(RtcState::Connected)) => {
-                    tracing::info!("mídia por WebRTC");
+                    let (h264, h265, fec) = rtc.negotiated().await;
+                    tracing::info!("mídia por WebRTC (H.264 {h264}, H.265 {h265}, FEC {fec})");
+                    if h265 {
+                        let _ = cap_r.send(CaptureCmd::SetHevc(true));
+                    }
                     *route_r.lock().unwrap() = Route::Rtc(rtc.clone());
                     let _ = cap_r.send(CaptureCmd::Keyframe);
                 }
@@ -699,6 +716,8 @@ struct MediaOptions {
     viewer_h264: bool,
     audio_allowed: bool,
     audio_on: bool,
+    /// Codecs extras do WebRTC aceitos pelo controlador (H.265).
+    rtc_codecs: crate::rtc::RtcCodecs,
 }
 
 fn audio_supported() -> bool {
@@ -723,6 +742,65 @@ fn to_display_info(d: &Display) -> DisplayInfo {
         height: (d.height as f32 * d.scale_factor.max(1.0)).round() as u32,
         primary: d.primary,
     }
+}
+
+/// Entrada binária vinda do data channel do WebRTC (caminho rápido, sem passar pelo QUIC):
+/// `[1,x,y]` mover (u16 LE normalizados), `[2,botão,pressionado]`, `[3,hid,pressionado]`,
+/// `[4,dx,dy]` rolagem (i8), `[5,t0]` ping (f64 LE) → resposta `[6,t0,host_us]`.
+/// Retorna a resposta a enviar, se houver.
+/// Entrada vinda do canal de dados do WebRTC (formato binário compacto, little-endian):
+/// - `[1, x u16, y u16, seq u16]` mover (x/y normalizados 0..65535; `seq` descarta atrasados)
+/// - `[2, botão, pressionado]`, `[3, hid u16, pressionado]`, `[4, dx i8, dy i8]`
+/// - `[5, t0 f64]` → responde `[6, t0, agora_us u64]` (sincronia de relógio e ida e volta)
+pub(crate) fn handle_dc_input(
+    b: &[u8],
+    perms: &RwLock<Permissions>,
+    geometry: &RwLock<Display>,
+    inj: Option<&lrd_input::InputInjector>,
+    last_move: &std::sync::atomic::AtomicU32,
+) -> Option<Vec<u8>> {
+    use std::sync::atomic::Ordering;
+    use lrd_input::InjectCmd;
+    let (&kind, rest) = b.split_first()?;
+    if kind == 5 && rest.len() >= 8 {
+        let mut out = Vec::with_capacity(17);
+        out.push(6);
+        out.extend_from_slice(&rest[..8]);
+        out.extend_from_slice(&lrd_protocol::now_us().to_le_bytes());
+        return Some(out);
+    }
+    let inj = inj?;
+    let p = *perms.read().ok()?;
+    match kind {
+        1 if p.control_mouse && rest.len() >= 4 => {
+            if rest.len() >= 6 {
+                // Canal sem ordem: ignora um movimento mais antigo que o último aplicado.
+                let seq = u16::from_le_bytes([rest[4], rest[5]]) as u32;
+                let prev = last_move.load(Ordering::Relaxed);
+                if prev <= 0xffff && ((seq.wrapping_sub(prev)) & 0xffff) > 0x8000 {
+                    return None;
+                }
+                last_move.store(seq, Ordering::Relaxed);
+            }
+            let d = geometry.read().ok()?.clone();
+            let nx = u16::from_le_bytes([rest[0], rest[1]]) as f64 / 65535.0;
+            let ny = u16::from_le_bytes([rest[2], rest[3]]) as f64 / 65535.0;
+            let x = d.x + (nx * d.width.saturating_sub(1) as f64).round() as i32;
+            let y = d.y + (ny * d.height.saturating_sub(1) as f64).round() as i32;
+            inj.send(InjectCmd::MoveAbs { x, y });
+        }
+        2 if p.control_mouse && rest.len() >= 2 => {
+            inj.send(InjectCmd::Button { button: (rest[0] as u32).min(2), pressed: rest[1] != 0 });
+        }
+        3 if p.control_keyboard && rest.len() >= 3 => {
+            inj.send(InjectCmd::Key { hid: u16::from_le_bytes([rest[0], rest[1]]) as u32, pressed: rest[2] != 0 });
+        }
+        4 if p.control_mouse && rest.len() >= 2 => {
+            inj.send(InjectCmd::Scroll { dx: rest[0] as i8 as i32, dy: rest[1] as i8 as i32 });
+        }
+        _ => {}
+    }
+    None
 }
 
 /// Aplica um evento de entrada respeitando as permissões. Eventos não permitidos são ignorados.

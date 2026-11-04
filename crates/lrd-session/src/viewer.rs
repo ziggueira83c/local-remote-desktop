@@ -149,6 +149,7 @@ impl Node {
             .iter()
             .filter(|c| {
                 *c == lrd_protocol::codec::WEBRTC
+                    || *c == lrd_protocol::codec::WEBRTC_H265
                     || *c == lrd_protocol::codec::H264
                     || *c == lrd_protocol::codec::JPEG_TILES
             })

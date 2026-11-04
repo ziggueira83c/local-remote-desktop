@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 
 use crate::capture::Display;
 use crate::encoder::QualitySettings;
-use crate::frame::{pack_rows, target_size, PixelFormat as FrameFormat, RawFrame};
+use crate::frame::{target_size, PixelFormat as FrameFormat, RawFrame};
 
 const SAMPLE_RATE: u32 = 48_000;
 const CHANNELS: usize = 2;
@@ -34,17 +34,18 @@ impl SCStreamOutputTrait for VideoHandler {
         }
         let ts = lrd_protocol::now_us();
         let Some(pixel_buffer) = sample.pixel_buffer() else { return };
-        let (w, h, bpr) = (pixel_buffer.width(), pixel_buffer.height(), pixel_buffer.bytes_per_row());
-        let Ok(guard) = pixel_buffer.lock_read_only() else { return };
-        let Some(src) = (unsafe { guard.as_slice() }) else { return };
-        let Some(data) = pack_rows(src, w, h, bpr) else { return };
+        // Sem cópia: guarda uma referência ao buffer da GPU. Os pixels só vêm para a memória
+        // se o codificador em uso não for o VideoToolbox.
+        let Some(pb) = (unsafe { crate::hw_mac::PixelBuffer::retain(pixel_buffer.as_ptr()) }) else { return };
+        let (w, h) = pb.size();
         // Se o envio estiver ocupado, descarta: o próximo quadro traz a tela atualizada.
         let _ = self.tx.try_send(RawFrame {
-            width: w as u32,
-            height: h as u32,
-            data,
+            width: w,
+            height: h,
+            data: Vec::new(),
             format: FrameFormat::Bgra,
             timestamp_us: ts,
+            native: Some(crate::frame::NativeFrame::Cv(pb)),
         });
     }
 }
@@ -123,7 +124,7 @@ impl SckSource {
             .with_pixel_format(PixelFormat::BGRA)
             .with_shows_cursor(false) // o controlador desenha o cursor localmente
             .with_fps(q.max_fps)
-            .with_queue_depth(5);
+            .with_queue_depth(8);
         let audio_on = audio.is_some();
         if audio_on {
             config = config

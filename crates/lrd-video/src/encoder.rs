@@ -159,7 +159,7 @@ mod tests {
     use lrd_protocol::video::validate_frame;
 
     fn solid(w: u32, h: u32, v: u8) -> RawFrame {
-        RawFrame { width: w, height: h, data: vec![v; (w * h * 4) as usize], format: PixelFormat::Rgba, timestamp_us: 0 }
+        RawFrame::cpu(w, h, vec![v; (w * h * 4) as usize], PixelFormat::Rgba, 0)
     }
 
     #[test]

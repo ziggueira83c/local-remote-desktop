@@ -42,7 +42,7 @@ mod tests {
 
     #[test]
     fn white_and_black() {
-        let f = RawFrame { width: 2, height: 2, data: vec![255; 16], format: PixelFormat::Rgba, timestamp_us: 0 };
+        let f = RawFrame::cpu(2, 2, vec![255; 16], PixelFormat::Rgba, 0);
         let n = to_nv12(&f);
         assert_eq!(n.len(), 6);
         assert!(n[0] >= 234 && n[0] <= 236);

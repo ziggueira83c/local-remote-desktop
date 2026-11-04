@@ -3,12 +3,13 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { api, type AppSettings } from "../lib/api";
 import { codeToHid } from "../lib/keymap";
 import { Enhancer } from "../lib/enhance";
-import type { MediaMode, RtcStats } from "../lib/media";
+import type { InputMsg, LatencyStats, MediaMode, RtcStats } from "../lib/media";
 import { CURSOR_CSS, type CursorState } from "../lib/renderer";
 import { currentEngine } from "../lib/session";
 import { useStore } from "../store";
 
 type ScaleMode = "fit" | "actual";
+type FrameMeta = { rtpTimestamp?: number; expectedDisplayTime?: number; presentationTime?: number };
 
 export function RemoteSessionPage() {
   const outbound = useStore((s) => s.outbound)!;
@@ -24,6 +25,7 @@ export function RemoteSessionPage() {
   mediaModeRef.current = mediaMode;
   const [audioBlocked, setAudioBlocked] = useState(false);
   const [rtc, setRtc] = useState<RtcStats | null>(null);
+  const [lat, setLat] = useState<LatencyStats | null>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
   const enhancerRef = useRef<Enhancer | null>(null);
   const [enhance, setEnhance] = useState(false);
@@ -94,10 +96,11 @@ export function RemoteSessionPage() {
     v.addEventListener("loadedmetadata", onSize);
     let stop = false;
     const vfc = v as HTMLVideoElement & {
-      requestVideoFrameCallback?: (cb: () => void) => number;
+      requestVideoFrameCallback?: (cb: (now: number, meta: FrameMeta) => void) => number;
     };
-    const step = () => {
+    const step = (_now?: number, meta?: FrameMeta) => {
       if (stop) return;
+      if (meta) currentEngine()?.noteVideoFrame(meta);
       const e = enhanceRef.current;
       if (e.on && enhancerRef.current) enhancerRef.current.render(v, e.strength);
       if (vfc.requestVideoFrameCallback) vfc.requestVideoFrameCallback(step);
@@ -118,10 +121,12 @@ export function RemoteSessionPage() {
       return;
     }
     const t = setInterval(() => {
-      currentEngine()
+      const engine = currentEngine();
+      engine
         ?.rtcStats()
         .then(setRtc)
         .catch(() => {});
+      setLat(engine?.latency() ?? null);
     }, 1000);
     return () => clearInterval(t);
   }, [mediaMode]);
@@ -173,6 +178,11 @@ export function RemoteSessionPage() {
   }, [recompute]);
 
   // ---------- entrada ----------
+  // Caminho rápido: canal de dados do WebRTC direto ao host. Reserva: comando do app (QUIC).
+  const sendInput = (m: InputMsg) => {
+    if (currentEngine()?.sendInput(m)) return;
+    api.sendInput({ ...m, displayId: displayRef.current } as Parameters<typeof api.sendInput>[0]).catch(() => {});
+  };
   const pressedKeys = useRef(new Set<number>());
   const pressedButtons = useRef(new Set<number>());
   const pendingMove = useRef<{ x: number; y: number } | null>(null);
@@ -183,8 +193,8 @@ export function RemoteSessionPage() {
   displayRef.current = outbound.activeDisplay;
 
   const releaseAll = useCallback(() => {
-    for (const hid of pressedKeys.current) api.sendInput({ type: "key", hid, pressed: false }).catch(() => {});
-    for (const b of pressedButtons.current) api.sendInput({ type: "button", button: b, pressed: false }).catch(() => {});
+    for (const hid of pressedKeys.current) sendInput({ type: "key", hid, pressed: false });
+    for (const b of pressedButtons.current) sendInput({ type: "button", button: b, pressed: false });
     pressedKeys.current.clear();
     pressedButtons.current.clear();
   }, []);
@@ -205,20 +215,20 @@ export function RemoteSessionPage() {
     return { x: Math.round(nx * 65535), y: Math.round(ny * 65535) };
   };
 
-  // Movimento do mouse enviado na hora (até ~250 vezes/s), sem esperar o próximo quadro da tela.
-  const MOVE_INTERVAL_MS = 4;
+  // Movimento do mouse enviado na hora (até ~500 vezes/s), sem esperar o próximo quadro da tela.
+  const MOVE_INTERVAL_MS = 2;
   const flushMove = () => {
     moveTimer.current = null;
     const m = pendingMove.current;
     pendingMove.current = null;
     if (!m) return;
     lastMoveSent.current = performance.now();
-    api.sendInput({ type: "pointer", displayId: displayRef.current, ...m }).catch(() => {});
+    sendInput({ type: "pointer", ...m });
   };
 
-  const onPointerMove = (e: React.PointerEvent) => {
+  const handleMove = (clientX: number, clientY: number) => {
     if (!outbound.permissions.controlMouse) return;
-    pendingMove.current = toNormalized(e.clientX, e.clientY);
+    pendingMove.current = toNormalized(clientX, clientY);
     const since = performance.now() - lastMoveSent.current;
     if (since >= MOVE_INTERVAL_MS) {
       if (moveTimer.current !== null) {
@@ -230,6 +240,27 @@ export function RemoteSessionPage() {
       moveTimer.current = window.setTimeout(flushMove, MOVE_INTERVAL_MS - since);
     }
   };
+  const handleMoveRef = useRef(handleMove);
+  handleMoveRef.current = handleMove;
+
+  // `pointerrawupdate` (Chromium/WebView2) entrega o movimento assim que o mouse informa,
+  // sem esperar o próximo quadro da interface; nos outros, `pointermove`.
+  const rawSupported = typeof window !== "undefined" && "onpointerrawupdate" in window;
+  useEffect(() => {
+    if (!rawSupported) return;
+    const stage = stageRef.current!;
+    const onRaw = (e: Event) => {
+      const p = e as PointerEvent;
+      handleMoveRef.current(p.clientX, p.clientY);
+    };
+    stage.addEventListener("pointerrawupdate", onRaw);
+    return () => stage.removeEventListener("pointerrawupdate", onRaw);
+  }, [rawSupported]);
+
+  const onPointerMove = (e: React.PointerEvent) => {
+    if (rawSupported) return;
+    handleMove(e.clientX, e.clientY);
+  };
 
   const onPointerDown = (e: React.PointerEvent) => {
     stageRef.current?.focus();
@@ -239,9 +270,9 @@ export function RemoteSessionPage() {
     (e.target as Element).setPointerCapture?.(e.pointerId);
     const button = e.button === 1 ? 1 : e.button === 2 ? 2 : 0;
     // Garante que o ponteiro está no lugar certo antes do clique.
-    api.sendInput({ type: "pointer", displayId: displayRef.current, ...toNormalized(e.clientX, e.clientY) }).catch(() => {});
+    sendInput({ type: "pointer", ...toNormalized(e.clientX, e.clientY) });
     pressedButtons.current.add(button);
-    api.sendInput({ type: "button", button, pressed: true }).catch(() => {});
+    sendInput({ type: "button", button, pressed: true });
   };
 
   const onPointerUp = (e: React.PointerEvent) => {
@@ -249,7 +280,7 @@ export function RemoteSessionPage() {
     const button = e.button === 1 ? 1 : e.button === 2 ? 2 : 0;
     if (!pressedButtons.current.has(button)) return;
     pressedButtons.current.delete(button);
-    api.sendInput({ type: "button", button, pressed: false }).catch(() => {});
+    sendInput({ type: "button", button, pressed: false });
   };
 
   // Roda do mouse: precisa de listener não-passivo para impedir a rolagem local.
@@ -266,7 +297,7 @@ export function RemoteSessionPage() {
       if (dx || dy) {
         wheelAcc.current.x -= dx;
         wheelAcc.current.y -= dy;
-        api.sendInput({ type: "scroll", dx, dy }).catch(() => {});
+        sendInput({ type: "scroll", dx, dy });
       }
     };
     stage.addEventListener("wheel", onWheel, { passive: false });
@@ -281,7 +312,7 @@ export function RemoteSessionPage() {
     e.preventDefault();
     pressedKeys.current.add(hid);
     // Repetições também são enviadas: o SO remoto não gera auto-repeat para teclas injetadas.
-    api.sendInput({ type: "key", hid, pressed: true }).catch(() => {});
+    sendInput({ type: "key", hid, pressed: true });
   };
 
   const onKeyUp = (e: React.KeyboardEvent) => {
@@ -290,7 +321,7 @@ export function RemoteSessionPage() {
     if (hid === null) return;
     e.preventDefault();
     pressedKeys.current.delete(hid);
-    api.sendInput({ type: "key", hid, pressed: false }).catch(() => {});
+    sendInput({ type: "key", hid, pressed: false });
   };
 
   // ---------- barra de ferramentas ----------
@@ -316,8 +347,8 @@ export function RemoteSessionPage() {
     // Ctrl+Alt+Del real não pode ser injetado no Windows (secure desktop); envia Ctrl+Shift+Esc
     // (Gerenciador de Tarefas) como alternativa útil.
     const seq = [0xe0, 0xe1, 0x29];
-    for (const hid of seq) api.sendInput({ type: "key", hid, pressed: true }).catch(() => {});
-    for (const hid of [...seq].reverse()) api.sendInput({ type: "key", hid, pressed: false }).catch(() => {});
+    for (const hid of seq) sendInput({ type: "key", hid, pressed: true });
+    for (const hid of [...seq].reverse()) sendInput({ type: "key", hid, pressed: false });
   };
 
   return (
@@ -410,7 +441,7 @@ export function RemoteSessionPage() {
           <span className="stats mono small" title="Quadros por segundo · banda · latência">
             {mediaMode === "webrtc"
               ? rtc
-                ? `WebRTC · ${rtc.fps.toFixed(0)} fps · ${(rtc.kbps / 1000).toFixed(1)} Mbps · ${(rtc.rttMs ?? metrics?.rttMs ?? 0).toFixed(0)} ms${rtc.lossPct >= 0.5 ? ` · perda ${rtc.lossPct.toFixed(1)}%` : ""}`
+                ? `WebRTC · ${rtc.fps.toFixed(0)} fps · ${(rtc.kbps / 1000).toFixed(1)} Mbps · ${(rtc.rttMs ?? metrics?.rttMs ?? 0).toFixed(0)} ms${lat?.glassMs != null ? ` · atraso ${lat.glassMs.toFixed(0)} ms` : ""}${rtc.lossPct >= 0.5 ? ` · perda ${rtc.lossPct.toFixed(1)}%` : ""}`
                 : "WebRTC"
               : `${mediaMode === "quic" ? (outbound.videoCodec === "h264" ? "H.264" : "JPEG") : "Conectando mídia"} · ${
                   metrics ? `${metrics.fps.toFixed(0)} fps · ${(metrics.kbps / 1000).toFixed(1)} Mbps · ${metrics.rttMs.toFixed(0)} ms` : "—"
@@ -515,6 +546,17 @@ export function RemoteSessionPage() {
           </div>
           <div>Resolução enviada: {hostStats ? `${hostStats.width}×${hostStats.height}` : "—"}</div>
           <div>Taxa alvo: {hostStats ? `${(hostStats.bitrateKbps / 1000).toFixed(1)} Mbps` : "—"}</div>
+          {lat && (
+            <>
+              <div>
+                Atraso real (captura → tela): {lat.glassMs != null ? `${lat.glassMs.toFixed(0)} ms` : "medindo…"}
+              </div>
+              <div>
+                Comandos: {lat.directInput ? "canal direto" : "caminho de reserva"}
+                {lat.inputRttMs != null ? ` · ${lat.inputRttMs.toFixed(0)} ms ida e volta` : ""}
+              </div>
+            </>
+          )}
           {rtc && (
             <>
               <div>Recebido: {`${rtc.fps.toFixed(0)} fps · ${(rtc.kbps / 1000).toFixed(1)} Mbps`}</div>
@@ -527,7 +569,9 @@ export function RemoteSessionPage() {
           <div className="diag__hint">
             {hostStats && hostStats.captureFps < 20 && hostStats.captureSource === "cópia"
               ? "A captura está no modo por cópia (lento). A captura contínua não iniciou nesse computador."
-              : hostStats && hostStats.encodeMs > 25
+              : lat?.glassMs != null && lat.glassMs > 120 && rtc && rtc.lossPct < 1
+                ? "O atraso está alto sem perda na rede: o computador acessado pode estar sobrecarregado."
+                : hostStats && hostStats.encodeMs > 25
                 ? "A codificação está lenta: o codificador de hardware não está ativo."
                 : rtc && rtc.lossPct > 2
                   ? "Há perda de pacotes na rede: prefira cabo ou Wi‑Fi 5 GHz."

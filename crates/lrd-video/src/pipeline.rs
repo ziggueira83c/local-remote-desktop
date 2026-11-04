@@ -28,6 +28,8 @@ pub enum CaptureCmd {
     SetBitrate(u32),
     /// Troca de codec (ex.: WebRTC falhou e o controlador só decodifica JPEG).
     SetCodec(VideoCodec),
+    /// Usar H.265 quando houver codificador de hardware (o controlador decodifica).
+    SetHevc(bool),
     Stop,
 }
 
@@ -113,16 +115,24 @@ enum Encoder {
 impl Encoder {
     fn name(&self) -> String {
         match self {
-            Encoder::H264(e) => format!("H.264 · {}", e.name()),
+            Encoder::H264(e) => format!(
+                "{} · {}{}",
+                if e.is_hevc() { "H.265" } else { "H.264" },
+                e.name(),
+                if e.zero_copy() { " · direto da GPU" } else { "" }
+            ),
             Encoder::Tiles(_) => "JPEG (tiles)".into(),
         }
     }
 }
 
-fn make_encoder(codec: VideoCodec, q: &QualitySettings) -> Encoder {
+fn make_encoder(codec: VideoCodec, q: &QualitySettings, hevc: bool) -> Encoder {
     if codec == VideoCodec::H264 {
         match H264Encoder::new(q) {
-            Ok(e) => return Encoder::H264(e),
+            Ok(mut e) => {
+                e.set_hevc(hevc);
+                return Encoder::H264(e);
+            }
             Err(e) => tracing::error!("H.264 indisponível, usando JPEG: {e:#}"),
         }
     }
@@ -148,7 +158,8 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
     let mut bitrate_override: Option<u32> = None;
     let mut display_id = display_id;
     let mut audio_enabled = audio_enabled && audio.is_some();
-    let mut encoder = make_encoder(codec, &quality);
+    let mut hevc = false;
+    let mut encoder = make_encoder(codec, &quality, hevc);
     let mut source: Option<Source> = None;
     let mut win_audio: Option<crate::audio::AudioCapture> = None;
 
@@ -175,7 +186,7 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
                 Ok(CaptureCmd::SetQuality(q)) => {
                     if q != quality {
                         quality = q;
-                        encoder = make_encoder(codec, &quality);
+                        encoder = make_encoder(codec, &quality, hevc);
                         bitrate_override = None;
                         if cfg!(target_os = "macos") {
                             source = None; // o ScreenCaptureKit aplica tamanho e FPS
@@ -198,8 +209,17 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
                 Ok(CaptureCmd::SetCodec(c)) => {
                     if c != codec {
                         codec = c;
-                        encoder = make_encoder(codec, &quality);
+                        encoder = make_encoder(codec, &quality, hevc);
                         last_encoded = None;
+                        want_keyframe = true;
+                    }
+                }
+                Ok(CaptureCmd::SetHevc(on)) => {
+                    if on != hevc {
+                        hevc = on;
+                        if let Encoder::H264(enc) = &mut encoder {
+                            enc.set_hevc(on);
+                        }
                         want_keyframe = true;
                     }
                 }
@@ -313,14 +333,19 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
 
         // ---- codificação ----
         let to_encode = match pending.take() {
-            Some(raw) => {
-                let (tw, th) = target_size(raw.width, raw.height, max_width);
-                Some(resize(raw, tw, th))
-            }
+            Some(raw) => Some(raw),
             None if want_keyframe => last_encoded.take(),
             None => None,
         };
-        let Some(frame) = to_encode else { continue };
+        let Some(raw) = to_encode else { continue };
+        let (tw, th) = target_size(raw.width, raw.height, max_width);
+        // Quadro na GPU vai direto ao codificador de hardware (que reduz e converte lá mesmo);
+        // senão, cópia para a memória + redução na CPU.
+        let native_ok = match &mut encoder {
+            Encoder::H264(e) => e.prepare_native(&raw, tw, th),
+            Encoder::Tiles(_) => false,
+        };
+        let frame = if native_ok { raw } else { resize(raw, tw, th) };
 
         let started = Instant::now();
         let encoded = match &mut encoder {
@@ -351,8 +376,8 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
 
         if let Ok(mut st) = stats.lock() {
             st.encoder = encoder.name();
-            st.width = frame.width;
-            st.height = frame.height;
+            st.width = tw;
+            st.height = th;
             if encoded.is_some() {
                 st.encoded += 1;
                 st.encode_us += took.as_micros() as u64;
@@ -375,8 +400,8 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
             let cur = cursor_fn().map(|c| {
                 let (rx_, ry_) = (c.x - d.x, c.y - d.y);
                 let inside = rx_ >= 0 && ry_ >= 0 && rx_ < d.width as i32 && ry_ < d.height as i32;
-                let px = (rx_.max(0) as f64 / d.width.max(1) as f64 * frame.width as f64) as u16;
-                let py = (ry_.max(0) as f64 / d.height.max(1) as f64 * frame.height as f64) as u16;
+                let px = (rx_.max(0) as f64 / d.width.max(1) as f64 * tw as f64) as u16;
+                let py = (ry_.max(0) as f64 / d.height.max(1) as f64 * th as f64) as u16;
                 (px, py, c.kind, c.visible && inside)
             });
             if cur != last_cursor {

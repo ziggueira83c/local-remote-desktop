@@ -7,6 +7,10 @@ pub enum PixelFormat {
 }
 
 /// Quadro de 4 bytes por pixel, sem preenchimento entre linhas.
+///
+/// Com `native`, a imagem está na memória da placa de vídeo (textura D3D11 no Windows,
+/// CVPixelBuffer no macOS) e `data` fica vazio até alguém pedir a cópia (`ensure_cpu`).
+/// O codificador de hardware lê direto do `native`: nenhuma cópia passa pela CPU.
 #[derive(Clone)]
 pub struct RawFrame {
     pub width: u32,
@@ -15,6 +19,62 @@ pub struct RawFrame {
     pub format: PixelFormat,
     /// Momento da captura (`lrd_protocol::now_us`).
     pub timestamp_us: u64,
+    pub native: Option<NativeFrame>,
+}
+
+/// Imagem na GPU.
+#[derive(Clone)]
+pub enum NativeFrame {
+    #[cfg(target_os = "macos")]
+    Cv(crate::hw_mac::PixelBuffer),
+    #[cfg(target_os = "windows")]
+    D3d(crate::win_gpu::GpuFrame),
+    #[allow(dead_code)]
+    None,
+}
+
+impl NativeFrame {
+    /// Identifica o dispositivo (o codificador precisa ser recriado se ele mudar).
+    pub fn device_key(&self) -> usize {
+        match self {
+            #[cfg(target_os = "macos")]
+            NativeFrame::Cv(_) => 1,
+            #[cfg(target_os = "windows")]
+            NativeFrame::D3d(f) => f.device_key(),
+            NativeFrame::None => 0,
+        }
+    }
+}
+
+impl RawFrame {
+    pub fn cpu(width: u32, height: u32, data: Vec<u8>, format: PixelFormat, timestamp_us: u64) -> Self {
+        RawFrame { width, height, data, format, timestamp_us, native: None }
+    }
+
+    /// Garante os pixels na memória (cópia da GPU, se for o caso) e solta a referência da GPU.
+    pub fn ensure_cpu(&mut self) -> bool {
+        if let Some(n) = self.native.take() {
+            if self.data.is_empty() {
+                let read = match &n {
+                    #[cfg(target_os = "macos")]
+                    NativeFrame::Cv(pb) => pb.read_bgra(),
+                    #[cfg(target_os = "windows")]
+                    NativeFrame::D3d(f) => f.read_bgra(),
+                    NativeFrame::None => None,
+                };
+                match read {
+                    Some((w, h, data)) => {
+                        self.width = w;
+                        self.height = h;
+                        self.data = data;
+                        self.format = PixelFormat::Bgra;
+                    }
+                    None => return false,
+                }
+            }
+        }
+        !self.data.is_empty()
+    }
 }
 
 /// Tamanho de saída: cabe em `max_width`, mantém a proporção e usa dimensões pares
@@ -33,6 +93,7 @@ pub fn target_size(width: u32, height: u32, max_width: u32) -> (u32, u32) {
 /// Redimensiona para `(tw, th)`. Reduções grandes passam antes por médias 2×2 (evita
 /// serrilhado em texto); o restante é bilinear em ponto fixo.
 pub fn resize(mut frame: RawFrame, tw: u32, th: u32) -> RawFrame {
+    frame.ensure_cpu();
     if frame.width == tw && frame.height == th {
         return frame;
     }
@@ -55,7 +116,7 @@ fn crop(frame: RawFrame, tw: u32, th: u32) -> RawFrame {
     for y in 0..th as usize {
         out.extend_from_slice(&frame.data[y * src_stride..y * src_stride + dst_stride]);
     }
-    RawFrame { width: tw, height: th, data: out, ..frame }
+    RawFrame { width: tw, height: th, data: out, native: None, ..frame }
 }
 
 fn halve(frame: RawFrame) -> RawFrame {
@@ -75,7 +136,7 @@ fn halve(frame: RawFrame) -> RawFrame {
             }
         }
     }
-    RawFrame { width: nw, height: nh, data: out, ..frame }
+    RawFrame { width: nw, height: nh, data: out, native: None, ..frame }
 }
 
 fn bilinear(frame: RawFrame, tw: u32, th: u32) -> RawFrame {
@@ -109,7 +170,7 @@ fn bilinear(frame: RawFrame, tw: u32, th: u32) -> RawFrame {
             }
         }
     }
-    RawFrame { width: tw, height: th, data: out, ..frame }
+    RawFrame { width: tw, height: th, data: out, native: None, ..frame }
 }
 
 /// Copia um buffer com `bytes_per_row` ≥ `width * 4` para um buffer contíguo.
@@ -133,7 +194,7 @@ mod tests {
     use super::*;
 
     fn solid(w: u32, h: u32) -> RawFrame {
-        RawFrame { width: w, height: h, data: vec![100; (w * h * 4) as usize], format: PixelFormat::Rgba, timestamp_us: 0 }
+        RawFrame::cpu(w, h, vec![100; (w * h * 4) as usize], PixelFormat::Rgba, 0)
     }
 
     #[test]

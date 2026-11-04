@@ -24,3 +24,4 @@ webrtc.workspace = true
 opus.workspace = true
 bytes.workspace = true
 keyring.workspace = true
+async-trait = "0.1"
