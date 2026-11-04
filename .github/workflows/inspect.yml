@@ -13,29 +13,26 @@ jobs:
       - name: dump
         run: |
           R=$(ls -d ~/.cargo/registry/src/*/ | head -1)
-          W=$(ls -d ${R}webrtc-0.* | sort -V | tail -1)
+          W=$(ls -d ${R}webrtc-0.1* | sort -V | tail -1)
           echo "WEBRTC DIR $W"
-          show() { for f in $1; do echo "################ $f"; cat "$f"; done; }
-          show "$W/examples/*play-from-disk*/*.rs" 2>/dev/null | head -400 || true
-          ls $W/examples | head -60
-          show "$W/src/api/interceptor_registry/mod.rs"
+          ls $W/examples/examples 2>/dev/null | head -50; ls $W/examples | head
+          for f in $(ls $W/examples/examples/play-from-disk-h264/*.rs $W/examples/examples/rtcp-processing/*.rs 2>/dev/null); do echo "################ $f"; grep -v "^\s*//" $f; done
+          echo "################ registry"; grep -n "pub fn" -A12 $W/src/api/interceptor_registry/mod.rs | head -120
           grep -n "pub fn \|pub async fn " $W/src/api/media_engine/mod.rs | head -40
+          grep -n "pub const MIME" $W/src/api/media_engine/mod.rs
           grep -n "pub fn \|pub async fn " $W/src/peer_connection/mod.rs | head -80
-          grep -n "pub fn \|pub async fn \|pub struct" $W/src/track/track_local/track_local_static_sample.rs | head
-          grep -n "pub fn \|pub async fn " $W/src/rtp_transceiver/rtp_receiver/mod.rs $W/src/rtp_transceiver/rtp_sender/mod.rs | head -40
-          grep -n "pub fn \|pub async fn \|pub struct" $W/src/api/setting_engine/mod.rs | head -60
-          grep -rn "pub struct Sample" -A20 ${R}webrtc-media-*/src/lib.rs | head -40
-          ls ${R} | grep -E "rtcp|interceptor|webrtc|opus|audiopus|bytes"
+          grep -n "pub fn \|pub async fn " $W/src/track/track_local/track_local_static_sample.rs
+          grep -n "pub fn \|pub async fn " $W/src/api/setting_engine/mod.rs | head -60
+          M=$(ls -d ${R}webrtc-media-* | sort -V | tail -1); grep -n "pub struct Sample" -A22 $M/src/lib.rs
           RT=$(ls -d ${R}rtcp-* | sort -V | tail -1)
-          grep -n "pub struct\|pub [a-z_]*:" $RT/src/payload_feedbacks/receiver_estimated_maximum_bitrate/mod.rs $RT/src/payload_feedbacks/picture_loss_indication/mod.rs $RT/src/payload_feedbacks/full_intra_request/mod.rs | head -30
-          grep -n "pub struct\|pub [a-z_]*:" $RT/src/receiver_report/mod.rs $RT/src/reception_report.rs | head -30
+          grep -rn "pub struct\|    pub [a-z_]*:" $RT/src/payload_feedbacks/receiver_estimated_maximum_bitrate/mod.rs $RT/src/payload_feedbacks/picture_loss_indication/mod.rs $RT/src/receiver_report/mod.rs $RT/src/reception_report.rs | head -30
           O=$(ls -d ${R}opus-0.* | sort -V | tail -1)
-          grep -n "pub fn \|pub enum\|^    [A-Z][a-zA-Z]*,\|^    [A-Z][a-zA-Z]* = " $O/src/lib.rs | head -80
-          cat $O/Cargo.toml | grep -A5 "dependencies"
-          A=$(ls -d ${R}audiopus_sys-* | sort -V | tail -1)
-          cat $A/Cargo.toml | sed -n '/features/,$p' | head -30
-          grep -n "static\|cmake\|pkg_config\|LIBOPUS" $A/build.rs | head -40
+          grep -n "pub fn \|pub enum\|^    [A-Z][a-zA-Z]*,\|^    [A-Z][a-zA-Z]* = " $O/src/lib.rs | head -70
+          grep -A8 "^\[dependencies" $O/Cargo.toml
+          A=$(ls -d ${R}audiopus_sys-* | sort -V | tail -1); echo "AUDIOPUS $A"
+          sed -n '/\[features\]/,$p' $A/Cargo.toml | head -20
+          grep -n "static\|cmake\|pkg_config\|LIBOPUS\|fn main" $A/build.rs | head -40
           S=$(ls -d ${R}openh264-sys2-0.9* | sort -V | tail -1)
-          grep -rn "ENCODER_OPTION_BITRATE\|pub struct TagBitrateInfo\|pub type SBitrateInfo\|SPATIAL_LAYER_ALL\|pub type LAYER_NUM\|ENCODER_OPTION_FRAME_RATE" $S/src/*.rs | head -20
-          grep -n "pub struct TagBitrateInfo" -A6 $S/src/generated/*.rs | head -10
-          grep -n "pub use\|pub mod" $S/src/lib.rs | head
+          grep -rn "ENCODER_OPTION_BITRATE\|SPATIAL_LAYER_ALL\|pub type SBitrateInfo\|pub struct TagBitrateInfo" $S/src | head -10
+          grep -rn "pub struct TagBitrateInfo" -A5 $S/src | head -8
+          grep -n "^pub use\|^pub mod\|^mod " $S/src/lib.rs | head
