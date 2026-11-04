@@ -2,8 +2,9 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { api, type AppSettings } from "../lib/api";
 import { codeToHid } from "../lib/keymap";
-import { FrameRenderer, type CursorState } from "../lib/renderer";
-import { attachRenderer, detachRenderer } from "../lib/session";
+import { Enhancer } from "../lib/enhance";
+import type { CursorState } from "../lib/renderer";
+import { currentEngine } from "../lib/session";
 import { useStore } from "../store";
 
 type ScaleMode = "fit" | "actual";
@@ -15,6 +16,14 @@ export function RemoteSessionPage() {
   const setActiveDisplay = useStore((s) => s.setActiveDisplay);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const overlayRef = useRef<HTMLCanvasElement>(null);
+  const enhancerRef = useRef<Enhancer | null>(null);
+  const [enhance, setEnhance] = useState(false);
+  const [strength, setStrength] = useState(0.5);
+  const enhanceRef = useRef({ on: false, strength: 0.5 });
+  enhanceRef.current = { on: enhance, strength };
+  const [audioOn, setAudioOn] = useState(outbound.audioEnabled);
+  const [volume, setVolume] = useState(1);
   const viewportRef = useRef<HTMLDivElement>(null);
   const [frame, setFrame] = useState({ w: 0, h: 0 });
   const [cssSize, setCssSize] = useState({ w: 0, h: 0 });
@@ -35,22 +44,52 @@ export function RemoteSessionPage() {
       setQuality(s.qualityProfile);
       setFps(s.maxFps);
       setSwap(s.swapCtrlCmd);
+      setEnhance(s.enhanceImage);
+      setStrength(s.enhanceStrength);
     });
   }, []);
 
-  // Renderer ligado ao canvas.
+  // Motor de mídia ligado ao canvas.
   useEffect(() => {
     const canvas = canvasRef.current!;
-    const r = new FrameRenderer(
-      canvas,
-      (w, h) => setFrame({ w, h }),
-      setCursor,
-      () => api.requestKeyframe().catch(() => {}),
-    );
-    attachRenderer(r);
+    const engine = currentEngine();
+    if (!engine) return;
+    engine.attach(canvas, {
+      onResize: (w, h) => setFrame({ w, h }),
+      onCursor: setCursor,
+      onKeyframeNeeded: () => api.requestKeyframe().catch(() => {}),
+      onDrawn: () => {
+        const e = enhanceRef.current;
+        if (e.on && enhancerRef.current) enhancerRef.current.render(canvas, e.strength);
+      },
+    });
     api.requestKeyframe().catch(() => {});
-    return () => detachRenderer(r);
+    return () => engine.detach(canvas);
   }, [outbound.sessionId]);
+
+  // Melhoria de imagem: cria o WebGL sob demanda e redesenha ao mudar a intensidade.
+  useEffect(() => {
+    if (enhance && !enhancerRef.current && overlayRef.current) {
+      enhancerRef.current = Enhancer.create(overlayRef.current);
+      if (!enhancerRef.current) setEnhance(false);
+    }
+    if (enhance && enhancerRef.current && canvasRef.current) {
+      enhancerRef.current.render(canvasRef.current, strength);
+    }
+  }, [enhance, strength, cssSize]);
+
+  // Áudio: volume local e liga/desliga a transmissão no host.
+  useEffect(() => {
+    const player = currentEngine()?.audio;
+    player?.setVolume(volume);
+    player?.setMuted(!audioOn);
+  }, [audioOn, volume]);
+
+  const toggleAudio = () => {
+    const next = !audioOn;
+    setAudioOn(next);
+    api.setAudio(next).catch(() => {});
+  };
 
   // Tamanho exibido: "ajustar" mantém a proporção; "100%" mostra 1 pixel remoto por pixel físico.
   const recompute = useCallback(() => {
@@ -255,6 +294,36 @@ export function RemoteSessionPage() {
               Ctrl+Shift+Esc
             </button>
           )}
+          <button
+            className={audioOn ? "btn btn--small btn--on" : "btn btn--small"}
+            onClick={toggleAudio}
+            title={audioOn ? "Desligar o áudio do outro computador" : "Ligar o áudio do outro computador"}
+          >
+            {audioOn ? "🔊 Áudio" : "🔇 Áudio"}
+          </button>
+          {audioOn && (
+            <input
+              className="slider"
+              type="range"
+              min={0}
+              max={1}
+              step={0.05}
+              value={volume}
+              onChange={(e) => setVolume(Number(e.target.value))}
+              title="Volume"
+            />
+          )}
+          <label className="check" title="Nitidez adaptativa aplicada na sua tela (não muda o que é transmitido)">
+            <input type="checkbox" checked={enhance} onChange={(e) => setEnhance(e.target.checked)} />
+            Melhorar imagem
+          </label>
+          {enhance && (
+            <select value={strength} onChange={(e) => setStrength(Number(e.target.value))} title="Intensidade">
+              <option value={0.25}>Leve</option>
+              <option value={0.5}>Média</option>
+              <option value={0.85}>Forte</option>
+            </select>
+          )}
           <button className="btn btn--small" onClick={() => api.requestKeyframe()} title="Redesenhar a tela inteira">
             Atualizar
           </button>
@@ -265,6 +334,7 @@ export function RemoteSessionPage() {
 
         <div className="toolbar__group">
           <span className="stats mono small" title="Quadros por segundo · banda · latência">
+            {outbound.videoCodec === "h264" ? "H.264" : "JPEG"} ·{" "}
             {metrics ? `${metrics.fps.toFixed(0)} fps · ${(metrics.kbps / 1000).toFixed(1)} Mbps · ${metrics.rttMs.toFixed(0)} ms` : "—"}
           </span>
           <button className="btn btn--small btn--danger" onClick={() => api.disconnect()}>
@@ -291,6 +361,15 @@ export function RemoteSessionPage() {
             onContextMenu={(e) => e.preventDefault()}
             onKeyDown={onKeyDown}
             onKeyUp={onKeyUp}
+          />
+          <canvas
+            ref={overlayRef}
+            className="remote-overlay"
+            style={{
+              width: cssSize.w || undefined,
+              height: cssSize.h || undefined,
+              visibility: enhance ? "visible" : "hidden",
+            }}
           />
           {cursor.visible && !canControl && frame.w > 0 && (
             <div

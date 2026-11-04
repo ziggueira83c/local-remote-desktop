@@ -15,9 +15,23 @@
 //! ```text
 //! u8 type = 2, u8 visible, u16 x, u16 y     (coordenadas em pixels do quadro)
 //! ```
+//! Vídeo H.264 (`type = 3`):
+//! ```text
+//! u8 type = 3, u8 flags (bit 0 = keyframe), u16 width, u16 height, u64 timestamp_us,
+//! u32 sequence, [bitstream Annex B]
+//! ```
+//! Áudio PCM (`type = 4`):
+//! ```text
+//! u8 type = 4, u8 channels, u32 sample_rate, u64 timestamp_us, [i16 LE intercalado]
+//! ```
+//! `timestamp_us` vem de `crate::now_us()` no host (mesmo relógio para vídeo e áudio).
 
 pub const FRAME_TILES: u8 = 1;
 pub const FRAME_CURSOR: u8 = 2;
+pub const FRAME_H264: u8 = 3;
+pub const FRAME_AUDIO: u8 = 4;
+pub const H264_HEADER_LEN: usize = 18;
+pub const AUDIO_HEADER_LEN: usize = 14;
 pub const FLAG_KEYFRAME: u8 = 1;
 pub const TILES_HEADER_LEN: usize = 12;
 pub const TILE_HEADER_LEN: usize = 12;
@@ -62,10 +76,43 @@ pub fn build_cursor_frame(visible: bool, x: u16, y: u16) -> Vec<u8> {
     out
 }
 
+/// Monta um quadro H.264.
+pub fn build_h264_frame(width: u16, height: u16, keyframe: bool, timestamp_us: u64, sequence: u32, bitstream: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(H264_HEADER_LEN + bitstream.len());
+    out.push(FRAME_H264);
+    out.push(if keyframe { FLAG_KEYFRAME } else { 0 });
+    out.extend_from_slice(&width.to_le_bytes());
+    out.extend_from_slice(&height.to_le_bytes());
+    out.extend_from_slice(&timestamp_us.to_le_bytes());
+    out.extend_from_slice(&sequence.to_le_bytes());
+    out.extend_from_slice(bitstream);
+    out
+}
+
+/// Monta um bloco de áudio PCM 16 bits intercalado.
+pub fn build_audio_frame(sample_rate: u32, channels: u8, timestamp_us: u64, samples: &[i16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(AUDIO_HEADER_LEN + samples.len() * 2);
+    out.push(FRAME_AUDIO);
+    out.push(channels);
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    out.extend_from_slice(&timestamp_us.to_le_bytes());
+    for s in samples {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
 /// Validação estrutural de um quadro recebido (o visualizador não confia no par remoto).
 pub fn validate_frame(buf: &[u8]) -> bool {
     match buf.first() {
         Some(&FRAME_CURSOR) => buf.len() == 6,
+        Some(&FRAME_H264) => buf.len() > H264_HEADER_LEN,
+        Some(&FRAME_AUDIO) => {
+            buf.len() >= AUDIO_HEADER_LEN
+                && buf[1] >= 1
+                && buf[1] <= 8
+                && (buf.len() - AUDIO_HEADER_LEN) % (2 * buf[1] as usize) == 0
+        }
         Some(&FRAME_TILES) => {
             if buf.len() < TILES_HEADER_LEN {
                 return false;
@@ -111,5 +158,8 @@ mod tests {
         bad.push(0);
         assert!(!validate_frame(&bad));
         assert!(validate_frame(&build_cursor_frame(true, 5, 5)));
+        assert!(validate_frame(&build_h264_frame(16, 16, true, 1, 1, &[0, 0, 0, 1, 0x67])));
+        assert!(validate_frame(&build_audio_frame(48000, 2, 5, &[1, 2, 3, 4])));
+        assert!(!validate_frame(&build_audio_frame(48000, 2, 5, &[1, 2, 3])));
     }
 }

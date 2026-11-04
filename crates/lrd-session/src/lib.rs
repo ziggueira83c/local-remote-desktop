@@ -35,6 +35,14 @@ pub struct AppSettings {
     pub swap_ctrl_cmd: bool,
     /// Sempre `true` nesta versão: acesso não supervisionado está desativado (RN-007).
     pub require_approval: bool,
+    /// Permite enviar o áudio do sistema quando este computador é acessado.
+    pub share_audio: bool,
+    /// Ao controlar: receber o áudio do outro computador.
+    pub receive_audio: bool,
+    /// Ao controlar: aplicar melhoria de imagem (nitidez) na tela remota.
+    pub enhance_image: bool,
+    /// Intensidade da melhoria de imagem, de 0.0 a 1.0.
+    pub enhance_strength: f32,
 }
 
 impl Default for AppSettings {
@@ -47,6 +55,10 @@ impl Default for AppSettings {
             max_fps: 30,
             swap_ctrl_cmd: true,
             require_approval: true,
+            share_audio: true,
+            receive_audio: true,
+            enhance_image: false,
+            enhance_strength: 0.5,
         }
     }
 }
@@ -111,6 +123,8 @@ pub enum NodeEvent {
         permissions: Permissions,
         fingerprint: String,
         sas: String,
+        video_codec: String,
+        audio_enabled: bool,
     },
     OutboundEnded {
         session_id: String,

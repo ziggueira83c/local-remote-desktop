@@ -24,6 +24,7 @@ export class FrameRenderer {
     private onResize: (w: number, h: number) => void,
     private onCursor: (c: CursorState) => void,
     private onOverload: () => void,
+    private onDrawn: () => void = () => {},
   ) {
     this.ctx = canvas.getContext("2d", { alpha: false });
   }
@@ -89,10 +90,11 @@ export class FrameRenderer {
       ctx?.drawImage(img, t.x, t.y);
       img.close();
     }
+    this.onDrawn();
   }
 }
 
-function toBytes(data: unknown): Uint8Array | null {
+export function toBytes(data: unknown): Uint8Array | null {
   if (data instanceof ArrayBuffer) return new Uint8Array(data);
   if (data instanceof Uint8Array) return data;
   if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);

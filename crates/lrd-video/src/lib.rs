@@ -1,14 +1,25 @@
-//! Captura de tela e codificação de vídeo.
+//! Captura de tela, áudio do sistema e codificação.
 //!
-//! Pipeline: captura nativa (xcap: GDI/DXGI no Windows, CoreGraphics no macOS) →
-//! redução de escala opcional → detecção de tiles alterados → JPEG por tile →
-//! quadro binário (`lrd_protocol::video`). Só o que mudou na tela é enviado.
+//! Vídeo: captura contínua (DXGI Desktop Duplication no Windows, ScreenCaptureKit no macOS,
+//! com captura por cópia como reserva) → redimensionamento → H.264 (OpenH264, modo
+//! "screen content" de baixa latência). Tiles JPEG continuam disponíveis para controladores
+//! que não decodificam H.264.
+//!
+//! Áudio: loopback WASAPI no Windows e ScreenCaptureKit no macOS, PCM 16 bits.
+//! Vídeo e áudio levam carimbos de tempo do mesmo relógio (`lrd_protocol::now_us`).
 
+pub mod audio;
 pub mod capture;
 pub mod encoder;
+pub mod frame;
+pub mod h264;
+#[cfg(target_os = "macos")]
+mod mac_sck;
 pub mod permissions;
 pub mod pipeline;
+pub mod source;
 
 pub use capture::{list_displays, Display};
 pub use encoder::{QualitySettings, TileEncoder};
-pub use pipeline::{spawn_capture, CaptureCmd, CaptureHandle, CaptureParams};
+pub use frame::{PixelFormat, RawFrame};
+pub use pipeline::{spawn_capture, CaptureCmd, CaptureHandle, CaptureParams, VideoCodec};

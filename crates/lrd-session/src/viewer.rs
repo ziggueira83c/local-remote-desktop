@@ -14,10 +14,10 @@ use tokio::time::timeout;
 use lrd_protocol::envelope::Payload;
 use lrd_protocol::framing::{read_envelope, read_frame, write_envelope};
 use lrd_protocol::input_event::Event;
-use lrd_protocol::video::{validate_frame, FRAME_TILES};
+use lrd_protocol::video::{validate_frame, FRAME_H264, FRAME_TILES};
 use lrd_protocol::{
     reason, ConnectRequest, Envelope, Hello, InputEvent, KeyEvent, MouseButton, MouseScroll, PointerMove,
-    RequestKeyframe, SelectDisplay, SetQuality, DEFAULT_PORT, MAX_VIDEO_FRAME, MIN_PROTOCOL_VERSION,
+    RequestKeyframe, SelectDisplay, SetAudio, SetQuality, DEFAULT_PORT, MAX_VIDEO_FRAME, MIN_PROTOCOL_VERSION,
     PROTOCOL_VERSION,
 };
 use lrd_security::{fingerprint_of, format_fingerprint, is_allowed_peer_ip, sas_code, Permissions, Profile};
@@ -37,6 +37,12 @@ pub struct ConnectParams {
     pub port: Option<u16>,
     pub expected_fingerprint: Option<String>,
     pub profile: Profile,
+    /// Codecs que a interface consegue decodificar (ex.: ["h264", "jpeg-tiles"]).
+    #[serde(default)]
+    pub codecs: Vec<String>,
+    /// Receber o áudio do outro computador.
+    #[serde(default)]
+    pub audio: bool,
 }
 
 /// Evento de entrada vindo da interface.
@@ -125,7 +131,17 @@ impl Node {
             });
         }
 
-        match self.clone().establish(conn.clone(), session_id.clone(), addr, params.profile, seen, sink).await {
+        let mut codecs: Vec<String> = params
+            .codecs
+            .iter()
+            .filter(|c| *c == lrd_protocol::codec::H264 || *c == lrd_protocol::codec::JPEG_TILES)
+            .cloned()
+            .collect();
+        if !codecs.iter().any(|c| c == lrd_protocol::codec::JPEG_TILES) {
+            codecs.push(lrd_protocol::codec::JPEG_TILES.into());
+        }
+        let media = (codecs, params.audio);
+        match self.clone().establish(conn.clone(), session_id.clone(), addr, params.profile, media, seen, sink).await {
             Ok(()) => Ok(session_id),
             Err(e) => {
                 {
@@ -148,9 +164,11 @@ impl Node {
         session_id: String,
         addr: SocketAddr,
         profile: Profile,
+        media: (Vec<String>, bool),
         seen: Arc<Mutex<Option<Vec<u8>>>>,
         sink: FrameSink,
     ) -> Result<()> {
+        let (codecs, want_audio) = media;
         let server_cert = seen.lock().unwrap().clone().ok_or_else(|| anyhow!("certificado do servidor ausente"))?;
         let server_fp = fingerprint_of(&server_cert);
         self.emit_outbound_state("authenticating", None, Some(format_fingerprint(&server_fp)), None);
@@ -161,7 +179,7 @@ impl Node {
             device_name: self.settings().device_name,
             min_version: MIN_PROTOCOL_VERSION,
             max_version: PROTOCOL_VERSION,
-            codecs: vec![lrd_protocol::codec::JPEG_TILES.into()],
+            codecs,
             platform: platform_name().into(),
         };
         write_envelope(&mut send, &Envelope::new("", 1, Payload::Hello(my_hello))).await?;
@@ -220,6 +238,7 @@ impl Node {
             requested_profile: profile.as_str().into(),
             requested_display: String::new(),
             control_requested: profile != Profile::ViewOnly,
+            want_audio,
         };
         write_envelope(&mut send, &Envelope::new("", 2, Payload::ConnectRequest(req))).await?;
 
@@ -252,25 +271,32 @@ impl Node {
         let stats = Arc::new(Stats::default());
         let close_note: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
-        // Vídeo.
+        // Vídeo e áudio: o host abre um stream unidirecional para cada um.
         let conn_v = conn.clone();
         let stats_v = stats.clone();
         let video = tokio::spawn(async move {
-            let mut uni = match conn_v.accept_uni().await {
-                Ok(u) => u,
-                Err(_) => return,
-            };
-            while let Ok(frame) = read_frame(&mut uni, MAX_VIDEO_FRAME).await {
-                if !validate_frame(&frame) {
-                    tracing::warn!("quadro de vídeo inválido; encerrando");
-                    conn_v.close(quinn::VarInt::from_u32(1), reason::PROTOCOL_ERROR.as_bytes());
-                    return;
-                }
-                if frame[0] == FRAME_TILES {
-                    stats_v.frames.fetch_add(1, Ordering::Relaxed);
-                }
-                stats_v.bytes.fetch_add(frame.len() as u64, Ordering::Relaxed);
-                sink(frame);
+            let mut readers = Vec::new();
+            while let Ok(mut uni) = conn_v.accept_uni().await {
+                let conn_r = conn_v.clone();
+                let stats_r = stats_v.clone();
+                let sink_r = sink.clone();
+                readers.push(tokio::spawn(async move {
+                    while let Ok(frame) = read_frame(&mut uni, MAX_VIDEO_FRAME).await {
+                        if !validate_frame(&frame) {
+                            tracing::warn!("quadro de mídia inválido; encerrando");
+                            conn_r.close(quinn::VarInt::from_u32(1), reason::PROTOCOL_ERROR.as_bytes());
+                            return;
+                        }
+                        if frame[0] == FRAME_TILES || frame[0] == FRAME_H264 {
+                            stats_r.frames.fetch_add(1, Ordering::Relaxed);
+                        }
+                        stats_r.bytes.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                        sink_r(frame);
+                    }
+                }));
+            }
+            for r in readers {
+                r.abort();
             }
         });
 
@@ -385,6 +411,12 @@ impl Node {
             permissions,
             fingerprint: format_fingerprint(&server_fp),
             sas,
+            video_codec: if resp.video_codec.is_empty() {
+                lrd_protocol::codec::JPEG_TILES.into()
+            } else {
+                resp.video_codec.clone()
+            },
+            audio_enabled: resp.audio_enabled,
         });
 
         // Encerramento: limpa tudo quando a conexão cair ou for fechada.
@@ -450,6 +482,10 @@ impl Node {
 
     pub fn set_quality(&self, profile: String, max_fps: u32) -> Result<()> {
         self.send_control(Payload::SetQuality(SetQuality { profile, max_fps }))
+    }
+
+    pub fn set_audio(&self, enabled: bool) -> Result<()> {
+        self.send_control(Payload::SetAudio(SetAudio { enabled }))
     }
 
     pub fn request_keyframe(&self) -> Result<()> {

@@ -41,6 +41,17 @@ pub mod reason {
 
 /// Codecs de vídeo conhecidos.
 pub mod codec {
-    /// Tiles JPEG com envio apenas das regiões alteradas.
+    /// H.264 (perfil baseline, Annex B) — padrão quando o controlador consegue decodificar.
+    pub const H264: &str = "h264";
+    /// Tiles JPEG com envio apenas das regiões alteradas (compatibilidade).
     pub const JPEG_TILES: &str = "jpeg-tiles";
+}
+
+/// Relógio monotônico do processo em microssegundos. Vídeo e áudio usam o mesmo relógio
+/// para que o controlador consiga sincronizá-los.
+pub fn now_us() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_micros() as u64
 }

@@ -3,6 +3,8 @@
 use anyhow::{anyhow, Result};
 use serde::Serialize;
 
+use crate::frame::{PixelFormat, RawFrame};
+
 /// Monitor físico. `x`, `y`, `width`, `height` estão no sistema de coordenadas nativo do SO
 /// usado pela injeção de mouse: pixels físicos do desktop virtual no Windows (app com DPI
 /// awareness) e pontos globais no macOS.
@@ -17,13 +19,6 @@ pub struct Display {
     pub height: u32,
     pub scale_factor: f32,
     pub primary: bool,
-}
-
-/// Quadro bruto RGBA.
-pub struct RawFrame {
-    pub width: u32,
-    pub height: u32,
-    pub rgba: Vec<u8>,
 }
 
 fn describe(m: &xcap::Monitor) -> Result<Display> {
@@ -47,9 +42,9 @@ pub fn list_displays() -> Result<Vec<Display>> {
     Ok(out)
 }
 
-/// Captura repetida de um monitor.
+/// Captura por cópia (reserva quando a captura contínua não está disponível).
 pub struct Capturer {
-    monitor: xcap::Monitor,
+    pub(crate) monitor: xcap::Monitor,
     pub display: Display,
 }
 
@@ -78,6 +73,6 @@ impl Capturer {
         if rgba.len() != (width as usize) * (height as usize) * 4 {
             return Err(anyhow!("quadro com tamanho inesperado"));
         }
-        Ok(RawFrame { width, height, rgba })
+        Ok(RawFrame { width, height, data: rgba, format: PixelFormat::Rgba, timestamp_us: lrd_protocol::now_us() })
     }
 }

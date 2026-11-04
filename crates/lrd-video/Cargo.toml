@@ -11,4 +11,11 @@ tracing.workspace = true
 tokio.workspace = true
 image.workspace = true
 xcap.workspace = true
+openh264.workspace = true
 lrd-protocol.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+cpal.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+screencapturekit.workspace = true

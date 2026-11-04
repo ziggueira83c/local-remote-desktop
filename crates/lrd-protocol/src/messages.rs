@@ -11,7 +11,7 @@ pub struct Envelope {
     pub session_id: String,
     #[prost(uint64, tag = "3")]
     pub sequence: u64,
-    #[prost(oneof = "envelope::Payload", tags = "10, 11, 12, 13, 14, 15, 16, 17, 18")]
+    #[prost(oneof = "envelope::Payload", tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19")]
     pub payload: Option<envelope::Payload>,
 }
 
@@ -36,6 +36,8 @@ pub mod envelope {
         SetQuality(super::SetQuality),
         #[prost(message, tag = "18")]
         RequestKeyframe(super::RequestKeyframe),
+        #[prost(message, tag = "19")]
+        SetAudio(super::SetAudio),
     }
 }
 
@@ -65,6 +67,9 @@ pub struct ConnectRequest {
     pub requested_display: String,
     #[prost(bool, tag = "3")]
     pub control_requested: bool,
+    /// O controlador quer receber o áudio do sistema.
+    #[prost(bool, tag = "4")]
+    pub want_audio: bool,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -93,6 +98,12 @@ pub struct ConnectResponse {
     pub displays: Vec<DisplayInfo>,
     #[prost(string, tag = "5")]
     pub active_display: String,
+    /// Codec de vídeo escolhido pelo host ("h264" ou "jpeg-tiles").
+    #[prost(string, tag = "6")]
+    pub video_codec: String,
+    /// O host vai transmitir áudio.
+    #[prost(bool, tag = "7")]
+    pub audio_enabled: bool,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -183,6 +194,13 @@ pub struct SetQuality {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct RequestKeyframe {}
+
+/// Liga/desliga o envio de áudio durante a sessão.
+#[derive(Clone, PartialEq, Message)]
+pub struct SetAudio {
+    #[prost(bool, tag = "1")]
+    pub enabled: bool,
+}
 
 impl Envelope {
     pub fn new(session_id: &str, sequence: u64, payload: envelope::Payload) -> Self {

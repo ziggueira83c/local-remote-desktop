@@ -57,6 +57,7 @@ fn main() {
             commands::select_display,
             commands::set_video_quality,
             commands::request_keyframe,
+            commands::set_audio,
             commands::approve_session,
             commands::reject_session,
             commands::end_inbound_session,

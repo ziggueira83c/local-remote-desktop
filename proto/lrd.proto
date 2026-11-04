@@ -18,6 +18,7 @@ message Envelope {
     SelectDisplay select_display = 16;
     SetQuality set_quality = 17;
     RequestKeyframe request_keyframe = 18;
+    SetAudio set_audio = 19;
   }
 }
 
@@ -26,7 +27,7 @@ message Hello {
   string device_name = 2;
   uint32 min_version = 3;
   uint32 max_version = 4;
-  repeated string codecs = 5;   // "jpeg-tiles"
+  repeated string codecs = 5;   // "h264", "jpeg-tiles"
   string platform = 6;          // "windows" | "macos" | "other"
 }
 
@@ -34,6 +35,7 @@ message ConnectRequest {
   string requested_profile = 1; // "view_only" | "remote_control" | "full_control"
   string requested_display = 2;
   bool control_requested = 3;
+  bool want_audio = 4;
 }
 
 message DisplayInfo {
@@ -50,6 +52,8 @@ message ConnectResponse {
   repeated string granted_permissions = 3;
   repeated DisplayInfo displays = 4;
   string active_display = 5;
+  string video_codec = 6;       // "h264" | "jpeg-tiles"
+  bool audio_enabled = 7;
 }
 
 message InputEvent {
@@ -75,3 +79,4 @@ message SessionClose { string reason_code = 1; }
 message SelectDisplay { string display_id = 1; }
 message SetQuality { string profile = 1; uint32 max_fps = 2; }
 message RequestKeyframe {}
+message SetAudio { bool enabled = 1; }

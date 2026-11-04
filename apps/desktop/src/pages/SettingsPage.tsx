@@ -73,9 +73,9 @@ export function SettingsPage() {
           <label className="field">
             <span className="field__label">Qualidade</span>
             <select value={s.qualityProfile} onChange={(e) => update("qualityProfile", e.target.value as AppSettings["qualityProfile"])}>
-              <option value="speed">Fluidez (até 1440 px de largura)</option>
-              <option value="balanced">Equilibrado (até 1920 px)</option>
-              <option value="quality">Nitidez (resolução nativa até 4K)</option>
+              <option value="speed">Fluidez (até 1600 px, ~3 Mbps)</option>
+              <option value="balanced">Equilibrado (até 1920 px, ~7 Mbps)</option>
+              <option value="quality">Nitidez (até 2560 px, ~14 Mbps)</option>
             </select>
           </label>
           <label className="field">
@@ -88,6 +88,35 @@ export function SettingsPage() {
           </label>
         </div>
         <span className="field__help">Quem controla pode mudar isso durante a sessão.</span>
+        <label className="check">
+          <input type="checkbox" checked={s.shareAudio} onChange={(e) => update("shareAudio", e.target.checked)} />
+          Transmitir o áudio deste computador (o que toca nos alto-falantes)
+        </label>
+      </div>
+
+      <div className="card">
+        <h2 className="card__title">Ao controlar outro computador</h2>
+        <label className="check">
+          <input type="checkbox" checked={s.receiveAudio} onChange={(e) => update("receiveAudio", e.target.checked)} />
+          Receber o áudio do outro computador
+        </label>
+        <label className="check">
+          <input type="checkbox" checked={s.enhanceImage} onChange={(e) => update("enhanceImage", e.target.checked)} />
+          Melhorar a imagem (nitidez adaptativa) por padrão
+        </label>
+        {s.enhanceImage && (
+          <label className="field">
+            <span className="field__label">Intensidade</span>
+            <select value={s.enhanceStrength} onChange={(e) => update("enhanceStrength", Number(e.target.value))}>
+              <option value={0.25}>Leve</option>
+              <option value={0.5}>Média</option>
+              <option value={0.85}>Forte</option>
+            </select>
+          </label>
+        )}
+        <span className="field__help">
+          A melhoria é feita na sua tela, pela placa de vídeo: não aumenta o tráfego nem pesa no outro computador.
+        </span>
       </div>
 
       <div className="card">

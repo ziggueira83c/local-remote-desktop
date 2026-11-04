@@ -9,6 +9,7 @@ import type {
   Profile,
   RemoteDisplay,
 } from "./lib/api";
+import { endMedia } from "./lib/session";
 
 export type Page = "home" | "session" | "settings" | "history";
 
@@ -42,6 +43,8 @@ export interface OutboundSession {
   permissions: Permissions;
   fingerprint: string;
   sas: string;
+  videoCodec: string;
+  audioEnabled: boolean;
 }
 
 export interface InboundSession {
@@ -194,12 +197,15 @@ export const useStore = create<State>((set, get) => ({
             permissions: e.permissions,
             fingerprint: e.fingerprint,
             sas: e.sas,
+            videoCodec: e.videoCodec,
+            audioEnabled: e.audioEnabled,
           },
         });
         s.bumpKnown();
         break;
       case "outboundEnded":
         if (s.outbound?.sessionId === e.sessionId) {
+          endMedia();
           set({ outbound: null, metrics: null, page: s.page === "session" ? "home" : s.page });
           s.toast("info", e.reason);
         }

@@ -17,7 +17,7 @@ use lrd_protocol::{
     MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 use lrd_security::{fingerprint_of, format_fingerprint, is_allowed_peer_ip, sas_code, Permissions, Profile};
-use lrd_video::{CaptureCmd, CaptureParams, Display, QualitySettings};
+use lrd_video::{CaptureCmd, CaptureParams, Display, QualitySettings, VideoCodec};
 
 use crate::node::{close_reason, Decision, InboundHandle, Node};
 use crate::{platform_name, NodeEvent};
@@ -91,10 +91,16 @@ impl Node {
             device_name: self.settings().device_name,
             min_version: MIN_PROTOCOL_VERSION,
             max_version: PROTOCOL_VERSION,
-            codecs: vec![lrd_protocol::codec::JPEG_TILES.into()],
+            codecs: vec![lrd_protocol::codec::H264.into(), lrd_protocol::codec::JPEG_TILES.into()],
             platform: platform_name().into(),
         };
         write_envelope(&mut send, &Envelope::new("", 1, Payload::Hello(my_hello))).await?;
+        // H.264 quando o controlador consegue decodificar; senão, tiles JPEG.
+        let codec = if hello.codecs.iter().any(|c| c == lrd_protocol::codec::H264) {
+            VideoCodec::H264
+        } else {
+            VideoCodec::JpegTiles
+        };
 
         // 2. ConnectRequest
         let req = match timeout(HANDSHAKE_TIMEOUT, read_envelope(&mut recv)).await??.payload {
@@ -244,16 +250,24 @@ impl Node {
             serde_json::json!({ "device": device_name, "permissions": granted.to_list() }),
         );
 
+        let audio_allowed = self.settings().share_audio && audio_supported();
+        let audio_on = audio_allowed && req.want_audio;
         let resp = ConnectResponse {
             approved: true,
             reason_code: reason::APPROVED.into(),
             granted_permissions: granted.to_list(),
             displays: displays.iter().map(to_display_info).collect(),
             active_display: active.id.to_string(),
+            video_codec: match codec {
+                VideoCodec::H264 => lrd_protocol::codec::H264.into(),
+                VideoCodec::JpegTiles => lrd_protocol::codec::JPEG_TILES.into(),
+            },
+            audio_enabled: audio_on,
         };
         write_envelope(&mut send, &Envelope::new(&session_id, 2, Payload::ConnectResponse(resp))).await?;
 
-        self.run_inbound(conn, send, recv, session_id, device_name, address, granted, displays, active, injector)
+        let media = MediaOptions { codec, audio_allowed, audio_on };
+        self.run_inbound(conn, send, recv, session_id, device_name, address, granted, displays, active, injector, media)
             .await
     }
 
@@ -270,6 +284,7 @@ impl Node {
         displays: Vec<Display>,
         active: Display,
         injector: Option<Arc<lrd_input::InputInjector>>,
+        media: MediaOptions,
     ) -> Result<()> {
         let perms = Arc::new(RwLock::new(granted));
         let geometry = Arc::new(RwLock::new(active.clone()));
@@ -278,11 +293,16 @@ impl Node {
         let s = self.settings();
         let quality = QualitySettings::from_profile(&s.quality_profile, s.max_fps);
         let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(1);
+        // Áudio: fila curta; se a rede engasgar, blocos antigos são descartados na origem.
+        let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(32);
         let capture = lrd_video::spawn_capture(
             CaptureParams {
                 display_id: Some(active.id),
                 quality,
+                codec: media.codec,
                 cursor: Some(Box::new(lrd_input::cursor_position)),
+                audio: if media.audio_allowed { Some(audio_tx) } else { None },
+                audio_enabled: media.audio_on,
             },
             frame_tx,
         );
@@ -319,6 +339,25 @@ impl Node {
                 write_frame(&mut uni, &frame).await?;
             }
             Ok::<_, anyhow::Error>(())
+        });
+
+        // Áudio: stream unidirecional próprio, para não esperar atrás de quadros de vídeo grandes.
+        let conn_a = conn.clone();
+        let audio_task = tokio::spawn(async move {
+            let mut uni: Option<quinn::SendStream> = None;
+            while let Some(block) = audio_rx.recv().await {
+                if uni.is_none() {
+                    match conn_a.open_uni().await {
+                        Ok(u) => uni = Some(u),
+                        Err(_) => break,
+                    }
+                }
+                if let Some(stream) = uni.as_mut() {
+                    if write_frame(stream, &block).await.is_err() {
+                        break;
+                    }
+                }
+            }
         });
 
         // Entrada: stream unidirecional viewer → host.
@@ -368,6 +407,9 @@ impl Node {
                     Some(Payload::RequestKeyframe(_)) => {
                         let _ = cap_cmds.send(CaptureCmd::Keyframe);
                     }
+                    Some(Payload::SetAudio(a)) => {
+                        let _ = cap_cmds.send(CaptureCmd::SetAudio(a.enabled && media.audio_allowed));
+                    }
                     Some(Payload::SessionClose(_)) => {
                         conn_c.close(quinn::VarInt::from_u32(0), reason::USER_CLOSED.as_bytes());
                         break;
@@ -381,6 +423,7 @@ impl Node {
         let why = close_reason(&err);
 
         video.abort();
+        audio_task.abort();
         input.abort();
         control.abort();
         writer.abort();
@@ -453,6 +496,17 @@ impl Node {
         self.storage.audit(Some(&session_id), "permissions_changed", serde_json::json!({ "permissions": applied.to_list() }));
         Ok(applied)
     }
+}
+
+#[derive(Clone, Copy)]
+struct MediaOptions {
+    codec: VideoCodec,
+    audio_allowed: bool,
+    audio_on: bool,
+}
+
+fn audio_supported() -> bool {
+    cfg!(any(target_os = "windows", target_os = "macos"))
 }
 
 async fn reject(conn: &quinn::Connection, send: &mut quinn::SendStream, session_id: &str, code: &str) -> Result<()> {

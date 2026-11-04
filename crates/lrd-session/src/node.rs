@@ -122,6 +122,7 @@ impl Node {
             new.listen_port = lrd_protocol::DEFAULT_PORT;
         }
         new.max_fps = new.max_fps.clamp(5, 60);
+        new.enhance_strength = if new.enhance_strength.is_finite() { new.enhance_strength.clamp(0.0, 1.0) } else { 0.5 };
         if !matches!(new.quality_profile.as_str(), "speed" | "balanced" | "quality") {
             new.quality_profile = "balanced".into();
         }

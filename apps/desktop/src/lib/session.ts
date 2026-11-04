@@ -1,22 +1,20 @@
-// Inicia conexões e encaminha os quadros de vídeo para o renderer da tela de sessão.
+// Inicia conexões e mantém o motor de mídia da sessão (vídeo + áudio).
 import { Channel } from "@tauri-apps/api/core";
 import { api, errorMessage, type Profile } from "./api";
-import type { FrameRenderer } from "./renderer";
+import { MediaEngine, supportedCodecs } from "./media";
 import { useStore } from "../store";
 
-let renderer: FrameRenderer | null = null;
-let pending: unknown[] = [];
+let engine: MediaEngine | null = null;
+let audioCtx: AudioContext | null = null;
 
-/** A tela de sessão registra seu renderer; quadros que chegaram antes são desenhados agora. */
-export function attachRenderer(r: FrameRenderer) {
-  renderer = r;
-  const queued = pending;
-  pending = [];
-  for (const f of queued) r.push(f);
+/** Motor de mídia da sessão atual (a tela de sessão liga o canvas nele). */
+export function currentEngine(): MediaEngine | null {
+  return engine;
 }
 
-export function detachRenderer(r: FrameRenderer) {
-  if (renderer === r) renderer = null;
+export function endMedia() {
+  engine?.close();
+  engine = null;
 }
 
 export interface ConnectTarget {
@@ -32,17 +30,32 @@ export async function connectTo(target: ConnectTarget, profile: Profile) {
     toast("warning", "Já existe uma conexão em andamento.");
     return;
   }
-  setProgress({ state: "connecting", target: target.label, remoteName: null, fingerprint: null, sas: null });
-  pending = [];
-  const channel = new Channel<ArrayBuffer>();
-  channel.onmessage = (data) => {
-    if (renderer) {
-      renderer.push(data);
-    } else {
-      pending.push(data);
-      if (pending.length > 400) pending = []; // a tela pedirá um quadro completo ao abrir
+  // O AudioContext precisa nascer dentro do clique do usuário (política de autoplay).
+  try {
+    if (!audioCtx) {
+      const Ctor = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      audioCtx = new Ctor({ latencyHint: "interactive" });
     }
-  };
+    audioCtx.resume().catch(() => {});
+  } catch {
+    audioCtx = null;
+  }
+
+  setProgress({ state: "connecting", target: target.label, remoteName: null, fingerprint: null, sas: null });
+  endMedia();
+  engine = new MediaEngine(audioCtx);
+  const current = engine;
+  const channel = new Channel<ArrayBuffer>();
+  channel.onmessage = (data) => current.push(data);
+
+  let receiveAudio = true;
+  try {
+    receiveAudio = (await api.getSettings()).receiveAudio;
+  } catch {
+    /* padrão */
+  }
+  const codecs = await supportedCodecs();
+
   try {
     await api.connect(
       {
@@ -50,11 +63,14 @@ export async function connectTo(target: ConnectTarget, profile: Profile) {
         port: target.port,
         expectedFingerprint: target.expectedFingerprint,
         profile,
+        codecs,
+        audio: receiveAudio && !!audioCtx,
       },
       channel,
     );
   } catch (e) {
     useStore.getState().setProgress(null);
+    if (engine === current) endMedia();
     const msg = errorMessage(e);
     if (!/cancel|closed_by_user|encerrada antes/i.test(msg)) toast("error", msg);
   }

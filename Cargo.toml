@@ -51,6 +51,9 @@ gethostname = "0.5"
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 xcap = "0.9"
+openh264 = "0.9"
+cpal = "0.16"
+screencapturekit = "11"
 enigo = "0.2"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
 core-graphics = "0.23"

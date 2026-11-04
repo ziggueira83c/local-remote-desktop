@@ -119,6 +119,10 @@ export interface AppSettings {
   maxFps: number;
   swapCtrlCmd: boolean;
   requireApproval: boolean;
+  shareAudio: boolean;
+  receiveAudio: boolean;
+  enhanceImage: boolean;
+  enhanceStrength: number;
 }
 
 export type NodeEvent =
@@ -155,6 +159,8 @@ export type NodeEvent =
       permissions: Permissions;
       fingerprint: string;
       sas: string;
+      videoCodec: string;
+      audioEnabled: boolean;
     }
   | { type: "outboundEnded"; sessionId: string; reason: string }
   | { type: "permissionsChanged"; sessionId: string; permissions: Permissions }
@@ -172,6 +178,8 @@ export interface ConnectParams {
   port?: number;
   expectedFingerprint?: string;
   profile: Profile;
+  codecs?: string[];
+  audio?: boolean;
 }
 
 export const api = {
@@ -187,6 +195,7 @@ export const api = {
   selectDisplay: (displayId: string) => invoke<void>("select_display", { displayId }),
   setVideoQuality: (profile: string, maxFps: number) => invoke<void>("set_video_quality", { profile, maxFps }),
   requestKeyframe: () => invoke<void>("request_keyframe"),
+  setAudio: (enabled: boolean) => invoke<void>("set_audio", { enabled }),
   approve: (sessionId: string, permissions: Permissions) => invoke<void>("approve_session", { sessionId, permissions }),
   reject: (sessionId: string) => invoke<void>("reject_session", { sessionId }),
   endInbound: () => invoke<void>("end_inbound_session"),

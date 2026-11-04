@@ -80,6 +80,11 @@ pub async fn set_video_quality(state: State<'_, AppState>, profile: String, max_
 }
 
 #[tauri::command]
+pub async fn set_audio(state: State<'_, AppState>, enabled: bool) -> CmdResult<()> {
+    state.node.set_audio(enabled).map_err(err)
+}
+
+#[tauri::command]
 pub async fn request_keyframe(state: State<'_, AppState>) -> CmdResult<()> {
     state.node.request_keyframe().map_err(err)
 }
