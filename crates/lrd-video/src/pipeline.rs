@@ -24,6 +24,10 @@ pub enum CaptureCmd {
     SetQuality(QualitySettings),
     Keyframe,
     SetAudio(bool),
+    /// Nova taxa alvo do H.264 (controle de banda do WebRTC).
+    SetBitrate(u32),
+    /// Troca de codec (ex.: WebRTC falhou e o controlador só decodifica JPEG).
+    SetCodec(VideoCodec),
     Stop,
 }
 
@@ -90,6 +94,8 @@ fn make_encoder(codec: VideoCodec, q: &QualitySettings) -> Encoder {
 
 fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8>>) {
     let CaptureParams { display_id, quality, codec, cursor, audio, audio_enabled } = params;
+    let mut codec = codec;
+    let mut bitrate_override: Option<u32> = None;
     let mut quality = quality;
     let mut display_id = display_id;
     let mut audio_enabled = audio_enabled && audio.is_some();
@@ -120,6 +126,7 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
                     if q != quality {
                         quality = q;
                         encoder = make_encoder(codec, &quality);
+                        bitrate_override = None;
                         // No macOS o tamanho e o FPS são aplicados pelo próprio ScreenCaptureKit.
                         if cfg!(target_os = "macos") {
                             source = None;
@@ -129,6 +136,20 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
                     }
                 }
                 Ok(CaptureCmd::Keyframe) => want_keyframe = true,
+                Ok(CaptureCmd::SetBitrate(bps)) => {
+                    bitrate_override = Some(bps);
+                    if let Encoder::H264(enc) = &mut encoder {
+                        enc.set_bitrate(bps);
+                    }
+                }
+                Ok(CaptureCmd::SetCodec(c)) => {
+                    if c != codec {
+                        codec = c;
+                        encoder = make_encoder(codec, &quality);
+                        last_encoded = None;
+                        want_keyframe = true;
+                    }
+                }
                 Ok(CaptureCmd::SetAudio(on)) => {
                     let on = on && audio.is_some();
                     if on != audio_enabled {
@@ -226,6 +247,9 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
 
         let encoded = match &mut encoder {
             Encoder::H264(enc) => {
+                if let Some(bps) = bitrate_override {
+                    enc.set_bitrate(bps);
+                }
                 if want_keyframe {
                     enc.force_keyframe();
                 }

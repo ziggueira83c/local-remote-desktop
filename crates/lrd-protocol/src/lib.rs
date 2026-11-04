@@ -45,6 +45,8 @@ pub mod codec {
     pub const H264: &str = "h264";
     /// Tiles JPEG com envio apenas das regiões alteradas (compatibilidade).
     pub const JPEG_TILES: &str = "jpeg-tiles";
+    /// O controlador aceita mídia por WebRTC (H.264 + Opus via RTP/SRTP).
+    pub const WEBRTC: &str = "webrtc";
 }
 
 /// Relógio monotônico do processo em microssegundos. Vídeo e áudio usam o mesmo relógio

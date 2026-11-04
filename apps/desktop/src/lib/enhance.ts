@@ -82,8 +82,10 @@ export class Enhancer {
     this.uSharp = gl.getUniformLocation(prog, "sharpness");
   }
 
-  /** Desenha `source` (canvas 2D com a tela remota) no canvas WebGL, com nitidez. */
-  render(source: HTMLCanvasElement, strength: number) {
+  /** Desenha `source` (canvas com a tela remota ou o <video> do WebRTC) com nitidez. */
+  render(source: HTMLCanvasElement | HTMLVideoElement, strength: number) {
+    const srcW = source instanceof HTMLVideoElement ? source.videoWidth : source.width;
+    const srcH = source instanceof HTMLVideoElement ? source.videoHeight : source.height;
     const gl = this.gl;
     const canvas = gl.canvas as HTMLCanvasElement;
     const dpr = window.devicePixelRatio || 1;
@@ -93,12 +95,12 @@ export class Enhancer {
       canvas.width = w;
       canvas.height = h;
     }
-    if (!source.width || !source.height) return;
+    if (!srcW || !srcH) return;
     gl.viewport(0, 0, w, h);
     gl.useProgram(this.prog);
     gl.bindTexture(gl.TEXTURE_2D, this.tex);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, source);
-    gl.uniform2f(this.uTexel, 1 / source.width, 1 / source.height);
+    gl.uniform2f(this.uTexel, 1 / srcW, 1 / srcH);
     gl.uniform1f(this.uSharp, Math.min(1, Math.max(0, strength)));
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }

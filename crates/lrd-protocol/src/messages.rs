@@ -11,7 +11,7 @@ pub struct Envelope {
     pub session_id: String,
     #[prost(uint64, tag = "3")]
     pub sequence: u64,
-    #[prost(oneof = "envelope::Payload", tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19")]
+    #[prost(oneof = "envelope::Payload", tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20")]
     pub payload: Option<envelope::Payload>,
 }
 
@@ -38,6 +38,8 @@ pub mod envelope {
         RequestKeyframe(super::RequestKeyframe),
         #[prost(message, tag = "19")]
         SetAudio(super::SetAudio),
+        #[prost(message, tag = "20")]
+        WebRtcSignal(super::WebRtcSignal),
     }
 }
 
@@ -194,6 +196,17 @@ pub struct SetQuality {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct RequestKeyframe {}
+
+/// Sinalização WebRTC (SDP), trafegando pelo canal QUIC já autenticado por certificado.
+/// Isso amarra a identidade DTLS do WebRTC à identidade verificada do par.
+#[derive(Clone, PartialEq, Message)]
+pub struct WebRtcSignal {
+    /// "offer" (host → controlador) ou "answer" (controlador → host).
+    #[prost(string, tag = "1")]
+    pub kind: String,
+    #[prost(string, tag = "2")]
+    pub sdp: String,
+}
 
 /// Liga/desliga o envio de áudio durante a sessão.
 #[derive(Clone, PartialEq, Message)]

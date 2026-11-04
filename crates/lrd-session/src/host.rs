@@ -2,7 +2,7 @@
 //! entrada — sempre verificando as permissões concedidas (RN-009).
 
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
@@ -13,13 +13,14 @@ use lrd_protocol::envelope::Payload;
 use lrd_protocol::framing::{read_envelope, write_envelope, write_frame};
 use lrd_protocol::input_event::Event;
 use lrd_protocol::{
-    reason, ConnectResponse, DisplayInfo, Envelope, Hello, InputEvent, PermissionUpdate, SessionClose,
+    reason, ConnectResponse, DisplayInfo, Envelope, Hello, InputEvent, PermissionUpdate, SessionClose, WebRtcSignal,
     MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 use lrd_security::{fingerprint_of, format_fingerprint, is_allowed_peer_ip, sas_code, Permissions, Profile};
 use lrd_video::{CaptureCmd, CaptureParams, Display, QualitySettings, VideoCodec};
 
 use crate::node::{close_reason, Decision, InboundHandle, Node};
+use crate::rtc::{RtcSender, RtcState};
 use crate::{platform_name, NodeEvent};
 
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -91,12 +92,18 @@ impl Node {
             device_name: self.settings().device_name,
             min_version: MIN_PROTOCOL_VERSION,
             max_version: PROTOCOL_VERSION,
-            codecs: vec![lrd_protocol::codec::H264.into(), lrd_protocol::codec::JPEG_TILES.into()],
+            codecs: vec![
+                lrd_protocol::codec::WEBRTC.into(),
+                lrd_protocol::codec::H264.into(),
+                lrd_protocol::codec::JPEG_TILES.into(),
+            ],
             platform: platform_name().into(),
         };
         write_envelope(&mut send, &Envelope::new("", 1, Payload::Hello(my_hello))).await?;
-        // H.264 quando o controlador consegue decodificar; senão, tiles JPEG.
-        let codec = if hello.codecs.iter().any(|c| c == lrd_protocol::codec::H264) {
+        // WebRTC sempre usa H.264. Sem WebRTC: H.264 via WebCodecs se possível, senão JPEG.
+        let viewer_webrtc = hello.codecs.iter().any(|c| c == lrd_protocol::codec::WEBRTC);
+        let viewer_h264 = hello.codecs.iter().any(|c| c == lrd_protocol::codec::H264);
+        let codec = if viewer_webrtc || viewer_h264 {
             VideoCodec::H264
         } else {
             VideoCodec::JpegTiles
@@ -266,7 +273,7 @@ impl Node {
         };
         write_envelope(&mut send, &Envelope::new(&session_id, 2, Payload::ConnectResponse(resp))).await?;
 
-        let media = MediaOptions { codec, audio_allowed, audio_on };
+        let media = MediaOptions { codec, webrtc: viewer_webrtc, viewer_h264, audio_allowed, audio_on };
         self.run_inbound(conn, send, recv, session_id, device_name, address, granted, displays, active, injector, media)
             .await
     }
@@ -331,33 +338,131 @@ impl Node {
             permissions: granted,
         });
 
-        // Vídeo: stream unidirecional host → viewer.
+        // ---- Rota da mídia: WebRTC (preferido) ou streams QUIC (reserva) ----
+        let route: Arc<Mutex<Route>> =
+            Arc::new(Mutex::new(if media.webrtc { Route::Pending } else { Route::Quic }));
+        let (answer_tx, mut answer_rx) = mpsc::channel::<String>(1);
+
+        // Vídeo (e cursor).
         let conn_v = conn.clone();
+        let route_v = route.clone();
         let video = tokio::spawn(async move {
-            let mut uni = conn_v.open_uni().await?;
+            let mut uni: Option<quinn::SendStream> = None;
             while let Some(frame) = frame_rx.recv().await {
-                write_frame(&mut uni, &frame).await?;
+                let r = route_v.lock().unwrap().clone();
+                let via_quic = match &r {
+                    Route::Pending => false,
+                    Route::Quic => true,
+                    Route::Rtc(rtc) => {
+                        if frame[0] == lrd_protocol::video::FRAME_H264 {
+                            rtc.write_video(&frame).await;
+                            false
+                        } else {
+                            // Cursor (e eventuais tiles) continuam pelo QUIC.
+                            true
+                        }
+                    }
+                };
+                if via_quic {
+                    if uni.is_none() {
+                        match conn_v.open_uni().await {
+                            Ok(u) => uni = Some(u),
+                            Err(_) => break,
+                        }
+                    }
+                    if let Some(stream) = uni.as_mut() {
+                        if write_frame(stream, &frame).await.is_err() {
+                            break;
+                        }
+                    }
+                }
             }
-            Ok::<_, anyhow::Error>(())
         });
 
-        // Áudio: stream unidirecional próprio, para não esperar atrás de quadros de vídeo grandes.
+        // Áudio.
         let conn_a = conn.clone();
+        let route_a = route.clone();
         let audio_task = tokio::spawn(async move {
             let mut uni: Option<quinn::SendStream> = None;
             while let Some(block) = audio_rx.recv().await {
-                if uni.is_none() {
-                    match conn_a.open_uni().await {
-                        Ok(u) => uni = Some(u),
-                        Err(_) => break,
-                    }
-                }
-                if let Some(stream) = uni.as_mut() {
-                    if write_frame(stream, &block).await.is_err() {
-                        break;
+                let r = route_a.lock().unwrap().clone();
+                match r {
+                    Route::Pending => {}
+                    Route::Rtc(rtc) => rtc.write_audio(&block).await,
+                    Route::Quic => {
+                        if uni.is_none() {
+                            match conn_a.open_uni().await {
+                                Ok(u) => uni = Some(u),
+                                Err(_) => break,
+                            }
+                        }
+                        if let Some(stream) = uni.as_mut() {
+                            if write_frame(stream, &block).await.is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
             }
+        });
+
+        // Negociação WebRTC; se falhar, cai para QUIC sem derrubar a sessão.
+        let route_r = route.clone();
+        let cap_r = cap_cmds.clone();
+        let ctrl_r = ctrl_tx.clone();
+        let sid_r = session_id.clone();
+        let max_bitrate = quality.bitrate_bps;
+        let rtc_task = tokio::spawn(async move {
+            if !media.webrtc {
+                return;
+            }
+            let fallback = |why: &str| {
+                tracing::warn!("WebRTC indisponível ({why}); usando QUIC");
+                *route_r.lock().unwrap() = Route::Quic;
+                if !media.viewer_h264 {
+                    let _ = cap_r.send(CaptureCmd::SetCodec(VideoCodec::JpegTiles));
+                }
+                let _ = cap_r.send(CaptureCmd::Keyframe);
+            };
+            let (state_tx, mut state_rx) = mpsc::unbounded_channel();
+            let (rtc, offer) = match RtcSender::start(cap_r.clone(), max_bitrate, state_tx).await {
+                Ok(v) => v,
+                Err(e) => return fallback(&format!("{e:#}")),
+            };
+            let signal = WebRtcSignal { kind: "offer".into(), sdp: offer };
+            if ctrl_r.send(Envelope::new(&sid_r, 0, Payload::WebRtcSignal(signal))).await.is_err() {
+                return;
+            }
+            let answer = match timeout(Duration::from_secs(10), answer_rx.recv()).await {
+                Ok(Some(a)) => a,
+                _ => {
+                    rtc.close().await;
+                    return fallback("sem resposta do controlador");
+                }
+            };
+            if let Err(e) = rtc.accept_answer(answer).await {
+                rtc.close().await;
+                return fallback(&format!("{e:#}"));
+            }
+            match timeout(Duration::from_secs(10), state_rx.recv()).await {
+                Ok(Some(RtcState::Connected)) => {
+                    tracing::info!("mídia por WebRTC");
+                    *route_r.lock().unwrap() = Route::Rtc(rtc.clone());
+                    let _ = cap_r.send(CaptureCmd::Keyframe);
+                }
+                _ => {
+                    rtc.close().await;
+                    return fallback("ICE não conectou");
+                }
+            }
+            // Se o WebRTC cair no meio da sessão, continua por QUIC.
+            while let Some(st) = state_rx.recv().await {
+                if st == RtcState::Failed {
+                    fallback("conexão perdida");
+                    break;
+                }
+            }
+            rtc.close().await;
         });
 
         // Entrada: stream unidirecional viewer → host.
@@ -407,6 +512,9 @@ impl Node {
                     Some(Payload::RequestKeyframe(_)) => {
                         let _ = cap_cmds.send(CaptureCmd::Keyframe);
                     }
+                    Some(Payload::WebRtcSignal(sig)) if sig.kind == "answer" => {
+                        let _ = answer_tx.try_send(sig.sdp);
+                    }
                     Some(Payload::SetAudio(a)) => {
                         let _ = cap_cmds.send(CaptureCmd::SetAudio(a.enabled && media.audio_allowed));
                     }
@@ -424,6 +532,10 @@ impl Node {
 
         video.abort();
         audio_task.abort();
+        rtc_task.abort();
+        if let Route::Rtc(rtc) = route.lock().unwrap().clone() {
+            tokio::spawn(async move { rtc.close().await });
+        }
         input.abort();
         control.abort();
         writer.abort();
@@ -498,9 +610,21 @@ impl Node {
     }
 }
 
+#[derive(Clone)]
+enum Route {
+    /// Aguardando a negociação WebRTC (mídia descartada; um quadro completo vai na troca).
+    Pending,
+    Rtc(Arc<RtcSender>),
+    Quic,
+}
+
 #[derive(Clone, Copy)]
 struct MediaOptions {
     codec: VideoCodec,
+    /// O controlador aceita WebRTC.
+    webrtc: bool,
+    /// O controlador decodifica H.264 também pelo caminho QUIC (WebCodecs).
+    viewer_h264: bool,
     audio_allowed: bool,
     audio_on: bool,
 }

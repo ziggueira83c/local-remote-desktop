@@ -163,6 +163,7 @@ export type NodeEvent =
       audioEnabled: boolean;
     }
   | { type: "outboundEnded"; sessionId: string; reason: string }
+  | { type: "webRtcOffer"; sessionId: string; sdp: string }
   | { type: "permissionsChanged"; sessionId: string; permissions: Permissions }
   | { type: "metrics"; sessionId: string; fps: number; kbps: number; rttMs: number }
   | { type: "notice"; level: "info" | "warning" | "error"; message: string };
@@ -196,6 +197,7 @@ export const api = {
   setVideoQuality: (profile: string, maxFps: number) => invoke<void>("set_video_quality", { profile, maxFps }),
   requestKeyframe: () => invoke<void>("request_keyframe"),
   setAudio: (enabled: boolean) => invoke<void>("set_audio", { enabled }),
+  webrtcAnswer: (sdp: string) => invoke<void>("webrtc_answer", { sdp }),
   approve: (sessionId: string, permissions: Permissions) => invoke<void>("approve_session", { sessionId, permissions }),
   reject: (sessionId: string) => invoke<void>("reject_session", { sessionId }),
   endInbound: () => invoke<void>("end_inbound_session"),

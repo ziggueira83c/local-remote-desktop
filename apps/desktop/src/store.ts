@@ -9,7 +9,8 @@ import type {
   Profile,
   RemoteDisplay,
 } from "./lib/api";
-import { endMedia } from "./lib/session";
+import { api } from "./lib/api";
+import { currentEngine, endMedia } from "./lib/session";
 
 export type Page = "home" | "session" | "settings" | "history";
 
@@ -210,6 +211,16 @@ export const useStore = create<State>((set, get) => ({
           s.toast("info", e.reason);
         }
         break;
+      case "webRtcOffer": {
+        const engine = currentEngine();
+        if (engine) {
+          engine
+            .acceptOffer(e.sdp)
+            .then((answer) => api.webrtcAnswer(answer))
+            .catch((err) => console.warn("WebRTC:", err));
+        }
+        break;
+      }
       case "permissionsChanged":
         if (s.outbound?.sessionId === e.sessionId) {
           set({ outbound: { ...s.outbound, permissions: e.permissions } });

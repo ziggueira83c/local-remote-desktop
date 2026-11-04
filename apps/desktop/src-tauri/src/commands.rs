@@ -80,6 +80,11 @@ pub async fn set_video_quality(state: State<'_, AppState>, profile: String, max_
 }
 
 #[tauri::command]
+pub async fn webrtc_answer(state: State<'_, AppState>, sdp: String) -> CmdResult<()> {
+    state.node.webrtc_answer(sdp).map_err(err)
+}
+
+#[tauri::command]
 pub async fn set_audio(state: State<'_, AppState>, enabled: bool) -> CmdResult<()> {
     state.node.set_audio(enabled).map_err(err)
 }

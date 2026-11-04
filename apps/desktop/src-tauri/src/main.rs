@@ -58,6 +58,7 @@ fn main() {
             commands::set_video_quality,
             commands::request_keyframe,
             commands::set_audio,
+            commands::webrtc_answer,
             commands::approve_session,
             commands::reject_session,
             commands::end_inbound_session,

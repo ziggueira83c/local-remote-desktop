@@ -16,6 +16,10 @@ pub struct H264Encoder {
     yuv: Option<YUVBuffer>,
     dims: (u32, u32),
     sequence: u32,
+    /// Taxa desejada e taxa aplicada no codificador (reaplicada após reinicializações).
+    target_bps: u32,
+    applied: Option<(u32, (u32, u32))>,
+    max_bps: u32,
 }
 
 impl H264Encoder {
@@ -33,7 +37,40 @@ impl H264Encoder {
             .num_threads(threads);
         let encoder = Encoder::with_api_config(OpenH264API::from_source(), config)
             .map_err(|e| anyhow!("iniciando H.264: {e}"))?;
-        Ok(H264Encoder { encoder, yuv: None, dims: (0, 0), sequence: 0 })
+        Ok(H264Encoder {
+            encoder,
+            yuv: None,
+            dims: (0, 0),
+            sequence: 0,
+            target_bps: q.bitrate_bps,
+            applied: None,
+            max_bps: q.bitrate_bps,
+        })
+    }
+
+    /// Ajusta a taxa sem reiniciar o codificador (sem quadro completo extra).
+    pub fn set_bitrate(&mut self, bps: u32) {
+        self.target_bps = bps.clamp(300_000, self.max_bps.max(300_000));
+    }
+
+    fn apply_bitrate(&mut self) {
+        if self.applied == Some((self.target_bps, self.dims)) {
+            return;
+        }
+        let mut info = openh264_sys2::SBitrateInfo {
+            iLayer: openh264_sys2::SPATIAL_LAYER_ALL,
+            iBitrate: self.target_bps as std::os::raw::c_int,
+        };
+        // SAFETY: SetOption apenas lê a estrutura durante a chamada.
+        let rc = unsafe {
+            self.encoder
+                .raw_api()
+                .set_option(openh264_sys2::ENCODER_OPTION_BITRATE, (&raw mut info).cast::<std::ffi::c_void>())
+        };
+        if rc != 0 {
+            tracing::debug!("SetOption(BITRATE) retornou {rc}");
+        }
+        self.applied = Some((self.target_bps, self.dims));
     }
 
     pub fn force_keyframe(&mut self) {
@@ -70,6 +107,8 @@ impl H264Encoder {
         if bitstream.is_empty() {
             return None;
         }
+        // Depois de codificar (o codificador pode ter sido reinicializado), aplica a taxa atual.
+        self.apply_bitrate();
         self.sequence = self.sequence.wrapping_add(1);
         Some(build_h264_frame(w as u16, h as u16, keyframe, frame.timestamp_us, self.sequence, &bitstream))
     }

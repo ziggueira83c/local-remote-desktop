@@ -20,3 +20,6 @@ lrd-discovery.workspace = true
 lrd-storage.workspace = true
 lrd-video.workspace = true
 lrd-input.workspace = true
+webrtc.workspace = true
+opus.workspace = true
+bytes.workspace = true

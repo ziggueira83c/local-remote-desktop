@@ -3,6 +3,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { api, type AppSettings } from "../lib/api";
 import { codeToHid } from "../lib/keymap";
 import { Enhancer } from "../lib/enhance";
+import type { MediaMode, RtcStats } from "../lib/media";
 import type { CursorState } from "../lib/renderer";
 import { currentEngine } from "../lib/session";
 import { useStore } from "../store";
@@ -16,6 +17,13 @@ export function RemoteSessionPage() {
   const setActiveDisplay = useStore((s) => s.setActiveDisplay);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
+  const [mediaMode, setMediaMode] = useState<MediaMode>("pending");
+  const mediaModeRef = useRef<MediaMode>("pending");
+  mediaModeRef.current = mediaMode;
+  const [audioBlocked, setAudioBlocked] = useState(false);
+  const [rtc, setRtc] = useState<RtcStats | null>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
   const enhancerRef = useRef<Enhancer | null>(null);
   const [enhance, setEnhance] = useState(false);
@@ -55,7 +63,11 @@ export function RemoteSessionPage() {
     const engine = currentEngine();
     if (!engine) return;
     engine.attach(canvas, {
-      onResize: (w, h) => setFrame({ w, h }),
+      onMode: setMediaMode,
+      onAudioBlocked: setAudioBlocked,
+      onResize: (w, h) => {
+        if (mediaModeRef.current !== "webrtc") setFrame({ w, h });
+      },
       onCursor: setCursor,
       onKeyframeNeeded: () => api.requestKeyframe().catch(() => {}),
       onDrawn: () => {
@@ -63,9 +75,54 @@ export function RemoteSessionPage() {
         if (e.on && enhancerRef.current) enhancerRef.current.render(canvas, e.strength);
       },
     });
+    if (videoRef.current) engine.attachVideo(videoRef.current);
     api.requestKeyframe().catch(() => {});
     return () => engine.detach(canvas);
   }, [outbound.sessionId]);
+
+  // WebRTC: o tamanho vem do <video>; a melhoria de imagem acompanha cada quadro novo.
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v || mediaMode !== "webrtc") return;
+    const onSize = () => {
+      if (v.videoWidth && v.videoHeight) setFrame({ w: v.videoWidth, h: v.videoHeight });
+    };
+    onSize();
+    v.addEventListener("resize", onSize);
+    v.addEventListener("loadedmetadata", onSize);
+    let stop = false;
+    const vfc = v as HTMLVideoElement & {
+      requestVideoFrameCallback?: (cb: () => void) => number;
+    };
+    const step = () => {
+      if (stop) return;
+      const e = enhanceRef.current;
+      if (e.on && enhancerRef.current) enhancerRef.current.render(v, e.strength);
+      if (vfc.requestVideoFrameCallback) vfc.requestVideoFrameCallback(step);
+      else requestAnimationFrame(step);
+    };
+    step();
+    return () => {
+      stop = true;
+      v.removeEventListener("resize", onSize);
+      v.removeEventListener("loadedmetadata", onSize);
+    };
+  }, [mediaMode]);
+
+  // Estatísticas do WebRTC (FPS, banda, latência, perdas) a cada segundo.
+  useEffect(() => {
+    if (mediaMode !== "webrtc") {
+      setRtc(null);
+      return;
+    }
+    const t = setInterval(() => {
+      currentEngine()
+        ?.rtcStats()
+        .then(setRtc)
+        .catch(() => {});
+    }, 1000);
+    return () => clearInterval(t);
+  }, [mediaMode]);
 
   // Melhoria de imagem: cria o WebGL sob demanda e redesenha ao mudar a intensidade.
   useEffect(() => {
@@ -73,22 +130,22 @@ export function RemoteSessionPage() {
       enhancerRef.current = Enhancer.create(overlayRef.current);
       if (!enhancerRef.current) setEnhance(false);
     }
-    if (enhance && enhancerRef.current && canvasRef.current) {
-      enhancerRef.current.render(canvasRef.current, strength);
+    const src = mediaMode === "webrtc" ? videoRef.current : canvasRef.current;
+    if (enhance && enhancerRef.current && src) {
+      enhancerRef.current.render(src, strength);
     }
-  }, [enhance, strength, cssSize]);
+  }, [enhance, strength, cssSize, mediaMode]);
 
   // Áudio: volume local e liga/desliga a transmissão no host.
   useEffect(() => {
-    const player = currentEngine()?.audio;
-    player?.setVolume(volume);
-    player?.setMuted(!audioOn);
-  }, [audioOn, volume]);
+    currentEngine()?.setVolume(volume, !audioOn);
+  }, [audioOn, volume, mediaMode]);
 
   const toggleAudio = () => {
     const next = !audioOn;
     setAudioOn(next);
     api.setAudio(next).catch(() => {});
+    if (next) currentEngine()?.unlockAudio();
   };
 
   // Tamanho exibido: "ajustar" mantém a proporção; "100%" mostra 1 pixel remoto por pixel físico.
@@ -139,7 +196,7 @@ export function RemoteSessionPage() {
   }, [releaseAll]);
 
   const toNormalized = (clientX: number, clientY: number) => {
-    const rect = canvasRef.current!.getBoundingClientRect();
+    const rect = stageRef.current!.getBoundingClientRect();
     const nx = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
     const ny = Math.min(1, Math.max(0, (clientY - rect.top) / rect.height));
     return { x: Math.round(nx * 65535), y: Math.round(ny * 65535) };
@@ -159,7 +216,8 @@ export function RemoteSessionPage() {
   };
 
   const onPointerDown = (e: React.PointerEvent) => {
-    canvasRef.current?.focus();
+    stageRef.current?.focus();
+    if (audioBlocked && audioOn) currentEngine()?.unlockAudio();
     if (!outbound.permissions.controlMouse) return;
     e.preventDefault();
     (e.target as Element).setPointerCapture?.(e.pointerId);
@@ -180,7 +238,7 @@ export function RemoteSessionPage() {
 
   // Roda do mouse: precisa de listener não-passivo para impedir a rolagem local.
   useEffect(() => {
-    const canvas = canvasRef.current!;
+    const stage = stageRef.current!;
     const onWheel = (e: WheelEvent) => {
       if (!outbound.permissions.controlMouse) return;
       e.preventDefault();
@@ -195,8 +253,8 @@ export function RemoteSessionPage() {
         api.sendInput({ type: "scroll", dx, dy }).catch(() => {});
       }
     };
-    canvas.addEventListener("wheel", onWheel, { passive: false });
-    return () => canvas.removeEventListener("wheel", onWheel);
+    stage.addEventListener("wheel", onWheel, { passive: false });
+    return () => stage.removeEventListener("wheel", onWheel);
   }, [outbound.permissions.controlMouse]);
 
   const onKeyDown = (e: React.KeyboardEvent) => {
@@ -334,8 +392,13 @@ export function RemoteSessionPage() {
 
         <div className="toolbar__group">
           <span className="stats mono small" title="Quadros por segundo · banda · latência">
-            {outbound.videoCodec === "h264" ? "H.264" : "JPEG"} ·{" "}
-            {metrics ? `${metrics.fps.toFixed(0)} fps · ${(metrics.kbps / 1000).toFixed(1)} Mbps · ${metrics.rttMs.toFixed(0)} ms` : "—"}
+            {mediaMode === "webrtc"
+              ? rtc
+                ? `WebRTC · ${rtc.fps.toFixed(0)} fps · ${(rtc.kbps / 1000).toFixed(1)} Mbps · ${(rtc.rttMs ?? metrics?.rttMs ?? 0).toFixed(0)} ms${rtc.lossPct >= 0.5 ? ` · perda ${rtc.lossPct.toFixed(1)}%` : ""}`
+                : "WebRTC"
+              : `${mediaMode === "quic" ? (outbound.videoCodec === "h264" ? "H.264" : "JPEG") : "Conectando mídia"} · ${
+                  metrics ? `${metrics.fps.toFixed(0)} fps · ${(metrics.kbps / 1000).toFixed(1)} Mbps · ${metrics.rttMs.toFixed(0)} ms` : "—"
+                }`}
           </span>
           <button className="btn btn--small btn--danger" onClick={() => api.disconnect()}>
             Desconectar
@@ -344,23 +407,43 @@ export function RemoteSessionPage() {
       </div>
 
       <div ref={viewportRef} className={mode === "fit" ? "viewport" : "viewport viewport--scroll"}>
-        <div className="viewport__stage" style={{ width: cssSize.w || undefined, height: cssSize.h || undefined }}>
+        <div
+          ref={stageRef}
+          className={focused ? "viewport__stage stage--focused" : "viewport__stage"}
+          style={{ width: cssSize.w || undefined, height: cssSize.h || undefined, cursor: "default" }}
+          tabIndex={0}
+          onFocus={() => setFocused(true)}
+          onBlur={() => {
+            setFocused(false);
+            releaseAll();
+          }}
+          onPointerMove={onPointerMove}
+          onPointerDown={onPointerDown}
+          onPointerUp={onPointerUp}
+          onContextMenu={(e) => e.preventDefault()}
+          onKeyDown={onKeyDown}
+          onKeyUp={onKeyUp}
+        >
           <canvas
             ref={canvasRef}
-            className={focused ? "remote remote--focused" : "remote"}
-            style={{ width: cssSize.w || undefined, height: cssSize.h || undefined, cursor: "default" }}
-            tabIndex={0}
-            onFocus={() => setFocused(true)}
-            onBlur={() => {
-              setFocused(false);
-              releaseAll();
+            className="remote"
+            style={{
+              width: cssSize.w || undefined,
+              height: cssSize.h || undefined,
+              display: mediaMode === "webrtc" ? "none" : "block",
             }}
-            onPointerMove={onPointerMove}
-            onPointerDown={onPointerDown}
-            onPointerUp={onPointerUp}
-            onContextMenu={(e) => e.preventDefault()}
-            onKeyDown={onKeyDown}
-            onKeyUp={onKeyUp}
+          />
+          <video
+            ref={videoRef}
+            className="remote"
+            autoPlay
+            playsInline
+            disablePictureInPicture
+            style={{
+              width: cssSize.w || undefined,
+              height: cssSize.h || undefined,
+              display: mediaMode === "webrtc" ? "block" : "none",
+            }}
           />
           <canvas
             ref={overlayRef}
@@ -378,6 +461,15 @@ export function RemoteSessionPage() {
             />
           )}
           {frame.w === 0 && <div className="viewport__loading">Recebendo a tela…</div>}
+          {audioBlocked && audioOn && mediaMode === "webrtc" && (
+            <button
+              className="btn btn--small audio-unlock"
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={() => currentEngine()?.unlockAudio()}
+            >
+              🔊 Clique para ativar o som
+            </button>
+          )}
         </div>
       </div>
       {canControl && !focused && frame.w > 0 && (

@@ -12,6 +12,7 @@ tokio.workspace = true
 image.workspace = true
 xcap.workspace = true
 openh264.workspace = true
+openh264-sys2.workspace = true
 lrd-protocol.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]

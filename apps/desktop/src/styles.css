@@ -234,7 +234,6 @@ input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px v
 .viewport__stage { position: relative; flex: none; }
 .viewport__loading { position: absolute; inset: 0; display: grid; place-items: center; color: #9aa6b4; min-width: 240px; min-height: 120px; }
 .remote { display: block; outline: none; background: #000; image-rendering: auto; touch-action: none; }
-.remote--focused { box-shadow: 0 0 0 2px var(--accent); }
 .remote-cursor {
   position: absolute; width: 0; height: 0; pointer-events: none;
   border-left: 7px solid transparent; border-right: 7px solid transparent; border-bottom: 16px solid #fff;
@@ -249,3 +248,9 @@ input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px v
 .remote-overlay { position: absolute; left: 0; top: 0; pointer-events: none; display: block; }
 .btn--on { border-color: var(--accent) !important; }
 .slider { width: 80px; height: auto; padding: 0; border: 0; background: transparent; box-shadow: none; }
+
+.viewport__stage { outline: none; }
+.stage--focused { box-shadow: 0 0 0 2px var(--accent); }
+video.remote { background: #000; object-fit: fill; pointer-events: none; }
+canvas.remote { pointer-events: none; }
+.audio-unlock { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); z-index: 3; }

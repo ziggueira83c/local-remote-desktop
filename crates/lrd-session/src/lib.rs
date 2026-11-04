@@ -4,6 +4,7 @@
 
 mod host;
 mod node;
+mod rtc;
 mod viewer;
 
 use std::path::PathBuf;
@@ -129,6 +130,11 @@ pub enum NodeEvent {
     OutboundEnded {
         session_id: String,
         reason: String,
+    },
+    /// Oferta WebRTC do host; a interface responde com `webrtc_answer`.
+    WebRtcOffer {
+        session_id: String,
+        sdp: String,
     },
     PermissionsChanged {
         session_id: String,

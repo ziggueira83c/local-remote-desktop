@@ -17,7 +17,7 @@ use lrd_protocol::input_event::Event;
 use lrd_protocol::video::{validate_frame, FRAME_H264, FRAME_TILES};
 use lrd_protocol::{
     reason, ConnectRequest, Envelope, Hello, InputEvent, KeyEvent, MouseButton, MouseScroll, PointerMove,
-    RequestKeyframe, SelectDisplay, SetAudio, SetQuality, DEFAULT_PORT, MAX_VIDEO_FRAME, MIN_PROTOCOL_VERSION,
+    RequestKeyframe, SelectDisplay, SetAudio, SetQuality, WebRtcSignal, DEFAULT_PORT, MAX_VIDEO_FRAME, MIN_PROTOCOL_VERSION,
     PROTOCOL_VERSION,
 };
 use lrd_security::{fingerprint_of, format_fingerprint, is_allowed_peer_ip, sas_code, Permissions, Profile};
@@ -134,7 +134,11 @@ impl Node {
         let mut codecs: Vec<String> = params
             .codecs
             .iter()
-            .filter(|c| *c == lrd_protocol::codec::H264 || *c == lrd_protocol::codec::JPEG_TILES)
+            .filter(|c| {
+                *c == lrd_protocol::codec::WEBRTC
+                    || *c == lrd_protocol::codec::H264
+                    || *c == lrd_protocol::codec::JPEG_TILES
+            })
             .cloned()
             .collect();
         if !codecs.iter().any(|c| c == lrd_protocol::codec::JPEG_TILES) {
@@ -329,6 +333,9 @@ impl Node {
                     Some(Payload::SessionClose(c)) => {
                         *note_c.lock().unwrap() = Some(c.reason_code);
                     }
+                    Some(Payload::WebRtcSignal(sig)) if sig.kind == "offer" => {
+                        node_c.events.emit(NodeEvent::WebRtcOffer { session_id: sid_c.clone(), sdp: sig.sdp });
+                    }
                     _ => {}
                 }
             }
@@ -482,6 +489,11 @@ impl Node {
 
     pub fn set_quality(&self, profile: String, max_fps: u32) -> Result<()> {
         self.send_control(Payload::SetQuality(SetQuality { profile, max_fps }))
+    }
+
+    /// Resposta SDP do WebRTC gerada pela interface.
+    pub fn webrtc_answer(&self, sdp: String) -> Result<()> {
+        self.send_control(Payload::WebRtcSignal(WebRtcSignal { kind: "answer".into(), sdp }))
     }
 
     pub fn set_audio(&self, enabled: bool) -> Result<()> {

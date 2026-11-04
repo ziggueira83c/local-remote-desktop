@@ -19,6 +19,7 @@ message Envelope {
     SetQuality set_quality = 17;
     RequestKeyframe request_keyframe = 18;
     SetAudio set_audio = 19;
+    WebRtcSignal webrtc_signal = 20;
   }
 }
 
@@ -27,7 +28,7 @@ message Hello {
   string device_name = 2;
   uint32 min_version = 3;
   uint32 max_version = 4;
-  repeated string codecs = 5;   // "h264", "jpeg-tiles"
+  repeated string codecs = 5;   // "webrtc", "h264", "jpeg-tiles"
   string platform = 6;          // "windows" | "macos" | "other"
 }
 
@@ -80,3 +81,5 @@ message SelectDisplay { string display_id = 1; }
 message SetQuality { string profile = 1; uint32 max_fps = 2; }
 message RequestKeyframe {}
 message SetAudio { bool enabled = 1; }
+// SDP do WebRTC: "offer" (host -> controlador) ou "answer" (controlador -> host)
+message WebRtcSignal { string kind = 1; string sdp = 2; }

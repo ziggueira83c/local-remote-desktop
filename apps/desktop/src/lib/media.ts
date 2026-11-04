@@ -7,7 +7,20 @@ import { AudioPlayer } from "./audio";
 import { FrameRenderer, toBytes, type CursorState } from "./renderer";
 import { AvSync } from "./sync";
 
+export type MediaMode = "pending" | "webrtc" | "quic";
+
+export interface RtcStats {
+  fps: number;
+  kbps: number;
+  rttMs: number | null;
+  jitterMs: number | null;
+  lossPct: number;
+}
+
 export interface MediaCallbacks {
+  onMode: (m: MediaMode) => void;
+  /** O áudio do WebRTC precisa de um clique para tocar (política de autoplay). */
+  onAudioBlocked: (blocked: boolean) => void;
   onResize: (w: number, h: number) => void;
   onCursor: (c: CursorState) => void;
   onKeyframeNeeded: () => void;
@@ -17,6 +30,7 @@ export interface MediaCallbacks {
 /** Codecs que esta interface consegue decodificar, em ordem de preferência. */
 export async function supportedCodecs(): Promise<string[]> {
   const out = ["jpeg-tiles"];
+  if (typeof RTCPeerConnection !== "undefined") out.unshift("webrtc");
   try {
     if (typeof VideoDecoder !== "undefined") {
       const r = await VideoDecoder.isConfigSupported({ codec: "avc1.42E033", optimizeForLatency: true });
@@ -54,9 +68,139 @@ export class MediaEngine {
   private raf = 0;
   private lastKeyRequest = 0;
   private closed = false;
+  private pc: RTCPeerConnection | null = null;
+  private stream: MediaStream | null = null;
+  private video: HTMLVideoElement | null = null;
+  mode: MediaMode = "pending";
+  private lastStats: { bytes: number; time: number; lost: number; recv: number } | null = null;
 
   constructor(audioCtx: AudioContext | null) {
     this.audio = audioCtx ? new AudioPlayer(audioCtx, this.sync) : null;
+  }
+
+  private setMode(m: MediaMode) {
+    if (this.mode === m) return;
+    this.mode = m;
+    this.cb?.onMode(m);
+  }
+
+  /** Responde a oferta WebRTC do host (só candidatos locais; sem servidores externos). */
+  async acceptOffer(sdp: string): Promise<string> {
+    this.pc?.close();
+    const pc = new RTCPeerConnection({ iceServers: [] });
+    this.pc = pc;
+    pc.ontrack = (ev) => {
+      // Latência mínima: o navegador mantém o menor buffer possível.
+      const r = ev.receiver as RTCRtpReceiver & { jitterBufferTarget?: number; playoutDelayHint?: number };
+      try {
+        r.jitterBufferTarget = 0;
+      } catch {
+        /* não suportado */
+      }
+      try {
+        r.playoutDelayHint = 0;
+      } catch {
+        /* não suportado */
+      }
+      if (!this.stream) this.stream = ev.streams[0] ?? new MediaStream();
+      if (!this.stream.getTracks().includes(ev.track)) this.stream.addTrack(ev.track);
+      this.bindVideo();
+      if (ev.track.kind === "video") this.setMode("webrtc");
+    };
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === "failed" && this.mode === "webrtc") this.setMode("pending");
+    };
+    await pc.setRemoteDescription({ type: "offer", sdp });
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    await new Promise<void>((resolve) => {
+      if (pc.iceGatheringState === "complete") return resolve();
+      const done = () => {
+        pc.removeEventListener("icegatheringstatechange", check);
+        resolve();
+      };
+      const check = () => pc.iceGatheringState === "complete" && done();
+      pc.addEventListener("icegatheringstatechange", check);
+      setTimeout(done, 1500);
+    });
+    return pc.localDescription?.sdp ?? answer.sdp ?? "";
+  }
+
+  /** Liga o elemento <video> que mostra a mídia do WebRTC. */
+  attachVideo(video: HTMLVideoElement) {
+    this.video = video;
+    this.bindVideo();
+  }
+
+  private bindVideo() {
+    const v = this.video;
+    if (!v || !this.stream) return;
+    if (v.srcObject !== this.stream) v.srcObject = this.stream;
+    v.muted = false;
+    v.play().then(
+      () => this.cb?.onAudioBlocked(false),
+      () => {
+        // Sem permissão para tocar com som: toca sem som e pede um clique.
+        v.muted = true;
+        v.play().catch(() => {});
+        this.cb?.onAudioBlocked(true);
+      },
+    );
+  }
+
+  /** Chamado num clique do usuário para liberar o som. */
+  unlockAudio() {
+    const v = this.video;
+    if (!v) return;
+    v.muted = false;
+    v.play().then(() => this.cb?.onAudioBlocked(false)).catch(() => {});
+  }
+
+  setVolume(volume: number, muted: boolean) {
+    this.audio?.setVolume(volume);
+    this.audio?.setMuted(muted);
+    if (this.video) {
+      this.video.volume = Math.min(1, Math.max(0, volume));
+      if (muted) this.video.muted = true;
+    }
+  }
+
+  async rtcStats(): Promise<RtcStats | null> {
+    if (!this.pc || this.mode !== "webrtc") return null;
+    const report = await this.pc.getStats();
+    let fps = 0;
+    let bytes = 0;
+    let jitter: number | null = null;
+    let lost = 0;
+    let recv = 0;
+    let rtt: number | null = null;
+    report.forEach((s: Record<string, unknown> & { type: string }) => {
+      if (s.type === "inbound-rtp" && s.kind === "video") {
+        fps = Number(s.framesPerSecond ?? 0);
+        bytes += Number(s.bytesReceived ?? 0);
+        lost = Number(s.packetsLost ?? 0);
+        recv = Number(s.packetsReceived ?? 0);
+        const jbd = Number(s.jitterBufferDelay ?? 0);
+        const jbe = Number(s.jitterBufferEmittedCount ?? 0);
+        if (jbe > 0) jitter = (jbd / jbe) * 1000;
+      } else if (s.type === "inbound-rtp" && s.kind === "audio") {
+        bytes += Number(s.bytesReceived ?? 0);
+      } else if (s.type === "candidate-pair" && s.state === "succeeded" && s.nominated) {
+        if (s.currentRoundTripTime != null) rtt = Number(s.currentRoundTripTime) * 1000;
+      }
+    });
+    const now = performance.now();
+    let kbps = 0;
+    let lossPct = 0;
+    if (this.lastStats) {
+      const dt = (now - this.lastStats.time) / 1000;
+      if (dt > 0) kbps = ((bytes - this.lastStats.bytes) * 8) / 1000 / dt;
+      const dl = lost - this.lastStats.lost;
+      const dr = recv - this.lastStats.recv;
+      if (dl + dr > 0) lossPct = (Math.max(0, dl) / (dl + dr)) * 100;
+    }
+    this.lastStats = { bytes, time: now, lost, recv };
+    return { fps, kbps, rttMs: rtt, jitterMs: jitter, lossPct };
   }
 
   attach(canvas: HTMLCanvasElement, cb: MediaCallbacks) {
@@ -67,6 +211,7 @@ export class MediaEngine {
     const queued = this.pending;
     this.pending = [];
     for (const f of queued) this.route(f);
+    cb.onMode(this.mode);
     cancelAnimationFrame(this.raf);
     this.raf = requestAnimationFrame(this.tick);
   }
@@ -92,6 +237,10 @@ export class MediaEngine {
     }
     this.decoder = null;
     this.audio?.close();
+    this.pc?.close();
+    this.pc = null;
+    if (this.video) this.video.srcObject = null;
+    this.stream = null;
   }
 
   push(data: unknown) {
@@ -99,7 +248,7 @@ export class MediaEngine {
     const bytes = toBytes(data);
     if (!bytes || bytes.length === 0) return;
     if (bytes[0] === 4) {
-      this.audio?.push(new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength));
+      if (this.mode !== "webrtc") this.audio?.push(new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength));
       return;
     }
     if (!this.canvas) {
@@ -111,6 +260,8 @@ export class MediaEngine {
   }
 
   private route(bytes: Uint8Array) {
+    // Mídia chegando pelo QUIC = modo de reserva (o cursor chega pelo QUIC nos dois modos).
+    if (bytes[0] === 1 || bytes[0] === 3) this.setMode("quic");
     if (bytes[0] === 3) this.pushH264(bytes);
     else this.tiles?.push(bytes);
   }
