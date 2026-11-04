@@ -12,22 +12,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: mac-apple-silicon
+          # Um único app para Intel e Apple Silicon (uma só máquina Mac na fila).
+          - name: mac-universal
             os: macos-latest
-            target: aarch64-apple-darwin
-          - name: mac-intel
-            os: macos-latest
-            target: x86_64-apple-darwin
+            target: universal-apple-darwin
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
           - name: windows
             os: windows-latest
             target: x86_64-pc-windows-msvc
+            rust_targets: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.rust_targets }}
 
       - uses: swatinem/rust-cache@v2
         with:
@@ -38,7 +38,6 @@ jobs:
           node-version: 22
 
       - name: Testes do núcleo
-        if: matrix.name != 'mac-intel'
         run: cargo test --workspace --exclude lrd-desktop
 
       - name: Dependências da interface
