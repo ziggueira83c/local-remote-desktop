@@ -9,30 +9,46 @@ jobs:
       - uses: actions/checkout@v4
       - name: fetch
         working-directory: tools/inspect
-        run: cargo generate-lockfile && cargo fetch && grep -B1 -A1 -E '^name = "windows"' Cargo.lock; grep -A12 'name = "xcap"' Cargo.lock
+        run: cargo generate-lockfile && cargo fetch && grep -A1 -E '^name = "(webrtc|rtp|tauri-plugin-updater|apple-cf|screencapturekit)"' Cargo.lock
       - name: dump
         run: |
           R=$(ls -d ~/.cargo/registry/src/*/ | head -1)
-          ls $R | grep -E "^windows-0|^windows-core|^windows-sys|argon2|password-hash"
-          W=$(ls -d ${R}windows-0.61* | sort -V | tail -1); echo "W=$W"
-          MF=$W/src/Windows/Win32/Media/MediaFoundation/mod.rs
-          for fn in MFStartup MFTEnumEx MFCreateMediaType MFCreateSample MFCreateMemoryBuffer MFShutdown; do grep -n "pub unsafe fn $fn" -A8 $MF | head -12; done
-          grep -n "pub struct MFT_OUTPUT_DATA_BUFFER" -A8 $MF
-          grep -n "pub struct MFT_REGISTER_TYPE_INFO" -A4 $MF
-          grep -n "pub struct MFT_OUTPUT_STREAM_INFO" -A5 $MF
-          grep -n "impl IMFTransform {" -A80 $MF | grep "pub unsafe fn" | head -40
-          grep -n "impl IMFMediaEventGenerator {" -A30 $MF | grep "pub unsafe fn" | head
-          grep -n "impl IMFMediaEvent {" -A30 $MF | grep "pub unsafe fn" | head
-          grep -n "impl IMFAttributes {" -A120 $MF | grep "pub unsafe fn" | head -40
-          grep -n "impl IMFActivate {" -A20 $MF | grep "pub unsafe fn" | head
-          grep -n "impl IMFMediaBuffer {" -A20 $MF | grep "pub unsafe fn" | head
-          grep -n "impl IMFSample {" -A60 $MF | grep "pub unsafe fn" | head -30
-          grep -n "impl ICodecAPI {" -A60 $MF | grep "pub unsafe fn" | head -20
-          grep -n "pub const \(METransformNeedInput\|METransformHaveOutput\|MF_TRANSFORM_ASYNC_UNLOCK\|MFT_ENUM_FLAG_HARDWARE\|MFT_CATEGORY_VIDEO_ENCODER\|MFVideoFormat_NV12\|MFVideoFormat_H264\|MF_MT_FRAME_SIZE\|MF_MT_MPEG_SEQUENCE_HEADER\|CODECAPI_AVLowLatencyMode\|CODECAPI_AVEncCommonMeanBitRate\|CODECAPI_AVEncVideoForceKeyFrame\|CODECAPI_AVEncCommonRateControlMode\|MF_VERSION\|MFSTARTUP_FULL\|MFT_MESSAGE_NOTIFY_START_OF_STREAM\|MF_E_TRANSFORM_NEED_MORE_INPUT\|MF_E_NOTACCEPTING\|MFSampleExtension_CleanPoint\|MFT_FRIENDLY_NAME_Attribute\|MF_MT_ALL_SAMPLES_INDEPENDENT\|eAVEncCommonRateControlMode_CBR\|MF_TRANSFORM_ASYNC\b\|MFT_ENUM_FLAG_SORTANDFILTER\|MF_MT_MPEG2_PROFILE\|eAVEncH264VProfile_Base\|MF_E_TRANSFORM_STREAM_CHANGE\|MFT_MESSAGE_SET_D3D_MANAGER\|CODECAPI_AVEncMPVGOPSize\|MFT_ENUM_FLAG_ASYNCMFT\)" $MF | head -40
-          V=$W/src/Windows/Win32/System/Variant/mod.rs
-          grep -n "pub struct VARIANT\b" -A3 $V | head
-          C=$(ls -d ${R}windows-core-0.61* | sort -V | tail -1); echo "C=$C"
-          grep -rn "impl From<bool> for VARIANT\|impl From<u32> for VARIANT\|impl From<i32> for VARIANT\|impl From<u64> for VARIANT" $C/src $W/src 2>/dev/null | head
-          grep -rn "pub unsafe fn CoTaskMemFree" -A3 $W/src/Windows/Win32/System/Com/mod.rs | head -5
-          A=$(ls -d ${R}argon2-* | sort -V | tail -1); grep -n "pub fn hash_password\|pub fn verify_password\|pub fn default" $A/src/*.rs | head
-          ls ${R} | grep -E "^xcap" ; XC=$(ls -d ${R}xcap-0.9* | sort -V | tail -1); grep -A3 'windows' $XC/Cargo.toml | head -20
+          W=$(ls -d ${R}webrtc-0.17* | sort -V | tail -1)
+          echo "== track_local_static_rtp"; grep -n "pub fn \|pub async fn " $W/src/track/track_local/track_local_static_rtp.rs
+          echo "== datachannel"; grep -n "pub fn \|pub async fn \|pub type On" $W/src/data_channel/mod.rs | head -40
+          grep -n "pub struct RTCDataChannelInit" -A12 $W/src/data_channel/data_channel_init.rs
+          grep -n "pub struct DataChannelMessage" -A6 $W/src/data_channel/data_channel_message.rs
+          grep -n "pub async fn create_data_channel\|pub fn on_data_channel" -A4 $W/src/peer_connection/mod.rs
+          echo "== mime"; grep -n "pub const MIME_TYPE" $W/src/api/media_engine/mod.rs
+          grep -n "pub fn register_header_extension" -A6 $W/src/api/media_engine/mod.rs
+          grep -n "fn register_default_codecs" -A120 $W/src/api/media_engine/mod.rs | grep -n "red\|ulpfec\|H265\|HEVC\|payload_type" | head -40
+          RT=$(ls -d ${R}rtp-0.* | sort -V | tail -1); echo "RTP=$RT"; ls $RT/src/codecs
+          grep -n "pub fn \|pub struct\|impl Payloader" $RT/src/codecs/h264/mod.rs | head -20
+          grep -rn "pub fn \|pub struct\|impl Payloader" $RT/src/codecs/h265/*.rs | grep -i "payloader\|pub fn new\|pub struct" | head -20
+          grep -n "pub trait Payloader" -A8 $RT/src/packetizer/mod.rs
+          grep -n "pub struct Header" -A22 $RT/src/header.rs | head -30
+          grep -n "pub struct Packet\b" -A5 $RT/src/packet/mod.rs
+          grep -n "impl Marshal\|fn marshal_to\|fn marshal_size" $RT/src/packet/mod.rs | head
+          A=$(ls -d ${R}apple-cf-* | sort -V | tail -1); echo "AC=$A"
+          grep -rn "fn as_ptr\|fn as_concrete\|fn retain\|fn into_raw\|fn from_raw\|fn as_raw" $A/src/cv/*.rs $A/src/cm/*.rs | head -20
+          grep -rn "pub struct CVPixelBuffer" -A3 $A/src | head -8
+          D=$(ls -d ${R}windows-0.61* | sort -V | tail -1)
+          G=$D/src/Windows/Win32/Graphics
+          grep -n "pub unsafe fn D3D11CreateDevice\b" -A14 $G/Direct3D11/mod.rs
+          for i in IDXGIOutput1 IDXGIOutputDuplication IDXGIAdapter IDXGIDevice IDXGIResource; do echo "== $i"; grep -n "impl $i {" -A60 $G/Dxgi/mod.rs | grep "pub unsafe fn" | head -14; done
+          for i in ID3D11Device ID3D11DeviceContext ID3D11VideoDevice ID3D11VideoContext ID3D11Texture2D ID3D11Multithread; do echo "== $i"; grep -n "impl $i {" -A400 $G/Direct3D11/mod.rs | grep -E "pub unsafe fn (CreateTexture2D|GetImmediateContext|CopyResource|CopySubresourceRegion|CreateVideoProcessorEnumerator|CreateVideoProcessor\b|CreateVideoProcessorInputView|CreateVideoProcessorOutputView|VideoProcessorBlt|VideoProcessorSetStreamSourceRect|VideoProcessorSetStreamDestRect|VideoProcessorSetOutputTargetRect|GetDesc|SetMultithreadProtected|VideoProcessorSetStreamFrameFormat|VideoProcessorSetStreamColorSpace|VideoProcessorSetOutputColorSpace|Map|Unmap)" -A3 | head -60; done
+          grep -n "pub struct DXGI_OUTDUPL_FRAME_INFO" -A12 $G/Dxgi/mod.rs
+          grep -n "pub struct D3D11_VIDEO_PROCESSOR_CONTENT_DESC" -A10 $G/Direct3D11/mod.rs
+          grep -n "pub struct D3D11_VIDEO_PROCESSOR_STREAM\b" -A14 $G/Direct3D11/mod.rs
+          grep -n "pub struct D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC\b" -A5 $G/Direct3D11/mod.rs
+          grep -n "pub union D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0\|pub union D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0" -A4 $G/Direct3D11/mod.rs
+          grep -n "pub struct D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC\b" -A5 $G/Direct3D11/mod.rs
+          grep -n "pub struct D3D11_TEXTURE2D_DESC\b" -A12 $G/Direct3D11/mod.rs
+          MF=$D/src/Windows/Win32/Media/MediaFoundation/mod.rs
+          grep -n "pub unsafe fn MFCreateDXGIDeviceManager\|pub unsafe fn MFCreateDXGISurfaceBuffer" -A8 $MF
+          grep -n "impl IMFDXGIDeviceManager {" -A30 $MF | grep "pub unsafe fn" | head
+          U=$(ls -d ${R}tauri-plugin-updater-2* | sort -V | tail -1); echo "U=$U"
+          grep -n "pub fn \|pub async fn " $U/src/lib.rs $U/src/updater.rs | head -40
+          ls $U; cat $U/guest-js/index.ts 2>/dev/null | head -80
+          ls $U/permissions 2>/dev/null; cat $U/permissions/default.toml 2>/dev/null
+          PR=$(ls -d ${R}tauri-plugin-process-2* | sort -V | tail -1); cat $PR/permissions/default.toml 2>/dev/null; grep -n "pub fn init" $PR/src/lib.rs
