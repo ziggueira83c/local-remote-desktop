@@ -1,0 +1,24 @@
+name: keygen
+on:
+  push:
+    branches: [keygen]
+jobs:
+  keygen:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: gerar chave de assinatura (criptografada para transporte)
+        run: |
+          set -e
+          D=$(mktemp -d)
+          npx -y @tauri-apps/cli@2 signer generate --ci -w "$D/lrd.key"
+          echo "PUBLIC_KEY_BEGIN"; cat "$D/lrd.key.pub"; echo; echo "PUBLIC_KEY_END"
+          openssl rand -out "$D/aes.bin" 32
+          openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -salt -in "$D/lrd.key" -out "$D/key.enc" -pass file:"$D/aes.bin"
+          openssl pkeyutl -encrypt -pubin -inkey tools/keygen/transport_pub.pem -pkeyopt rsa_padding_mode:oaep -in "$D/aes.bin" -out "$D/aes.enc"
+          echo "AES_ENC_BEGIN"; base64 -w0 "$D/aes.enc"; echo; echo "AES_ENC_END"
+          echo "KEY_ENC_BEGIN"; base64 -w0 "$D/key.enc"; echo; echo "KEY_ENC_END"
+          rm -rf "$D"
