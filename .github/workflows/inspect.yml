@@ -14,17 +14,15 @@ jobs:
         run: |
           R=$(ls -d ~/.cargo/registry/src/*/ | head -1)
           show() { for f in $R$1; do echo "################ $f"; cat "$f"; done; }
-          show "openh264-0.9*/src/encoder.rs"
-          show "openh264-0.9*/src/formats/rgb2yuv.rs"
-          show "openh264-0.9*/src/formats/mod.rs"
-          ls $R | grep -E "openh264|xcap|cpal|screencapturekit"
-          show "xcap-0.9*/src/windows/*video_recorder*.rs"
-          show "xcap-0.9*/src/macos/impl_video_recorder.rs"
-          show "xcap-0.9*/src/video_recorder.rs"
-          ls -R ${R}screencapturekit-*/src | head -150
-          show "screencapturekit-*/examples/03_audio_capture.rs"
-          show "screencapturekit-*/src/cm/sample_buffer*.rs"
-          show "screencapturekit-*/src/cm/mod.rs"
-          show "screencapturekit-*/src/cm/audio*.rs"
-          show "screencapturekit-*/src/stream/configuration/audio.rs"
-          grep -rn "pub fn " ${R}screencapturekit-*/src/cm/ | head -120
+          ls $R | grep -E "apple|screencapture|cpal|openh264"
+          show "openh264-0.9*/src/formats/yuv.rs"
+          show "openh264-0.9*/src/formats/rgb.rs" | grep -nE "pub fn new|impl.*for|pub struct" | head -40
+          ls -R ${R}apple-cf-*/src | head -80
+          show "apple-cf-*/src/cm/audio.rs"
+          grep -rn "pub fn \|pub unsafe fn " ${R}apple-cf-*/src/cm/sample_buffer*.rs ${R}apple-cf-*/src/cv/*.rs | head -120
+          grep -rn "pub fn " ${R}screencapturekit-11*/src/stream/configuration/*.rs | head -120
+          grep -rn "pub fn " ${R}screencapturekit-11*/src/shareable_content/*.rs | head -60
+          grep -rn "pub fn \|pub enum\|^    [A-Z0-9]*," ${R}screencapturekit-11*/src/stream/configuration/pixel_format.rs | head -40
+          show "screencapturekit-11*/src/prelude.rs"
+          show "screencapturekit-11*/Cargo.toml" | head -80
+          grep -n "fn build_input_stream" -A12 ${R}cpal-0.16*/src/traits.rs
