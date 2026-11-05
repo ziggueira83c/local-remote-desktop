@@ -257,6 +257,7 @@ impl LrdEncoder {
                     if let Some((sy, dy, len)) = detect_scroll(&self.reference, cur, w, x0, x1, y0, y1) {
                         outs.push(Out::Copy { x: x0, y: dy, w: x1 - x0, h: len, sy });
                         apply_copy(&mut self.reference, w, x0, x1 - x0, sy, dy, len);
+                        self.propagate_lossy(x0, x1, sy, dy, len);
                         stats.copies += 1;
                         for (i, d) in dirty.iter_mut().enumerate() {
                             let (_, ty, _, th) = self.tile_rect(i);
@@ -425,6 +426,9 @@ impl LrdEncoder {
         if chosen == 0 {
             return None;
         }
+        // Blocos de foto: só as faixas de 16 colunas com muitas cores vão em JPEG de alta
+        // qualidade; faixas de texto/interface do mesmo bloco vão sem perdas.
+        let mut set = ColorSet::new();
         let mut jobs = Vec::new();
         for r in 0..self.rows {
             let mut c = 0;
@@ -434,14 +438,36 @@ impl LrdEncoder {
                     c += 1;
                     continue;
                 };
+                if photo {
+                    let (tx, ty, tw, th) = self.tile_rect(i);
+                    let mut s0 = 0u32;
+                    while s0 * 16 < tw {
+                        let strip_lossy = |set: &mut ColorSet, st: u32| {
+                            let a = tx + st * 16;
+                            let b = (a + 16).min(tx + tw);
+                            set.count(&self.reference, self.width, a, ty, b - a, th, STRIP_COLORS + 1).0 > STRIP_COLORS
+                        };
+                        let lossy = strip_lossy(&mut set, s0);
+                        let mut s1 = s0 + 1;
+                        while s1 * 16 < tw && strip_lossy(&mut set, s1) == lossy {
+                            s1 += 1;
+                        }
+                        let a = tx + s0 * 16;
+                        let b = (tx + s1 * 16).min(tx + tw);
+                        let kind = if lossy { JobKind::Jpeg(92) } else { JobKind::Lossless };
+                        jobs.push(Job { kind, x: a, y: ty, w: b - a, h: th });
+                        s0 = s1;
+                    }
+                    c += 1;
+                    continue;
+                }
                 let mut end = c + 1;
-                while end < self.cols && mark[(r * self.cols + end) as usize] == Some(photo) {
+                while end < self.cols && mark[(r * self.cols + end) as usize] == Some(false) {
                     end += 1;
                 }
                 let (x, y, _, th) = self.tile_rect(i);
                 let (lx, _, lw, _) = self.tile_rect((r * self.cols + end - 1) as usize);
-                let kind = if photo { JobKind::Jpeg(92) } else { JobKind::Lossless };
-                jobs.push(Job { kind, x, y, w: lx + lw - x, h: th });
+                jobs.push(Job { kind: JobKind::Lossless, x, y, w: lx + lw - x, h: th });
                 c = end;
             }
         }
@@ -508,16 +534,39 @@ impl LrdEncoder {
         Some((x + c0, y0, c1 - c0, y1 - y0))
     }
 
+    /// Uma cópia leva junto pixels que podem ter ido com perdas: o bloco de destino passa a
+    /// precisar de refino se algum bloco de origem estava com perdas.
+    fn propagate_lossy(&mut self, x0: u32, x1: u32, sy: u32, dy: u32, len: u32) {
+        let (c0, c1) = (x0 / TILE, (x1 - 1) / TILE);
+        let (sr0, sr1) = (sy / TILE, (sy + len - 1) / TILE);
+        let (dr0, dr1) = (dy / TILE, (dy + len - 1) / TILE);
+        let now = Instant::now();
+        for c in c0..=c1 {
+            let src_lossy = (sr0..=sr1).any(|r| self.tiles[(r * self.cols + c) as usize].lossy);
+            if !src_lossy {
+                continue;
+            }
+            let photo = (sr0..=sr1).any(|r| self.tiles[(r * self.cols + c) as usize].photo);
+            for r in dr0..=dr1 {
+                let t = &mut self.tiles[(r * self.cols + c) as usize];
+                t.lossy = true;
+                t.photo |= photo;
+                t.lossy_at = Some(now);
+            }
+        }
+    }
+
+    /// Limites (x0, x1, y0, y1) dos pixels alterados. As colunas vêm dos retângulos exatos
+    /// das mudanças — não dos blocos — para que colunas paradas ao lado de uma janela rolando
+    /// não entrem na comparação das linhas (senão nenhuma linha "bate" e a rolagem some).
     fn dirty_bbox(&self, dirty: &[Option<Rect>]) -> Option<(u32, u32, u32, u32)> {
         let (mut x0, mut x1, mut y0, mut y1) = (u32::MAX, 0, u32::MAX, 0);
-        for (i, d) in dirty.iter().enumerate() {
-            if d.is_some() {
-                let (x, y, tw, th) = self.tile_rect(i);
-                x0 = x0.min(x);
-                y0 = y0.min(y);
-                x1 = x1.max(x + tw);
-                y1 = y1.max(y + th);
-            }
+        for d in dirty.iter().flatten() {
+            let (x, y, bw, bh) = *d;
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x + bw);
+            y1 = y1.max(y + bh);
         }
         (x0 < x1).then_some((x0, x1, y0, y1))
     }

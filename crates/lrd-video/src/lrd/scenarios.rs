@@ -149,6 +149,23 @@ mod tests {
                 copies
             );
         }
+        // Comparação dos codificadores JPEG (uma thread, 1920×1080 "foto").
+        #[cfg(not(lrd_stub))]
+        {
+            let f = frame("video-tela-cheia", 3);
+            let rgb: Vec<u8> = f.data.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
+            for (name, func) in [
+                ("jpeg-encoder (novo)", super::backend::jpeg_encode as fn(&[u8], u32, u32, u8) -> Option<Vec<u8>>),
+                ("image (antigo)", super::backend::jpeg_encode_image_crate),
+            ] {
+                let t = std::time::Instant::now();
+                let mut size = 0;
+                for _ in 0..5 {
+                    size = func(&rgb, 1920, 1080, 72).unwrap().len();
+                }
+                println!("JPEG {name}: {:.1} ms por quadro 1080p, {} KB", t.elapsed().as_secs_f64() * 1000.0 / 5.0, size / 1024);
+            }
+        }
         let t = std::time::Instant::now();
         let _ = frame("video-tela-cheia", 3);
         println!("(gerar um quadro sintético leva {:.1} ms — fora das medidas)", t.elapsed().as_secs_f64() * 1000.0);

@@ -215,3 +215,34 @@ fn static_text_next_to_motion_stays_exact() {
         }
     }
 }
+
+#[test]
+fn scroll_inside_window_with_static_sides_uses_copy() {
+    // Janela em x 100..500 com o conteúdo rolando; fora dela, "papel de parede" parado.
+    let page = |x: u32, y: u32, off: u32| {
+        if (100..500).contains(&x) && y >= 40 { ui(x - 100, y, off) } else { noisy(x, y, 0) }
+    };
+    let mut enc = LrdEncoder::new();
+    let a = frame(640, 480, |x, y| page(x, y, 0));
+    let k = enc.encode(&a, 70).unwrap();
+    let b = frame(640, 480, |x, y| page(x, y, 54));
+    let d = enc.encode(&b, 70).unwrap();
+    assert_eq!(enc.last.copies, 1, "rolagem dentro de janela não detectada");
+    // Parou: o refino deixa a janela exata (pixels copiados de regiões com perdas inclusive).
+    enc.refine_after = Duration::from_millis(0);
+    assert!(enc.encode(&b, 70).is_none());
+    let mut frames = vec![k, d];
+    while let Some(r) = enc.refine(3) {
+        frames.push(r);
+    }
+    let (fb, _) = decode(&frames);
+    // Área da janela tem que ficar exata (sem perdas). Exceção: a faixa de 16 colunas (e a
+    // linha de blocos) que divide com o papel de parede (foto) pode ficar em JPEG de alta
+    // qualidade — x 100..112 e y 40..64.
+    for y in 64..480usize {
+        for x in 112..500usize {
+            let o = (y * 640 + x) * 4;
+            assert_eq!(fb[o..o + 3], b.data[o..o + 3], "pixel ({x},{y})");
+        }
+    }
+}

@@ -11,6 +11,7 @@ tracing.workspace = true
 tokio.workspace = true
 image.workspace = true
 lz4_flex.workspace = true
+jpeg-encoder.workspace = true
 xcap.workspace = true
 openh264.workspace = true
 openh264-sys2.workspace = true
