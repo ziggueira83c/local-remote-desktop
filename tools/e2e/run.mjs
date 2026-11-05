@@ -112,7 +112,8 @@ for (const bname of wanted) {
       continue;
     }
     const problems = [];
-    if (!(pg.fps >= 15)) problems.push(`fps ${pg.fps?.toFixed(1)}`);
+    // Os Macs do GitHub são máquinas virtuais (codificador lento, ~16 quadros/s).
+    if (!(pg.fps >= (process.platform === "darwin" ? 12 : 20))) problems.push(`fps ${pg.fps?.toFixed(1)}`);
     if (pg.freezes > (cfg.lossy ? 4 : 1)) problems.push(`${pg.freezes} travadas`);
     if (!cfg.lossy && host.bitrateBps < 3_000_000) problems.push(`taxa caiu para ${(host.bitrateBps / 1e6).toFixed(1)} Mbps`);
     if (pg.width !== 1280) problems.push(`largura ${pg.width}`);

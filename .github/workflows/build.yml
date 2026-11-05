@@ -75,7 +75,7 @@ jobs:
             target/${{ matrix.target }}/release/bundle/msi/*.msi
 
       - name: Separar arquivos da versão
-        if: (startsWith(github.ref, 'refs/tags/v') || contains(github.event.head_commit.message, '[publicar]'))
+        if: (startsWith(github.ref, 'refs/tags/v') || contains(github.event.head_commit.message, '[publicar]') && env.TAURI_SIGNING_PRIVATE_KEY != '')
         shell: bash
         run: |
           set -e
@@ -94,7 +94,7 @@ jobs:
           ls -la release
 
       - name: Guardar arquivos da versão
-        if: (startsWith(github.ref, 'refs/tags/v') || contains(github.event.head_commit.message, '[publicar]'))
+        if: (startsWith(github.ref, 'refs/tags/v') || contains(github.event.head_commit.message, '[publicar]') && env.TAURI_SIGNING_PRIVATE_KEY != '')
         uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.name }}
