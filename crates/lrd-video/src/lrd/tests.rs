@@ -246,3 +246,18 @@ fn scroll_inside_window_with_static_sides_uses_copy() {
         }
     }
 }
+
+#[test]
+fn video_region_uses_few_large_operations() {
+    // Vídeo 640×384 alinhado aos blocos, mudando a cada quadro, no meio de uma interface.
+    let f = |t: u32| frame(1024, 512, move |x, y| if (128..768).contains(&x) && (64..448).contains(&y) { noisy(x, y, t) } else { ui(x, y, 0) });
+    let mut enc = LrdEncoder::new();
+    enc.encode(&f(0), 60).unwrap();
+    let mut last = Vec::new();
+    for t in 1..5 {
+        last = enc.encode(&f(t), 60).unwrap();
+    }
+    let (_, ops) = lrd_protocol::lrd::parse(&last).unwrap();
+    // 6 linhas de blocos ⇒ no máximo 2 retângulos (até 4 linhas de blocos por operação).
+    assert!(ops.len() <= 2, "{} operações para um vídeo retangular", ops.len());
+}

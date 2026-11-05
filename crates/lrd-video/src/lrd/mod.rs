@@ -346,6 +346,8 @@ impl LrdEncoder {
             }
         }
 
+        let jobs = merge_vertical(jobs);
+
         // 5. Compressão em paralelo.
         let t_compress = Instant::now();
         outs.extend(self.run_jobs(cur, &jobs));
@@ -471,6 +473,7 @@ impl LrdEncoder {
                 c = end;
             }
         }
+        let jobs = merge_vertical(jobs);
         let reference = std::mem::take(&mut self.reference);
         let outs = self.run_jobs(&reference, &jobs);
         self.reference = reference;
@@ -679,6 +682,37 @@ impl LrdEncoder {
         });
         results.into_iter().filter_map(|m| m.into_inner().unwrap()).collect()
     }
+}
+
+/// Linhas de blocos juntadas numa operação, no máximo (mantém a compressão em paralelo).
+const MERGE_ROWS: u32 = 4;
+
+/// Junta retângulos do mesmo tipo empilhados exatamente (mesmo x e largura, um logo abaixo
+/// do outro) em retângulos maiores: menos operações para o controlador decodificar.
+fn merge_vertical(mut jobs: Vec<Job>) -> Vec<Job> {
+    if jobs.len() < 2 {
+        return jobs;
+    }
+    let key = |j: &Job| -> (u8, u8, u32, u32, u32) {
+        let (k, q) = match j.kind {
+            JobKind::Lossless => (0, 0),
+            JobKind::Jpeg(q) => (1, q),
+        };
+        (k, q, j.x, j.w, j.y)
+    };
+    jobs.sort_by_key(key);
+    let mut out: Vec<Job> = Vec::with_capacity(jobs.len());
+    for j in jobs {
+        if let Some(last) = out.last_mut() {
+            let same_kind = key(last).0 == key(&j).0 && key(last).1 == key(&j).1;
+            if same_kind && last.x == j.x && last.w == j.w && last.y + last.h == j.y && last.h + j.h <= MERGE_ROWS * TILE {
+                last.h += j.h;
+                continue;
+            }
+        }
+        out.push(j);
+    }
+    out
 }
 
 /// Conjunto de cores de um bloco (tabela aberta reaproveitada; para no limite).
