@@ -7,7 +7,16 @@ const bin = process.argv[2];
 const wanted = (process.argv[3] ?? "chromium,webkit").split(",");
 const SECONDS = 12;
 
-const configs = [
+// LRD_SCENARIOS=1: mede o codecLRD em cenários de desktop 1920×1080 (informativo).
+const scenarioNames = ["parado", "digitando", "rolagem", "arrastar-janela", "video-720p", "video-tela-cheia"];
+const scenarioConfigs = scenarioNames.map((n) => ({
+  name: `codecLRD · ${n}`,
+  args: ["--scenario", n],
+  lrd: true,
+  scenario: n,
+  informative: true,
+}));
+const configs = process.env.LRD_SCENARIOS ? scenarioConfigs : [
   { name: "codecLRD", args: ["--lrd"], lrd: true },
   { name: "H.264", args: [] },
   { name: "H.264, 3% de perda", args: [], env: { LRD_TEST_DROP_PCT: "3" }, lossy: true },
@@ -66,6 +75,7 @@ const launchers = {
 };
 
 const rows = [];
+const scenarioRows = [];
 let failures = 0;
 let port = 8800;
 for (const bname of wanted) {
@@ -102,6 +112,16 @@ for (const bname of wanted) {
     }
     const { host, page: pg } = res;
     console.log("   host:", JSON.stringify(host));
+    if (cfg.scenario) {
+      const l = host.lrd;
+      scenarioRows.push([
+        bname, cfg.scenario, pg.fps?.toFixed(1), pg.glassMs?.toFixed(0) ?? "-", l.kbPerFrame,
+        ((l.kbPerFrame * 8 * (pg.fps || 0)) / 1000).toFixed(1), l.encodeMsAvg, l.encodeMsMax, l.sendMsAvg,
+        pg.lrdApplyMsAvg?.toFixed(1), pg.lrdApplyMsP95?.toFixed(1), pg.lrdQueueApplyMsAvg?.toFixed(1),
+        l.deferred, l.copies, l.lz4Mpx, l.jpegMpx, pg.inputRttMs?.toFixed(1) ?? "-",
+      ]);
+      continue;
+    }
     console.log("   page:", JSON.stringify(pg));
     const hevcCase = cfg.args.includes("--hevc");
     if (!pg.directInput && pg.frames === 0) {
@@ -143,6 +163,11 @@ for (const bname of wanted) {
   await browser.close();
 }
 
+if (scenarioRows.length) {
+  console.log("\nCENÁRIOS codecLRD");
+  console.log("navegador | cenário | qps | atraso ms | KB/quadro | Mbps | codificar ms (média) | codificar ms (máx) | envio ms | aplicar ms (média) | aplicar ms (p95) | fila+aplicar ms | adiados | cópias | LZ4 Mpx/q | JPEG Mpx/q | comando ms");
+  for (const r of scenarioRows) console.log(r.join(" | "));
+}
 console.log("\nnavegador | caso | resultado | codec | fps | travadas | atraso ms | comando ida/volta ms | nitidez | exatos | problemas");
 for (const r of rows) console.log(r.join(" | "));
 process.exit(failures ? 1 : 0);

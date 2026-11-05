@@ -153,7 +153,12 @@ report.forEach((s) => {
 const lat = engine.latency();
 const sorted = [...gaps].sort((a, b) => a - b);
 const dur = (last - first) / 1000;
+const avg = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : null);
+const p95 = (a) => (a.length ? [...a].sort((x, y) => x - y)[Math.floor(a.length * 0.95)] : null);
+const lt = engine.lrdTimes;
 const result = {
+  lrdApplyMsAvg: avg(lt.apply), lrdApplyMsP95: p95(lt.apply),
+  lrdQueueApplyMsAvg: avg(lt.queueAndApply), lrdResets: lt.resets,
   ua: navigator.userAgent,
   browserH265: h265,
   codec: cfg.lrd ? "codecLRD" : codec, decoder,

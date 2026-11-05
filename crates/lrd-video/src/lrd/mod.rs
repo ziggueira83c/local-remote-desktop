@@ -115,6 +115,18 @@ pub struct LrdStats {
     pub lossy: usize,
     pub fills: usize,
     pub keyframe: bool,
+    /// Tempos por etapa (µs): comparação, rolagem, classificação, compressão, total.
+    pub diff_us: u32,
+    pub scroll_us: u32,
+    pub classify_us: u32,
+    pub compress_us: u32,
+    pub total_us: u32,
+    /// Bytes por tipo de operação.
+    pub lz4_bytes: usize,
+    pub jpeg_bytes: usize,
+    /// Pixels por tipo (área codificada).
+    pub lz4_px: usize,
+    pub jpeg_px: usize,
 }
 
 pub struct LrdEncoder {
@@ -206,6 +218,7 @@ impl LrdEncoder {
 
     /// Codifica um quadro. `None` = nada mudou (nenhum byte a enviar).
     pub fn encode(&mut self, frame: &RawFrame, jpeg_quality: u8) -> Option<Vec<u8>> {
+        let t_start = Instant::now();
         let (w, h) = (frame.width, frame.height);
         if w == 0 || h == 0 || frame.data.len() < (w * h * 4) as usize || w > 8192 || h > 8192 {
             return None;
@@ -234,6 +247,8 @@ impl LrdEncoder {
         //    mexe continua exato).
         let mut dirty: Vec<Option<Rect>> =
             if key { (0..n).map(|i| Some(self.tile_rect(i))).collect() } else { (0..n).map(|i| self.change_box(cur, i)).collect() };
+        stats.diff_us = t_start.elapsed().as_micros() as u32;
+        let t_scroll = Instant::now();
 
         // 2. Rolagem.
         if !key && dirty.iter().filter(|d| d.is_some()).count() >= 4 {
@@ -254,12 +269,15 @@ impl LrdEncoder {
             }
         }
 
+        stats.scroll_us = t_scroll.elapsed().as_micros() as u32;
+        let t_classify = Instant::now();
         // 3. Classificação (em paralelo por faixas de linhas).
         for (i, d) in dirty.iter().enumerate() {
             let t = &mut self.tiles[i];
             t.streak = if d.is_some() { t.streak.saturating_add(1) } else { 0 };
         }
         let classes = self.classify(cur, &dirty, key);
+        stats.classify_us = t_classify.elapsed().as_micros() as u32;
 
         // 4. Agrupa blocos vizinhos inteiros da mesma classe em faixas horizontais; blocos com
         //    mudança parcial vão sozinhos, só com o retângulo alterado.
@@ -328,7 +346,22 @@ impl LrdEncoder {
         }
 
         // 5. Compressão em paralelo.
+        let t_compress = Instant::now();
         outs.extend(self.run_jobs(cur, &jobs));
+        stats.compress_us = t_compress.elapsed().as_micros() as u32;
+        for o in &outs {
+            match o {
+                Out::Lz4 { w, h, data, .. } => {
+                    stats.lz4_bytes += data.len();
+                    stats.lz4_px += (*w * *h) as usize;
+                }
+                Out::Jpeg { w, h, data, .. } => {
+                    stats.jpeg_bytes += data.len();
+                    stats.jpeg_px += (*w * *h) as usize;
+                }
+                _ => {}
+            }
+        }
 
         // Estado: o controlador passa a ter estes pixels.
         let now = Instant::now();
@@ -363,6 +396,7 @@ impl LrdEncoder {
         }
         let bytes = self.write(key, frame.timestamp_us, outs);
         stats.bytes = bytes.len();
+        stats.total_us = t_start.elapsed().as_micros() as u32;
         self.last = stats;
         Some(bytes)
     }
@@ -843,6 +877,8 @@ pub fn apply_frame(bytes: &[u8], fb: &mut Vec<u8>, dims: &mut (u32, u32)) -> Opt
     }
     Some(h)
 }
+
+pub mod scenarios;
 
 #[cfg(test)]
 mod tests;

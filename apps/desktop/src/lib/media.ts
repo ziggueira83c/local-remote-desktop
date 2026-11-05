@@ -114,6 +114,8 @@ export class MediaEngine {
   private lrdBacklog = 0;
   private chunks: Uint8Array[] = [];
   private lrdFrames = 0;
+  /** Diagnóstico: ms desde a chegada até desenhar (inclui fila) e só aplicando. */
+  lrdTimes = { queueAndApply: [] as number[], apply: [] as number[], resets: 0 };
   private lrdBytes = 0;
   private lrdMark = { time: performance.now(), frames: 0, bytes: 0 };
   private lastStats: { bytes: number; time: number; lost: number; recv: number } | null = null;
@@ -481,6 +483,7 @@ export class MediaEngine {
     if (!dec) return;
     if (this.lrdBacklog > 90) {
       // A tela daqui não acompanha: descarta e recomeça de um quadro completo.
+      this.lrdTimes.resets++;
       dec.reset();
       this.requestKeyframe();
       return;
@@ -488,11 +491,24 @@ export class MediaEngine {
     this.lrdBacklog++;
     this.lrdBytes += bytes.length;
     const hdr = LrdDecoder.header(bytes);
+    const tArrive = performance.now();
+    let tStart = 0;
     this.lrdChain = this.lrdChain
-      .then(() => dec.apply(bytes))
+      .then(() => {
+        tStart = performance.now();
+        return dec.apply(bytes);
+      })
       .then((info) => {
         if (!info) return;
         this.lrdFrames++;
+        const tEnd = performance.now();
+        const t = this.lrdTimes;
+        t.queueAndApply.push(tEnd - tArrive);
+        t.apply.push(tEnd - tStart);
+        if (t.apply.length > 300) {
+          t.apply.shift();
+          t.queueAndApply.shift();
+        }
         const off = this.clockOffset();
         if (off != null) {
           const ms = performance.timeOrigin + performance.now() + off - info.captureUs / 1000;

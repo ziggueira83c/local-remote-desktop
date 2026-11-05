@@ -32,6 +32,8 @@ struct Args {
     hevc: bool,
     no_fec: bool,
     lrd: bool,
+    /// Cenário de desktop 1920×1080 (`lrd_video::lrd::scenarios`), só com --lrd.
+    scenario: Option<String>,
     bitrate: u32,
 }
 
@@ -44,6 +46,7 @@ fn args() -> Args {
         hevc: false,
         no_fec: false,
         lrd: false,
+        scenario: None,
         bitrate: 6_000_000,
     };
     let v: Vec<String> = std::env::args().collect();
@@ -56,6 +59,10 @@ fn args() -> Args {
             "--script" => a.script = next(),
             "--seconds" => a.seconds = next().parse().unwrap(),
             "--bitrate" => a.bitrate = next().parse().unwrap(),
+            "--scenario" => {
+                a.scenario = Some(next());
+                a.lrd = true;
+            }
             "--hevc" => {
                 a.hevc = true;
                 i += 1;
@@ -79,6 +86,19 @@ fn args() -> Args {
 }
 
 #[derive(Default)]
+struct LrdMeter {
+    frames: AtomicU64,
+    bytes: AtomicU64,
+    encode_us: AtomicU64,
+    max_encode_us: AtomicU64,
+    deferred: AtomicU64,
+    send_us: AtomicU64,
+    copies: AtomicU64,
+    jpeg_px: AtomicU64,
+    lz4_px: AtomicU64,
+}
+
+#[derive(Default)]
 struct Counters {
     moves: AtomicU64,
     buttons: AtomicU64,
@@ -93,6 +113,10 @@ struct State {
     counters: Arc<Counters>,
     encoder_info: Arc<Mutex<(String, bool, u64)>>,
     cap: Mutex<Option<std::sync::mpsc::Sender<CaptureCmd>>>,
+    /// Medidas do lado do host (codecLRD): quadros, bytes, µs codificando, quadros adiados
+    /// pelo controle de fluxo, µs esperando o canal.
+    lrd_meter: Arc<LrdMeter>,
+    scenario_frames: Arc<Vec<RawFrame>>,
     started: Mutex<Option<Instant>>,
 }
 
@@ -165,6 +189,9 @@ async fn start_rtc(st: &Arc<State>, browser_hevc: bool) -> anyhow::Result<String
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
     let want_hevc = codecs.hevc;
     let lrd = codecs.lrd;
+    let meter = st.lrd_meter.clone();
+    let meter_send = st.lrd_meter.clone();
+    let scenario_frames = st.scenario_frames.clone();
     let bitrate = st.args.bitrate;
     let info = st.encoder_info.clone();
     std::thread::spawn(move || {
@@ -182,8 +209,15 @@ async fn start_rtc(st: &Arc<State>, browser_hevc: bool) -> anyhow::Result<String
                         enc.force_keyframe();
                     }
                 }
-                let f = synth(n);
+                let synth_frame;
+                let f: &RawFrame = if scenario_frames.is_empty() {
+                    synth_frame = synth(n);
+                    &synth_frame
+                } else {
+                    &scenario_frames[n as usize % scenario_frames.len()]
+                };
                 if !enc.ready() {
+                    meter.deferred.fetch_add(1, Ordering::Relaxed);
                     // Controlador ainda aplicando: este quadro some (as mudanças vão no próximo).
                     n += 1;
                     next += interval;
@@ -195,8 +229,22 @@ async fn start_rtc(st: &Arc<State>, browser_hevc: bool) -> anyhow::Result<String
                     }
                     continue;
                 }
-                let out = enc.encode(&f, q.jpeg_quality).or_else(|| enc.refine_due().then(|| enc.refine(lrd_protocol::now_us())).flatten());
+                let mut fresh = f.clone();
+                fresh.timestamp_us = lrd_protocol::now_us();
+                let t_enc = Instant::now();
+                let out = enc
+                    .encode(&fresh, q.jpeg_quality)
+                    .or_else(|| enc.refine_due().then(|| enc.refine(lrd_protocol::now_us())).flatten());
+                let el = t_enc.elapsed().as_micros() as u64;
                 if let Some(bytes) = out {
+                    let l = enc.last;
+                    meter.frames.fetch_add(1, Ordering::Relaxed);
+                    meter.bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    meter.encode_us.fetch_add(el, Ordering::Relaxed);
+                    meter.max_encode_us.fetch_max(el, Ordering::Relaxed);
+                    meter.copies.fetch_add(l.copies as u64, Ordering::Relaxed);
+                    meter.jpeg_px.fetch_add(l.jpeg_px as u64, Ordering::Relaxed);
+                    meter.lz4_px.fetch_add(l.lz4_px as u64, Ordering::Relaxed);
                     if let Ok(mut i) = info.lock() {
                         let l = enc.last;
                         *i = (format!("codecLRD {}/{} blocos, {} cópias, {} B", l.dirty_tiles, l.total_tiles, l.copies, l.bytes), false, 0);
@@ -254,7 +302,9 @@ async fn start_rtc(st: &Arc<State>, browser_hevc: bool) -> anyhow::Result<String
     tokio::spawn(async move {
         while let Some(f) = frame_rx.recv().await {
             if lrd {
+                let t = Instant::now();
                 rtc_send.write_media(&f).await;
+                meter_send.send_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
             } else {
                 rtc_send.write_video(&f).await;
             }
@@ -362,8 +412,23 @@ async fn handle(mut sock: TcpStream, st: Arc<State>) {
                 Some(r) => r.negotiated().await,
                 None => (false, false, false),
             };
+            let m = &st.lrd_meter;
+            let mf = m.frames.load(Ordering::Relaxed).max(1) as f64;
+            let lrd_json = format!(
+                r#"{{"scenario":"{}","frames":{},"kbPerFrame":{:.1},"encodeMsAvg":{:.2},"encodeMsMax":{:.1},"sendMsAvg":{:.2},"deferred":{},"copies":{},"jpegMpx":{:.3},"lz4Mpx":{:.3}}}"#,
+                st.args.scenario.clone().unwrap_or_default(),
+                m.frames.load(Ordering::Relaxed),
+                m.bytes.load(Ordering::Relaxed) as f64 / mf / 1024.0,
+                m.encode_us.load(Ordering::Relaxed) as f64 / mf / 1000.0,
+                m.max_encode_us.load(Ordering::Relaxed) as f64 / 1000.0,
+                m.send_us.load(Ordering::Relaxed) as f64 / mf / 1000.0,
+                m.deferred.load(Ordering::Relaxed),
+                m.copies.load(Ordering::Relaxed),
+                m.jpeg_px.load(Ordering::Relaxed) as f64 / mf / 1e6,
+                m.lz4_px.load(Ordering::Relaxed) as f64 / mf / 1e6,
+            );
             let host = format!(
-                r#"{{"encoder":"{}","encoderHevc":{},"bitrateBps":{},"negH264":{},"negH265":{},"negFec":{},"moves":{},"buttons":{},"keys":{},"scrolls":{},"pings":{},"dropPct":"{}"}}"#,
+                r#"{{"lrd":{lrd_json},"encoder":"{}","encoderHevc":{},"bitrateBps":{},"negH264":{},"negH265":{},"negFec":{},"moves":{},"buttons":{},"keys":{},"scrolls":{},"pings":{},"dropPct":"{}"}}"#,
                 enc_name,
                 enc_hevc,
                 enc_bitrate,
@@ -396,6 +461,20 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let args = args();
+    // Quadros do cenário gerados antes (em paralelo), para não pesar na medida.
+    let scenario_frames: Vec<RawFrame> = match &args.scenario {
+        Some(name) => {
+            let name = name.clone();
+            let handles: Vec<_> = (0..12u32)
+                .map(|t| {
+                    let name = name.clone();
+                    std::thread::spawn(move || lrd_video::lrd::scenarios::frame(&name, t))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        }
+        None => Vec::new(),
+    };
     let listener = TcpListener::bind(("127.0.0.1", args.port)).await?;
     let limit = args.seconds + 60;
     let st = Arc::new(State {
@@ -404,6 +483,8 @@ async fn main() -> anyhow::Result<()> {
         counters: Arc::new(Counters::default()),
         encoder_info: Arc::new(Mutex::new((String::new(), false, 0))),
         cap: Mutex::new(None),
+        lrd_meter: Arc::new(LrdMeter::default()),
+        scenario_frames: Arc::new(scenario_frames),
         started: Mutex::new(None),
     });
     println!("LISTENING");

@@ -138,6 +138,18 @@ jobs:
         shell: bash
         run: node tools/e2e/run.mjs target/release/examples/${{ matrix.exe }} ${{ matrix.browsers }}
 
+      - name: Medir codecLRD (codificador, cenários 1080p)
+        continue-on-error: true
+        shell: bash
+        run: cargo test --release -p lrd-video bench_scenarios -- --ignored --nocapture
+
+      - name: Medir codecLRD ponta a ponta (cenários 1080p)
+        continue-on-error: true
+        shell: bash
+        env:
+          LRD_SCENARIOS: "1"
+        run: node tools/e2e/run.mjs target/release/examples/${{ matrix.exe }} ${{ matrix.browsers }}
+
   release:
     name: publicar versão
     needs: build
