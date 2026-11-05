@@ -60,6 +60,8 @@ pub type InputHandler = Arc<dyn Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync>;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RtcCodecs {
     pub hevc: bool,
+    /// Desliga a proteção FEC (testes / diagnóstico).
+    pub no_fec: bool,
 }
 const OPUS_RATE: u32 = 48_000;
 const OPUS_FRAME: usize = 960; // 20 ms por canal
@@ -109,8 +111,10 @@ impl RtcSender {
             video_codecs.push(("video/H265", PT_H265, H265_FMTP, video_fb()));
         }
         // Proteção contra perdas (FEC): RED como envelope + ULPFEC como paridade.
-        video_codecs.push(("video/red", PT_RED, "", vec![]));
-        video_codecs.push(("video/ulpfec", PT_ULPFEC, "", vec![]));
+        if !codecs.no_fec && std::env::var_os("LRD_NO_FEC").is_none() {
+            video_codecs.push(("video/red", PT_RED, "", vec![]));
+            video_codecs.push(("video/ulpfec", PT_ULPFEC, "", vec![]));
+        }
         for (mime, pt, fmtp, fb) in video_codecs {
             media.register_codec(
                 RTCRtpCodecParameters {

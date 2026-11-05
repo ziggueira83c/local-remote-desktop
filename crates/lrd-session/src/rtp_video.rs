@@ -14,11 +14,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio::sync::{mpsc, Mutex};
-use webrtc::rtp::codecs::h264::H264Payloader;
-use webrtc::rtp::codecs::h265::HevcPayloader;
 use webrtc::rtp::header::Header;
 use webrtc::rtp::packet::Packet;
-use webrtc::rtp::packetizer::Payloader;
 use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecParameters, RTPCodecType};
 use webrtc::track::track_local::{TrackLocal, TrackLocalContext, TrackLocalWriter};
 
@@ -150,25 +147,23 @@ impl Pacer {
     }
 }
 
+/// Janela máxima para espalhar um quadro: além disso o pacing passaria a atrasar a imagem.
+const MAX_SPREAD: Duration = Duration::from_millis(8);
+/// Taxa mínima de espalhamento (bem abaixo da capacidade de um Wi‑Fi 5 GHz).
+const MIN_PACING_BPS: u64 = 60_000_000;
+
 async fn run(track: Arc<VideoTrack>, mut rx: mpsc::Receiver<OutFrame>, target_bps: Arc<AtomicU32>) {
     let mut seq: u16 = rand_u16();
-    let mut h264 = H264Payloader::default();
-    let mut h265 = HevcPayloader::default();
+    let test_drop = std::env::var("LRD_TEST_DROP_PCT").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+    let mut rng_state = seq as u32 | 1;
     while let Some(frame) = rx.recv().await {
         let Some(b) = track.binding.lock().await.clone() else { continue };
-        let (payloader, pt): (&mut dyn Payloader, Option<u8>) = if frame.hevc {
-            (&mut h265, b.pt_h265)
-        } else {
-            (&mut h264, b.pt_h264)
+        let pt = if frame.hevc { b.pt_h265 } else { b.pt_h264 };
+        let Some(media_pt) = pt else {
+            tracing::debug!("codec do quadro não negociado (H.265: {})", frame.hevc);
+            continue;
         };
-        let Some(media_pt) = pt else { continue };
-        let payloads = match payloader.payload(MTU, &frame.annexb) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!("empacotamento: {e}");
-                continue;
-            }
-        };
+        let payloads = if frame.hevc { packetize_h265(&frame.annexb, MTU) } else { packetize_h264(&frame.annexb, MTU) };
         if payloads.is_empty() {
             continue;
         }
@@ -209,24 +204,141 @@ async fn run(track: Arc<VideoTrack>, mut rx: mpsc::Receiver<OutFrame>, target_bp
             }
         }
 
-        // Pacing: espalha a ~2,5× a taxa alvo (mínimo 25 Mbps), em fatias de 1 ms.
-        // Se outro quadro já estiver esperando, despeja o resto sem atrasar.
-        let rate_bps = (target_bps.load(Ordering::Relaxed) as u64 * 5 / 2).max(25_000_000);
-        let bytes_per_ms = (rate_bps / 8 / 1000).max(1500) as usize;
-        let mut budget = 0usize;
-        let mut next = tokio::time::Instant::now();
+        // Pacing por relógio real: o pacote k sai em `início + janela × (bytes antes dele / total)`.
+        // Se o sistema dormir mais que o pedido (temporizador de 15,6 ms do Windows), os pacotes
+        // atrasados saem juntos na sequência — o atraso nunca se acumula. Com outro quadro
+        // esperando, o resto sai na hora.
+        let total: usize = out.iter().map(|p| p.payload.len() + 12).sum();
+        let rate_bps = (target_bps.load(Ordering::Relaxed) as u64 * 3).max(MIN_PACING_BPS);
+        let window = Duration::from_micros((total as u64 * 8 * 1_000_000 / rate_bps).max(1)).min(MAX_SPREAD);
+        let start = tokio::time::Instant::now();
+        let mut sent = 0usize;
         for p in out {
-            if budget == 0 && rx.is_empty() {
-                tokio::time::sleep_until(next).await;
-                next += Duration::from_millis(1);
-                budget = bytes_per_ms;
+            if rx.is_empty() {
+                let due = start + window.mul_f64(sent as f64 / total as f64);
+                let now = tokio::time::Instant::now();
+                if due > now + Duration::from_millis(1) {
+                    tokio::time::sleep_until(due).await;
+                }
             }
-            budget = budget.saturating_sub(p.payload.len() + 12);
+            sent += p.payload.len() + 12;
+            if test_drop > 0 {
+                // Teste de perdas (só com LRD_TEST_DROP_PCT): xorshift simples.
+                rng_state ^= rng_state << 13;
+                rng_state ^= rng_state >> 17;
+                rng_state ^= rng_state << 5;
+                if rng_state % 100 < test_drop {
+                    continue;
+                }
+            }
             if let Err(e) = b.writer.write_rtp(&p).await {
                 tracing::debug!("RTP: {e}");
             }
         }
     }
+}
+
+/// Divide um bitstream Annex B em unidades NAL (sem os códigos de início).
+pub fn split_annexb(data: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut start: Option<usize> = None;
+    while i + 3 <= data.len() {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            if let Some(s) = start {
+                let mut e = i;
+                while e > s && data[e - 1] == 0 {
+                    e -= 1; // zeros do código de início de 4 bytes
+                }
+                if e > s {
+                    out.push(&data[s..e]);
+                }
+            }
+            i += 3;
+            start = Some(i);
+        } else {
+            i += 1;
+        }
+    }
+    if let Some(s) = start {
+        if s < data.len() {
+            out.push(&data[s..]);
+        }
+    }
+    out
+}
+
+/// RFC 6184: NAL única quando cabe; FU-A quando não cabe. Sem STAP-A (cada NAL no seu pacote).
+pub fn packetize_h264(annexb: &[u8], mtu: usize) -> Vec<Bytes> {
+    let mut out = Vec::new();
+    for nal in split_annexb(annexb) {
+        let kind = nal[0] & 0x1f;
+        if kind == 9 {
+            continue; // delimitador de unidade de acesso: inútil no RTP
+        }
+        if nal.len() <= mtu {
+            out.push(Bytes::copy_from_slice(nal));
+            continue;
+        }
+        let indicator = (nal[0] & 0xe0) | 28;
+        let body = &nal[1..];
+        let chunk = mtu - 2;
+        let n = body.len().div_ceil(chunk);
+        for (k, part) in body.chunks(chunk).enumerate() {
+            let mut header = kind;
+            if k == 0 {
+                header |= 0x80;
+            }
+            if k == n - 1 {
+                header |= 0x40;
+            }
+            let mut p = BytesMut::with_capacity(part.len() + 2);
+            p.put_u8(indicator);
+            p.put_u8(header);
+            p.extend_from_slice(part);
+            out.push(p.freeze());
+        }
+    }
+    out
+}
+
+/// RFC 7798: NAL única quando cabe; FU (tipo 49) quando não cabe. Sem AP.
+pub fn packetize_h265(annexb: &[u8], mtu: usize) -> Vec<Bytes> {
+    let mut out = Vec::new();
+    for nal in split_annexb(annexb) {
+        if nal.len() < 3 {
+            continue;
+        }
+        let kind = (nal[0] >> 1) & 0x3f;
+        if kind == 35 {
+            continue; // AUD
+        }
+        if nal.len() <= mtu {
+            out.push(Bytes::copy_from_slice(nal));
+            continue;
+        }
+        let hdr0 = (nal[0] & 0x81) | (49 << 1);
+        let hdr1 = nal[1];
+        let body = &nal[2..];
+        let chunk = mtu - 3;
+        let n = body.len().div_ceil(chunk);
+        for (k, part) in body.chunks(chunk).enumerate() {
+            let mut fu = kind;
+            if k == 0 {
+                fu |= 0x80;
+            }
+            if k == n - 1 {
+                fu |= 0x40;
+            }
+            let mut p = BytesMut::with_capacity(part.len() + 3);
+            p.put_u8(hdr0);
+            p.put_u8(hdr1);
+            p.put_u8(fu);
+            p.extend_from_slice(part);
+            out.push(p.freeze());
+        }
+    }
+    out
 }
 
 fn packet(ssrc: u32, pt: u8, seq: u16, ts: u32, marker: bool, payload: Bytes) -> Packet {
@@ -286,6 +398,85 @@ fn rand_u16() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Desfaz o empacotamento como um receptor faria (H.264).
+    fn depacketize_h264(pkts: &[Bytes]) -> Vec<Vec<u8>> {
+        let mut nals = Vec::new();
+        let mut cur: Vec<u8> = Vec::new();
+        for p in pkts {
+            let kind = p[0] & 0x1f;
+            if kind == 28 {
+                if p[1] & 0x80 != 0 {
+                    cur = vec![(p[0] & 0xe0) | (p[1] & 0x1f)];
+                }
+                cur.extend_from_slice(&p[2..]);
+                if p[1] & 0x40 != 0 {
+                    nals.push(std::mem::take(&mut cur));
+                }
+            } else {
+                nals.push(p.to_vec());
+            }
+        }
+        nals
+    }
+
+    fn depacketize_h265(pkts: &[Bytes]) -> Vec<Vec<u8>> {
+        let mut nals = Vec::new();
+        let mut cur: Vec<u8> = Vec::new();
+        for p in pkts {
+            let kind = (p[0] >> 1) & 0x3f;
+            if kind == 49 {
+                if p[2] & 0x80 != 0 {
+                    cur = vec![(p[0] & 0x81) | ((p[2] & 0x3f) << 1), p[1]];
+                }
+                cur.extend_from_slice(&p[3..]);
+                if p[2] & 0x40 != 0 {
+                    nals.push(std::mem::take(&mut cur));
+                }
+            } else {
+                nals.push(p.to_vec());
+            }
+        }
+        nals
+    }
+
+    fn sample_stream(nal_headers: &[&[u8]], sizes: &[usize]) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let mut stream = Vec::new();
+        let mut nals = Vec::new();
+        for (i, (h, size)) in nal_headers.iter().zip(sizes).enumerate() {
+            let mut nal = h.to_vec();
+            // Conteúdo sem sequências 00 00 01 (como num bitstream real, com prevenção de emulação).
+            nal.extend((0..*size).map(|k| ((k * 7 + i) % 251) as u8 | 1));
+            stream.extend_from_slice(if i % 2 == 0 { &[0, 0, 0, 1][..] } else { &[0, 0, 1][..] });
+            stream.extend_from_slice(&nal);
+            nals.push(nal);
+        }
+        (stream, nals)
+    }
+
+    #[test]
+    fn h264_roundtrip() {
+        let (stream, nals) = sample_stream(&[&[0x67], &[0x68], &[0x65], &[0x41]], &[20, 4, 5000, 900]);
+        let pkts = packetize_h264(&stream, 1150);
+        assert!(pkts.iter().all(|p| p.len() <= 1150));
+        assert_eq!(depacketize_h264(&pkts), nals);
+    }
+
+    #[test]
+    fn h265_roundtrip() {
+        // VPS(32) SPS(33) PPS(34) IDR(19) TRAIL(1)
+        let (stream, nals) =
+            sample_stream(&[&[0x40, 0x01], &[0x42, 0x01], &[0x44, 0x01], &[0x26, 0x01], &[0x02, 0x01]], &[30, 60, 8, 7000, 1149]);
+        let pkts = packetize_h265(&stream, 1150);
+        assert!(pkts.iter().all(|p| p.len() <= 1150));
+        assert_eq!(depacketize_h265(&pkts), nals);
+    }
+
+    #[test]
+    fn annexb_split_handles_trailing_zeros() {
+        let data = [0, 0, 0, 1, 0x67, 1, 2, 0, 0, 0, 1, 0x68, 3];
+        assert_eq!(split_annexb(&data), vec![&[0x67, 1, 2][..], &[0x68, 3][..]]);
+    }
 
     #[test]
     fn fec_recovers_single_loss() {

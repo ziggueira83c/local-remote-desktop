@@ -2,8 +2,11 @@
 //!
 //! - `device_id`: UUID persistente (arquivo `identity.json`, público).
 //! - Certificado autoassinado (público) salvo em `identity.json`.
-//! - Chave privada (PKCS#8) guardada no cofre do sistema: Credential Manager (Windows)
-//!   ou Keychain (macOS). Se o cofre falhar, cai para um arquivo local com aviso no log.
+//! - Chave privada (PKCS#8):
+//!   - Windows: Credential Manager (protegido pela conta do usuário, sem perguntas).
+//!   - macOS: arquivo `private_key.b64` na pasta do app, legível só pelo usuário (0600).
+//!     O Keychain amarra cada item à assinatura do app; como o app não tem assinatura da
+//!     Apple, cada versão nova virava "outro app" e o macOS pedia a senha de novo.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -87,8 +90,14 @@ fn fallback_key_path(data_dir: &Path) -> PathBuf {
     data_dir.join("private_key.b64")
 }
 
+/// Usar o cofre do sistema? (no macOS, não — ver o cabeçalho do módulo)
+const USE_SYSTEM_VAULT: bool = !cfg!(target_os = "macos");
+
 fn store_private_key(data_dir: &Path, device_id: &str, key_der: &[u8]) -> Result<()> {
     let encoded = B64.encode(key_der);
+    if !USE_SYSTEM_VAULT {
+        return write_private_file(&fallback_key_path(data_dir), encoded.as_bytes());
+    }
     match keyring::Entry::new(KEYRING_SERVICE, device_id).and_then(|e| e.set_password(&encoded)) {
         Ok(()) => {
             // Confere se o cofre realmente guardou (alguns ambientes usam armazenamento falso).
@@ -106,10 +115,24 @@ fn store_private_key(data_dir: &Path, device_id: &str, key_der: &[u8]) -> Result
 }
 
 fn load_private_key(data_dir: &Path, device_id: &str) -> Result<Vec<u8>> {
+    let path = fallback_key_path(data_dir);
+    if !USE_SYSTEM_VAULT {
+        if let Ok(encoded) = fs::read_to_string(&path) {
+            return Ok(B64.decode(encoded.trim())?);
+        }
+        // Migração única de versões antigas: lê do Keychain, passa para o arquivo e apaga
+        // o item do Keychain (pode pedir a senha do Mac esta última vez).
+        let entry = keyring::Entry::new(KEYRING_SERVICE, device_id)?;
+        let encoded = entry.get_password().context("chave privada no Keychain")?;
+        let key = B64.decode(encoded.trim())?;
+        write_private_file(&path, encoded.trim().as_bytes())?;
+        let _ = entry.delete_credential();
+        tracing::info!("chave privada migrada do Keychain para arquivo local");
+        return Ok(key);
+    }
     if let Ok(encoded) = keyring::Entry::new(KEYRING_SERVICE, device_id).and_then(|e| e.get_password()) {
         return Ok(B64.decode(encoded.trim())?);
     }
-    let path = fallback_key_path(data_dir);
     let encoded = fs::read_to_string(&path).with_context(|| format!("lendo {}", path.display()))?;
     Ok(B64.decode(encoded.trim())?)
 }

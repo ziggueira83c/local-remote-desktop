@@ -105,6 +105,7 @@ impl Node {
         let viewer_h264 = hello.codecs.iter().any(|c| c == lrd_protocol::codec::H264);
         let rtc_codecs = crate::rtc::RtcCodecs {
             hevc: hello.codecs.iter().any(|c| c == lrd_protocol::codec::WEBRTC_H265),
+            no_fec: false,
         };
         let codec = if viewer_webrtc || viewer_h264 {
             VideoCodec::H264

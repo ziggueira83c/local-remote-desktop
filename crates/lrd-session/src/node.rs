@@ -72,6 +72,7 @@ pub struct Node {
     pub(crate) outbound: Mutex<Option<OutboundHandle>>,
     pub(crate) rate: Mutex<RateLimiter>,
     pub(crate) injector: Mutex<Option<Arc<lrd_input::InputInjector>>>,
+    pub(crate) data_dir: std::path::PathBuf,
 }
 
 impl Node {
@@ -103,6 +104,7 @@ impl Node {
             outbound: Mutex::new(None),
             rate: Mutex::new(RateLimiter::default()),
             injector: Mutex::new(None),
+            data_dir: config.data_dir.clone(),
         });
 
         node.restart_listener();
@@ -280,32 +282,56 @@ impl Node {
     }
 
     pub(crate) fn has_saved_password(&self, device_id: &str) -> bool {
-        self.storage.get_setting::<bool>(&Self::saved_flag_key(device_id)).ok().flatten().unwrap_or(false)
+        let flag = self.storage.get_setting::<bool>(&Self::saved_flag_key(device_id)).ok().flatten().unwrap_or(false);
+        if flag && cfg!(target_os = "macos") {
+            return self.password_file().remove_or_get(device_id, None).is_some();
+        }
+        flag
     }
 
-    /// Senha guardada no cofre do sistema (Keychain / Credential Manager).
+    /// Senha guardada: Credential Manager no Windows; no macOS, arquivo próprio legível só
+    /// pelo usuário (o Keychain pediria a senha do Mac a cada versão nova do app).
     pub(crate) fn load_saved_password(&self, device_id: &str) -> Option<String> {
         if !self.has_saved_password(device_id) {
             return None;
+        }
+        if cfg!(target_os = "macos") {
+            // Senhas antigas no Keychain não são lidas (evita o pedido de permissão):
+            // basta digitar uma vez de novo.
+            return self.password_file().remove_or_get(device_id, None);
         }
         keyring::Entry::new(PEER_KEYRING_SERVICE, device_id).and_then(|e| e.get_password()).ok()
     }
 
     pub(crate) fn save_password(&self, device_id: &str, password: &str) {
-        match keyring::Entry::new(PEER_KEYRING_SERVICE, device_id).and_then(|e| e.set_password(password)) {
-            Ok(()) => {
-                let _ = self.storage.put_setting(&Self::saved_flag_key(device_id), &true);
+        let ok = if cfg!(target_os = "macos") {
+            self.password_file().remove_or_get(device_id, Some(Some(password))).is_some()
+        } else {
+            match keyring::Entry::new(PEER_KEYRING_SERVICE, device_id).and_then(|e| e.set_password(password)) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!("não foi possível guardar a senha no cofre do sistema: {e}");
+                    false
+                }
             }
-            Err(e) => tracing::warn!("não foi possível guardar a senha no cofre do sistema: {e}"),
+        };
+        if ok {
+            let _ = self.storage.put_setting(&Self::saved_flag_key(device_id), &true);
         }
     }
 
     pub fn forget_saved_password(&self, device_id: &str) -> Result<()> {
-        if let Ok(e) = keyring::Entry::new(PEER_KEYRING_SERVICE, device_id) {
+        if cfg!(target_os = "macos") {
+            self.password_file().remove_or_get(device_id, Some(None));
+        } else if let Ok(e) = keyring::Entry::new(PEER_KEYRING_SERVICE, device_id) {
             let _ = e.delete_credential();
         }
         self.storage.put_setting(&Self::saved_flag_key(device_id), &false)?;
         Ok(())
+    }
+
+    fn password_file(&self) -> PasswordFile {
+        PasswordFile(self.data_dir.join("saved_passwords.json"))
     }
 
     pub fn set_favorite(&self, device_id: &str, favorite: bool) -> Result<()> {
@@ -379,4 +405,51 @@ pub(crate) fn close_reason(err: &quinn::ConnectionError) -> String {
         quinn::ConnectionError::LocallyClosed => lrd_protocol::reason::USER_CLOSED.into(),
         _ => "connection_lost".into(),
     }
+}
+
+/// Arquivo de senhas lembradas (macOS), permissão 0600.
+struct PasswordFile(std::path::PathBuf);
+
+static PASSWORD_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+impl PasswordFile {
+    /// `change`: `None` = só ler; `Some(Some(pw))` = gravar; `Some(None)` = apagar.
+    /// Devolve a senha (leitura) ou `Some("")` se a gravação deu certo.
+    fn remove_or_get(&self, device_id: &str, change: Option<Option<&str>>) -> Option<String> {
+        let _guard = PASSWORD_FILE_LOCK.lock().ok()?;
+        let mut map: HashMap<String, String> =
+            std::fs::read(&self.0).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        match change {
+            None => map.get(device_id).cloned(),
+            Some(new) => {
+                match new {
+                    Some(pw) => {
+                        map.insert(device_id.to_string(), pw.to_string());
+                    }
+                    None => {
+                        map.remove(device_id);
+                    }
+                }
+                let data = serde_json::to_vec(&map).ok()?;
+                write_private(&self.0, &data).ok()?;
+                Some(String::new())
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+    f.write_all(data)?;
+    f.sync_all()?;
+    std::fs::rename(tmp, path)
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, data)
 }

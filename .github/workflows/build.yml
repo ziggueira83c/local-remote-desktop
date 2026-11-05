@@ -100,6 +100,43 @@ jobs:
           name: release-${{ matrix.name }}
           path: release/*
 
+  e2e:
+    name: teste ponta a ponta (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: mac
+            os: macos-latest
+            browsers: webkit,chromium
+            exe: rtc_e2e
+          - name: windows
+            os: windows-latest
+            browsers: chromium
+            exe: rtc_e2e.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: e2e-${{ matrix.name }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Compilar o teste
+        run: cargo build --release -p lrd-session --example rtc_e2e
+      - name: Navegadores e interface
+        working-directory: tools/e2e
+        shell: bash
+        run: |
+          npm install --no-fund --no-audit
+          npx playwright install ${{ matrix.browsers == 'chromium' && 'chromium' || 'chromium webkit' }}
+          npx esbuild ../../apps/desktop/src/lib/media.ts --bundle --format=esm --target=es2021 --outfile=dist/media.js
+      - name: Rodar
+        shell: bash
+        run: node tools/e2e/run.mjs target/release/examples/${{ matrix.exe }} ${{ matrix.browsers }}
+
   release:
     name: publicar versão
     needs: build

@@ -4,8 +4,10 @@
 
 mod host;
 mod node;
-mod rtc;
-mod rtp_video;
+#[doc(hidden)]
+pub mod rtc;
+#[doc(hidden)]
+pub mod rtp_video;
 mod viewer;
 
 use std::path::PathBuf;

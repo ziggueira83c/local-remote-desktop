@@ -1,0 +1,130 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>LRD e2e</title></head>
+<body style="margin:0;background:#000">
+<video id="v" playsinline autoplay muted style="width:1280px;height:720px"></video>
+<canvas id="c" width="1280" height="720" style="display:none"></canvas>
+<script type="module">
+import { MediaEngine } from "/media.js";
+
+const log = (m) => fetch("/log", { method: "POST", body: String(m) });
+window.onerror = (e) => log("erro: " + e);
+
+const cfg = await (await fetch("/config")).json();
+let h265 = false;
+try {
+  h265 = !!RTCRtpReceiver.getCapabilities("video")?.codecs.some((c) => c.mimeType.toLowerCase() === "video/h265");
+} catch {}
+const sdp = await (await fetch("/offer?h265=" + (h265 ? 1 : 0))).text();
+const engine = new MediaEngine(null);
+const video = document.getElementById("v");
+engine.attachVideo(video);
+const answer = await engine.acceptOffer(sdp);
+await fetch("/answer", { method: "POST", body: answer });
+
+// --- quadros apresentados ---
+let first = 0, last = 0, frames = 0, freezes = 0, maxGap = 0;
+const gaps = [];
+const onFrame = (now, meta) => {
+  const t = performance.now();
+  if (!first) first = t;
+  if (last) {
+    const gap = t - last;
+    gaps.push(gap);
+    maxGap = Math.max(maxGap, gap);
+    if (gap > 250) freezes++;
+  }
+  last = t;
+  frames++;
+  engine.noteVideoFrame(meta);
+  video.requestVideoFrameCallback(onFrame);
+};
+if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(onFrame);
+else log("sem requestVideoFrameCallback");
+
+// --- comandos pelo canal de dados ---
+let sentMoves = 0, sentDirect = 0;
+const inputTimer = setInterval(() => {
+  for (let i = 0; i < 5; i++) {
+    sentMoves++;
+    if (engine.sendInput({ type: "pointer", x: (sentMoves * 97) % 65535, y: (sentMoves * 31) % 65535 })) sentDirect++;
+  }
+}, 20);
+let clicks = 0;
+const clickTimer = setInterval(() => {
+  engine.sendInput({ type: "button", button: 0, pressed: true });
+  engine.sendInput({ type: "button", button: 0, pressed: false });
+  engine.sendInput({ type: "key", hid: 0x04, pressed: true });
+  engine.sendInput({ type: "key", hid: 0x04, pressed: false });
+  engine.sendInput({ type: "scroll", dx: 0, dy: 1 });
+  clicks++;
+}, 250);
+
+// --- nitidez: diferença média entre pixels vizinhos no xadrez de 2 px ---
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d", { willReadFrequently: true });
+const sharpSamples = [];
+const sharpTimer = setInterval(() => {
+  if (!video.videoWidth) return;
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  ctx.drawImage(video, 0, 0);
+  const sx = video.videoWidth / 1280, sy = video.videoHeight / 720;
+  const d = ctx.getImageData(Math.round(110 * sx), Math.round(110 * sy), Math.round(200 * sx), Math.round(100 * sy)).data;
+  const w = Math.round(200 * sx);
+  let sum = 0, n = 0;
+  for (let i = 0; i + 8 < d.length; i += 4) {
+    if (((i / 4) % w) >= w - 2) continue;
+    const a = d[i] + d[i + 1] + d[i + 2], b = d[i + 8] + d[i + 9] + d[i + 10];
+    sum += Math.abs(a - b) / 3;
+    n++;
+  }
+  sharpSamples.push(sum / Math.max(1, n));
+}, 500);
+
+await new Promise((r) => setTimeout(r, cfg.seconds * 1000));
+clearInterval(inputTimer);
+clearInterval(clickTimer);
+clearInterval(sharpTimer);
+await new Promise((r) => setTimeout(r, 500));
+
+const pc = engine.pc;
+const report = pc ? await pc.getStats() : new Map();
+let codec = null, decoder = null, inbound = {};
+const codecs = {};
+report.forEach((s) => { if (s.type === "codec") codecs[s.id] = s.mimeType; });
+report.forEach((s) => {
+  if (s.type === "inbound-rtp" && s.kind === "video") {
+    inbound = {
+      packetsLost: s.packetsLost, packetsReceived: s.packetsReceived, nackCount: s.nackCount,
+      pliCount: s.pliCount, firCount: s.firCount, framesDecoded: s.framesDecoded, framesDropped: s.framesDropped,
+      fecPacketsReceived: s.fecPacketsReceived, fecPacketsDiscarded: s.fecPacketsDiscarded,
+      freezeCount: s.freezeCount, totalFreezesDuration: s.totalFreezesDuration,
+      jitterBufferMs: s.jitterBufferEmittedCount ? (s.jitterBufferDelay / s.jitterBufferEmittedCount) * 1000 : null,
+      width: s.frameWidth, height: s.frameHeight,
+    };
+    codec = codecs[s.codecId] ?? null;
+    decoder = s.decoderImplementation ?? null;
+  }
+});
+const lat = engine.latency();
+const sorted = [...gaps].sort((a, b) => a - b);
+const dur = (last - first) / 1000;
+const result = {
+  ua: navigator.userAgent,
+  browserH265: h265,
+  codec, decoder,
+  width: video.videoWidth, height: video.videoHeight,
+  fps: dur > 0 ? frames / dur : 0,
+  frames, freezes, maxGapMs: Math.round(maxGap),
+  p95GapMs: sorted.length ? Math.round(sorted[Math.floor(sorted.length * 0.95)]) : null,
+  firstFrameMs: first ? Math.round(first) : null,
+  glassMs: lat.glassMs, inputRttMs: lat.inputRttMs, directInput: lat.directInput,
+  sentMoves, sentDirect, clicks,
+  sharpness: sharpSamples.length ? sharpSamples.reduce((a, b) => a + b, 0) / sharpSamples.length : null,
+  inbound,
+};
+await fetch("/result", { method: "POST", body: JSON.stringify(result) });
+</script>
+</body>
+</html>

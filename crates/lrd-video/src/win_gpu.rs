@@ -92,6 +92,8 @@ pub struct DuplSource {
     dupl: Option<IDXGIOutputDuplication>,
     latest: Option<ID3D11Texture2D>,
     size: (u32, u32),
+    /// Ainda não entregou nenhuma imagem desde a (re)criação da duplicação.
+    need_first: bool,
     staging: Arc<Mutex<Option<ID3D11Texture2D>>>,
     pub display: Display,
 }
@@ -161,6 +163,7 @@ impl DuplSource {
                 size: (0, 0),
                 staging: Arc::new(Mutex::new(None)),
                 display: display.clone(),
+                need_first: true,
             };
             s.duplicate()?;
             Ok(s)
@@ -171,6 +174,7 @@ impl DuplSource {
         self.dupl = None;
         let d = unsafe { self.output.DuplicateOutput(&self.gpu.device) }.context("DuplicateOutput")?;
         self.dupl = Some(d);
+        self.need_first = true;
         Ok(())
     }
 
@@ -200,9 +204,12 @@ impl DuplSource {
 
     fn copy_frame(&mut self, info: &DXGI_OUTDUPL_FRAME_INFO, resource: Option<IDXGIResource>) -> Result<Option<RawFrame>> {
         // Só o mouse mudou: nada de imagem nova (o cursor é desenhado no controlador).
-        if info.LastPresentTime == 0 || info.AccumulatedFrames == 0 {
+        // Exceção: logo após abrir, a superfície já tem a tela atual — usa para não começar
+        // com tela preta esperando algo mudar.
+        if (info.LastPresentTime == 0 || info.AccumulatedFrames == 0) && !self.need_first {
             return Ok(None);
         }
+        self.need_first = false;
         let Some(resource) = resource else { return Ok(None) };
         let src: ID3D11Texture2D = resource.cast().context("textura da tela")?;
         unsafe {
