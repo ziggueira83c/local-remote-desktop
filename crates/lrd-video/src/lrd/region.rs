@@ -46,10 +46,6 @@ impl RegionTracker {
         self.last_activity = None;
     }
 
-    pub fn active(&self) -> Option<Rect> {
-        self.active
-    }
-
     /// `moving_tiles`: um por bloco (linha a linha), verdadeiro se o bloco foi classificado com
     /// perdas neste quadro. `inside_changed`: a região ativa mudou neste quadro.
     pub fn update(&mut self, moving_tiles: &[bool], inside_changed: bool, now: Instant) -> Option<Rect> {

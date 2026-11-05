@@ -292,3 +292,162 @@ fn unaligned_video_region_uses_few_operations() {
         }
     }
 }
+
+// ---------- região de vídeo (Task 3) ----------
+
+use super::region_encoder::{RegionEncoder, RegionOut};
+use std::sync::{Arc as SArc, Mutex as SMutex};
+
+#[derive(Default)]
+struct StubLog {
+    created: Vec<(u32, u32)>,
+    idrs: usize,
+}
+
+struct StubRegion {
+    first: bool,
+    n: u32,
+    log: SArc<SMutex<StubLog>>,
+}
+
+impl RegionEncoder for StubRegion {
+    fn encode(&mut self, frame: &RawFrame, force_idr: bool) -> Option<RegionOut> {
+        let idr = force_idr || self.first;
+        self.first = false;
+        self.n += 1;
+        if idr {
+            self.log.lock().unwrap().idrs += 1;
+        }
+        let mut annexb = vec![0, 0, 0, 1];
+        annexb.extend_from_slice(&frame.width.to_le_bytes());
+        annexb.extend_from_slice(&frame.height.to_le_bytes());
+        annexb.extend_from_slice(&self.n.to_le_bytes());
+        Some(RegionOut { annexb, idr, hevc: true })
+    }
+    fn set_bitrate(&mut self, _bps: u32) {}
+}
+
+fn stub_factory(log: SArc<SMutex<StubLog>>, fail: bool) -> super::RegionFactory {
+    Box::new(move |w, h| {
+        if fail {
+            return None;
+        }
+        log.lock().unwrap().created.push((w, h));
+        Some(Box::new(StubRegion { first: true, n: 0, log: log.clone() }) as Box<dyn RegionEncoder>)
+    })
+}
+
+fn video_frame(t: u32, x1: u32) -> RawFrame {
+    frame(1024, 512, move |x, y| if (128..x1).contains(&x) && (64..448).contains(&y) { noisy(x, y, t) } else { ui(x, y, 0) })
+}
+
+fn ops_of(bytes: &[u8]) -> Vec<lrd_protocol::lrd::Op<'_>> {
+    lrd_protocol::lrd::parse(bytes).unwrap().1
+}
+
+fn count_ops(bytes: &[u8]) -> (usize, usize) {
+    let ops = ops_of(bytes);
+    let v = ops.iter().filter(|o| matches!(o, lrd_protocol::lrd::Op::Video { .. })).count();
+    let j = ops.iter().filter(|o| matches!(o, lrd_protocol::lrd::Op::Jpeg { .. })).count();
+    (v, j)
+}
+
+#[test]
+fn video_region_replaces_jpeg_and_keeps_text_exact() {
+    let log = SArc::new(SMutex::new(StubLog::default()));
+    let mut enc = LrdEncoder::new();
+    enc.enable_video(stub_factory(log.clone(), false), 8_000_000);
+    let mut frames = Vec::new();
+    for t in 0..12 {
+        frames.push(enc.encode(&video_frame(t, 768), 60).unwrap());
+    }
+    for f in &frames[8..] {
+        assert_eq!(count_ops(f), (1, 0), "esperado só a operação de vídeo");
+    }
+    assert_eq!(log.lock().unwrap().created.len(), 1);
+    let (fb, _) = decode(&frames);
+    let want = video_frame(11, 768);
+    for y in 0..512usize {
+        for x in 0..1024usize {
+            if (128..768).contains(&x) && (64..448).contains(&y) {
+                continue;
+            }
+            let o = (y * 1024 + x) * 4;
+            assert_eq!(fb[o..o + 3], want.data[o..o + 3], "pixel ({x},{y})");
+        }
+    }
+}
+
+#[test]
+fn region_resize_starts_with_idr() {
+    let log = SArc::new(SMutex::new(StubLog::default()));
+    let mut enc = LrdEncoder::new();
+    enc.enable_video(stub_factory(log.clone(), false), 8_000_000);
+    for t in 0..10 {
+        enc.encode(&video_frame(t, 768), 60).unwrap();
+    }
+    let mut saw_resize = false;
+    for t in 10..24 {
+        let b = enc.encode(&video_frame(t, 960), 60).unwrap();
+        for op in ops_of(&b) {
+            if let lrd_protocol::lrd::Op::Video { w, flags, .. } = op {
+                if w > 640 && !saw_resize {
+                    assert!(flags & lrd_protocol::lrd::VIDEO_IDR != 0, "primeiro quadro do tamanho novo sem IDR");
+                    saw_resize = true;
+                }
+            }
+        }
+    }
+    assert!(saw_resize, "a região não cresceu");
+    assert_eq!(log.lock().unwrap().created.len(), 2);
+}
+
+#[test]
+fn keyframe_request_forces_idr_and_full_frame() {
+    let log = SArc::new(SMutex::new(StubLog::default()));
+    let mut enc = LrdEncoder::new();
+    enc.enable_video(stub_factory(log.clone(), false), 8_000_000);
+    for t in 0..10 {
+        enc.encode(&video_frame(t, 768), 60).unwrap();
+    }
+    enc.force_keyframe();
+    let b = enc.encode(&video_frame(10, 768), 60).unwrap();
+    let (h, ops) = lrd_protocol::lrd::parse(&b).unwrap();
+    assert!(h.keyframe);
+    assert!(ops.iter().any(|o| matches!(o, lrd_protocol::lrd::Op::Video { flags, .. } if flags & lrd_protocol::lrd::VIDEO_IDR != 0)));
+}
+
+#[test]
+fn released_area_returns_exact() {
+    let log = SArc::new(SMutex::new(StubLog::default()));
+    let mut enc = LrdEncoder::new();
+    enc.enable_video(stub_factory(log.clone(), false), 8_000_000);
+    let mut now = Instant::now();
+    let mut frames = Vec::new();
+    for t in 0..10 {
+        now += Duration::from_millis(33);
+        frames.extend(enc.encode_at(&video_frame(t, 768), 60, now));
+    }
+    // O vídeo para: a área vira interface parada. Passa 1,5 s.
+    let still = frame(1024, 512, |x, y| ui(x, y, 0));
+    for _ in 0..45 {
+        now += Duration::from_millis(33);
+        frames.extend(enc.encode_at(&still, 60, now));
+    }
+    let (fb, _) = decode(&frames);
+    assert!(bgr_eq(&fb, &still.data), "a área liberada não voltou exata");
+}
+
+#[test]
+fn encoder_failure_disables_video() {
+    let log = SArc::new(SMutex::new(StubLog::default()));
+    let mut enc = LrdEncoder::new();
+    enc.enable_video(stub_factory(log.clone(), true), 8_000_000);
+    let mut last = Vec::new();
+    for t in 0..12 {
+        last = enc.encode(&video_frame(t, 768), 60).unwrap();
+    }
+    let (v, j) = count_ops(&last);
+    assert_eq!(v, 0);
+    assert!(j > 0, "a área deveria seguir em JPEG");
+}

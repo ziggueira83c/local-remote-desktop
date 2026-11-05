@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use lrd_protocol::lrd::{Writer, FILTER_LEFT};
+use lrd_protocol::lrd::{Writer, FILTER_LEFT, VIDEO_HEVC, VIDEO_IDR};
 
 use crate::frame::{PixelFormat, RawFrame};
 
@@ -102,6 +102,7 @@ enum Out {
     Copy { x: u32, y: u32, w: u32, h: u32, sy: u32 },
     Lz4 { x: u32, y: u32, w: u32, h: u32, raw_len: usize, data: Vec<u8> },
     Jpeg { x: u32, y: u32, w: u32, h: u32, data: Vec<u8> },
+    Video { x: u32, y: u32, w: u32, h: u32, flags: u8, data: Vec<u8> },
 }
 
 /// Números do último quadro (diagnóstico).
@@ -127,7 +128,27 @@ pub struct LrdStats {
     /// Pixels por tipo (área codificada).
     pub lz4_px: usize,
     pub jpeg_px: usize,
+    /// Região de vídeo (codec temporal) neste quadro.
+    pub video_bytes: usize,
+    pub video_rect: Option<Rect>,
+    pub video_hevc: bool,
 }
+
+/// Região de vídeo: detector + codificador temporal (ver especificação 2026-11-05).
+struct VideoState {
+    factory: RegionFactory,
+    profile_bitrate: u32,
+    tracker: region::RegionTracker,
+    enc: Option<(Rect, Box<dyn RegionEncoder>)>,
+    /// O codificador falhou: região desligada pelo resto da sessão.
+    disabled: bool,
+    force_idr: bool,
+    /// Área que deixou de ser região e precisa voltar pelo caminho normal.
+    release: Option<Rect>,
+}
+
+/// Piso da taxa da região (bps).
+const VIDEO_MIN_BPS: u32 = 1_500_000;
 
 pub struct LrdEncoder {
     width: u32,
@@ -146,6 +167,8 @@ pub struct LrdEncoder {
     pub ack: Option<Arc<AtomicU32>>,
     blocked_since: Option<Instant>,
     pub last: LrdStats,
+    /// Em `Mutex` só para o `LrdEncoder` continuar `Sync` (threads de classificação).
+    video: Option<Mutex<VideoState>>,
 }
 
 impl Default for LrdEncoder {
@@ -170,6 +193,7 @@ impl LrdEncoder {
             refine_after: Duration::from_millis(350),
             ack: None,
             blocked_since: None,
+            video: None,
             last: LrdStats::default(),
         }
     }
@@ -199,6 +223,27 @@ impl LrdEncoder {
 
     pub fn force_keyframe(&mut self) {
         self.force_key = true;
+        if let Some(v) = self.video_mut() {
+            v.force_idr = true;
+        }
+    }
+
+    /// Liga a região de vídeo: blocos em movimento contínuo vão pelo codificador temporal
+    /// criado por `factory` (H.265/H.264), com taxa proporcional à área da região.
+    pub fn enable_video(&mut self, factory: RegionFactory, profile_bitrate_bps: u32) {
+        self.video = Some(Mutex::new(VideoState {
+            factory,
+            profile_bitrate: profile_bitrate_bps,
+            tracker: region::RegionTracker::new(self.width.max(1), self.height.max(1)),
+            enc: None,
+            disabled: false,
+            force_idr: false,
+            release: None,
+        }));
+    }
+
+    fn video_mut(&mut self) -> Option<&mut VideoState> {
+        self.video.as_mut().map(|m| m.get_mut().unwrap_or_else(|e| e.into_inner()))
     }
 
     fn reset(&mut self, w: u32, h: u32) {
@@ -218,6 +263,11 @@ impl LrdEncoder {
 
     /// Codifica um quadro. `None` = nada mudou (nenhum byte a enviar).
     pub fn encode(&mut self, frame: &RawFrame, jpeg_quality: u8) -> Option<Vec<u8>> {
+        self.encode_at(frame, jpeg_quality, Instant::now())
+    }
+
+    /// Como `encode`, com o relógio informado (testes da região de vídeo).
+    pub fn encode_at(&mut self, frame: &RawFrame, jpeg_quality: u8, now: Instant) -> Option<Vec<u8>> {
         let t_start = Instant::now();
         let (w, h) = (frame.width, frame.height);
         if w == 0 || h == 0 || frame.data.len() < (w * h * 4) as usize || w > 8192 || h > 8192 {
@@ -234,19 +284,53 @@ impl LrdEncoder {
             }
         };
         let cur: &[u8] = &cur;
-        let key = self.force_key || w != self.width || h != self.height || self.reference.is_empty();
+        let resized = w != self.width || h != self.height;
+        let key = self.force_key || resized || self.reference.is_empty();
         if key {
             self.reset(w, h);
+        }
+        if resized {
+            if let Some(v) = self.video_mut() {
+                v.tracker = region::RegionTracker::new(w, h);
+                v.enc = None;
+                v.release = None;
+            }
         }
         let n = self.tiles.len();
         let mut stats = LrdStats { total_tiles: n, keyframe: key, ..Default::default() };
         let mut outs: Vec<Out> = Vec::new();
+
+        // 0. Região de vídeo ativa: copia a região para a referência antes de comparar — o
+        //    caminho normal deixa de enxergá-la (ela vai pelo codificador temporal).
+        let region = self.video_mut().and_then(|v| v.enc.as_ref().map(|(r, _)| *r));
+        let mut inside_changed = false;
+        if let Some(r) = region {
+            inside_changed = !rect_equal(cur, &self.reference, w, r);
+            copy_rect(cur, &mut self.reference, w, r.0, r.1, r.2, r.3);
+        }
 
         // 1. O que mudou: por bloco, o retângulo exato das mudanças (o resto do bloco, que o
         //    controlador já tem certo, não é reenviado — texto parado ao lado de algo que se
         //    mexe continua exato).
         let mut dirty: Vec<Option<Rect>> =
             if key { (0..n).map(|i| Some(self.tile_rect(i))).collect() } else { (0..n).map(|i| self.change_box(cur, i)).collect() };
+        if let Some(r) = region {
+            // Blocos inteiros dentro da região não vão pelo caminho normal (nem no quadro completo).
+            for (i, d) in dirty.iter_mut().enumerate() {
+                if inside(self.tile_rect(i), r) {
+                    *d = None;
+                }
+            }
+        }
+        // Área que deixou de ser região: volta inteira pelo caminho normal.
+        if let Some(rel) = self.video_mut().and_then(|v| v.release.take()) {
+            for (i, d) in dirty.iter_mut().enumerate() {
+                let t = self.tile_rect(i);
+                if overlaps(t, rel) && !region.is_some_and(|r| inside(t, r)) {
+                    *d = Some(t);
+                }
+            }
+        }
         stats.diff_us = t_start.elapsed().as_micros() as u32;
         let t_scroll = Instant::now();
 
@@ -279,6 +363,16 @@ impl LrdEncoder {
         }
         let classes = self.classify(cur, &dirty, key);
         stats.classify_us = t_classify.elapsed().as_micros() as u32;
+
+        // 3b. Região de vídeo: detector + codificador temporal.
+        if let Some(out) = self.video_step(cur, &classes, inside_changed, region, frame.timestamp_us, now) {
+            stats.video_bytes = out.data_len();
+            if let Out::Video { x, y, w: vw, h: vh, flags, .. } = &out {
+                stats.video_rect = Some((*x, *y, *vw, *vh));
+                stats.video_hevc = flags & VIDEO_HEVC != 0;
+            }
+            outs.push(out);
+        }
 
         // 4. Agrupa blocos vizinhos inteiros da mesma classe em faixas horizontais; blocos com
         //    mudança parcial vão sozinhos, só com o retângulo alterado.
@@ -489,6 +583,89 @@ impl LrdEncoder {
         Some(bytes)
     }
 
+    /// Atualiza o detector, (re)cria o codificador da região e codifica o recorte.
+    fn video_step(
+        &mut self,
+        cur: &[u8],
+        classes: &[Class],
+        inside_changed: bool,
+        region: Option<Rect>,
+        capture_us: u64,
+        now: Instant,
+    ) -> Option<Out> {
+        let (sw, sh) = (self.width, self.height);
+        let tile_rects: Vec<Rect> = (0..self.tiles.len()).map(|i| self.tile_rect(i)).collect();
+        let v = self.video.as_mut()?.get_mut().unwrap_or_else(|e| e.into_inner());
+        if v.disabled {
+            return None;
+        }
+        // A região ativa fica escondida do caminho normal; o detector precisa enxergá-la como
+        // "em movimento" quando o conteúdo dela mudou, senão ela encolheria para só a parte nova.
+        let moving: Vec<bool> = classes
+            .iter()
+            .zip(&tile_rects)
+            .map(|(c, t)| matches!(c, Class::Lossy { .. }) || (inside_changed && region.is_some_and(|r| inside(*t, r))))
+            .collect();
+        let next = v.tracker.update(&moving, inside_changed, now);
+        let mut force = std::mem::take(&mut v.force_idr);
+        if next != region {
+            // Área que sai da região volta pelo caminho normal no próximo quadro.
+            if let Some(old) = region {
+                v.release = Some(old);
+            }
+            match next {
+                Some(r) if v.enc.as_ref().map(|(o, _)| (o.2, o.3)) != Some((r.2, r.3)) => match (v.factory)(r.2, r.3) {
+                    Some(e) => {
+                        v.enc = Some((r, e));
+                        force = true;
+                    }
+                    None => {
+                        v.disabled = true;
+                        v.enc = None;
+                        v.tracker.reset();
+                        return None;
+                    }
+                },
+                Some(r) => {
+                    if let Some((old, _)) = &mut v.enc {
+                        *old = r;
+                    }
+                    force = true;
+                }
+                None => {
+                    v.enc = None;
+                    return None;
+                }
+            }
+        }
+        let (r, enc) = v.enc.as_mut()?;
+        let r = *r;
+        if !(inside_changed || force || next != region) {
+            return None;
+        }
+        let area = (r.2 as u64 * r.3 as u64).max(1);
+        let screen = (sw as u64 * sh as u64).max(1);
+        enc.set_bitrate(((v.profile_bitrate as u64 * area / screen) as u32).max(VIDEO_MIN_BPS));
+        let mut crop = Vec::with_capacity((r.2 * r.3 * 4) as usize);
+        let stride = (sw * 4) as usize;
+        for y in r.1..r.1 + r.3 {
+            let o = y as usize * stride + r.0 as usize * 4;
+            crop.extend_from_slice(&cur[o..o + r.2 as usize * 4]);
+        }
+        let frame = RawFrame::cpu(r.2, r.3, crop, PixelFormat::Bgra, capture_us);
+        let out = enc.encode(&frame, force)?;
+        let flags = if out.idr { VIDEO_IDR } else { 0 } | if out.hevc { VIDEO_HEVC } else { 0 };
+        // Blocos da região não precisam de refino (a região é redesenhada pelo vídeo).
+        for (i, t_rect) in tile_rects.iter().enumerate() {
+            if inside(*t_rect, r) {
+                let t = &mut self.tiles[i];
+                t.lossy = false;
+                t.lossy_at = None;
+            }
+        }
+        Some(Out::Video { x: r.0, y: r.1, w: r.2, h: r.3, flags, data: out.annexb })
+    }
+
     fn write(&mut self, key: bool, capture_us: u64, outs: Vec<Out>) -> Vec<u8> {
         let mut wr = Writer::new(key, self.width, self.height, capture_us, self.frame_id);
         self.frame_id = self.frame_id.wrapping_add(1);
@@ -498,12 +675,20 @@ impl LrdEncoder {
                 wr.copy(*x, *y, *w, *h, *x, *sy);
             }
         }
+        let (videos, outs): (Vec<Out>, Vec<Out>) = outs.into_iter().partition(|o| matches!(o, Out::Video { .. }));
         for o in outs {
             match o {
                 Out::Copy { .. } => {}
                 Out::Fill { x, y, w, h, bgr } => wr.fill(x, y, w, h, bgr),
                 Out::Lz4 { x, y, w, h, raw_len, data } => wr.lz4(x, y, w, h, FILTER_LEFT, raw_len, &data),
                 Out::Jpeg { x, y, w, h, data } => wr.jpeg(x, y, w, h, &data),
+                Out::Video { .. } => {}
+            }
+        }
+        // Vídeo por último: desenhado por cima de tudo que for da mesma área.
+        for o in videos {
+            if let Out::Video { x, y, w, h, flags, data } = o {
+                wr.video(x, y, w, h, flags, &data);
             }
         }
         wr.finish()
@@ -797,6 +982,33 @@ impl ColorSet {
     }
 }
 
+impl Out {
+    fn data_len(&self) -> usize {
+        match self {
+            Out::Lz4 { data, .. } | Out::Jpeg { data, .. } | Out::Video { data, .. } => data.len(),
+            _ => 0,
+        }
+    }
+}
+
+/// `t` está inteiro dentro de `r`?
+fn inside(t: Rect, r: Rect) -> bool {
+    t.0 >= r.0 && t.1 >= r.1 && t.0 + t.2 <= r.0 + r.2 && t.1 + t.3 <= r.1 + r.3
+}
+
+fn overlaps(a: Rect, b: Rect) -> bool {
+    a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3
+}
+
+/// Pixels (BGR) do retângulo iguais nos dois quadros?
+fn rect_equal(a: &[u8], b: &[u8], width: u32, r: Rect) -> bool {
+    let stride = (width * 4) as usize;
+    (r.1..r.1 + r.3).all(|y| {
+        let o = y as usize * stride + r.0 as usize * 4;
+        a[o..o + r.2 as usize * 4] == b[o..o + r.2 as usize * 4]
+    })
+}
+
 /// BGR da região, com cada byte menos o do pixel à esquerda (predição; decodificação soma).
 fn extract_bgr_filtered(src: &[u8], width: u32, x: u32, y: u32, w: u32, h: u32) -> Vec<u8> {
     let stride = (width * 4) as usize;
@@ -977,7 +1189,15 @@ pub fn apply_frame(bytes: &[u8], fb: &mut Vec<u8>, dims: &mut (u32, u32)) -> Opt
                     }
                 }
             }
-            Op::Video { .. } => return None, // decodificado na Task 3 (marca a região)
+            Op::Video { x, y, w, h: hh, .. } => {
+                // Decodificador de referência: marca a região (o vídeo é decodificado no controlador).
+                for r in y..y + hh {
+                    for c in x..x + w {
+                        let o = r as usize * stride + c as usize * 4;
+                        fb[o..o + 4].copy_from_slice(&[1, 2, 3, 255]);
+                    }
+                }
+            }
             Op::Copy { x, y, w, h: hh, sx, sy } => {
                 if sx != x {
                     return None; // o codificador só gera cópia vertical
@@ -991,6 +1211,11 @@ pub fn apply_frame(bytes: &[u8], fb: &mut Vec<u8>, dims: &mut (u32, u32)) -> Opt
 
 pub mod scenarios;
 mod region;
+pub mod region_encoder;
+
+pub use region_encoder::{RegionEncoder, RegionFactory, RegionOut};
+#[cfg(not(lrd_stub))]
+pub use region_encoder::hardware_region_encoder;
 
 #[cfg(test)]
 mod tests;
