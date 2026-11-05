@@ -312,6 +312,13 @@ async fn handle(mut sock: TcpStream, st: Arc<State>) {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,webrtc_ice=debug")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
     let args = args();
     let listener = TcpListener::bind(("127.0.0.1", args.port)).await?;
     let limit = args.seconds + 60;

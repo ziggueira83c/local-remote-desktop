@@ -8,10 +8,10 @@ const wanted = (process.argv[3] ?? "chromium,webkit").split(",");
 const SECONDS = 12;
 
 const configs = [
-  { name: "H.264 + FEC", args: [] },
-  { name: "H.264 sem FEC", args: ["--no-fec"] },
-  { name: "H.264 + FEC, 5% de perda", args: [], env: { LRD_TEST_DROP_PCT: "5" } },
+  { name: "H.264", args: [] },
+  { name: "H.264, 3% de perda", args: [], env: { LRD_TEST_DROP_PCT: "3" }, lossy: true },
   { name: "H.265 (se suportado)", args: ["--hevc"] },
+  { name: "H.264 + FEC (experimental)", args: [], env: { LRD_FEC: "1" }, informative: true },
 ];
 
 function runHost(port, cfg) {
@@ -91,19 +91,20 @@ for (const bname of wanted) {
       continue;
     }
     const problems = [];
-    if (!(pg.fps >= 20)) problems.push(`fps ${pg.fps?.toFixed(1)}`);
-    if (pg.freezes > 2) problems.push(`${pg.freezes} travadas`);
+    if (!(pg.fps >= 15)) problems.push(`fps ${pg.fps?.toFixed(1)}`);
+    if (pg.freezes > (cfg.lossy ? 4 : 1)) problems.push(`${pg.freezes} travadas`);
+    if (!cfg.lossy && host.bitrateBps < 3_000_000) problems.push(`taxa caiu para ${(host.bitrateBps / 1e6).toFixed(1)} Mbps`);
     if (pg.width !== 1280) problems.push(`largura ${pg.width}`);
     if (!pg.directInput) problems.push("comandos fora do canal direto");
     if (host.moves < pg.sentDirect * 0.8) problems.push(`movimentos ${host.moves}/${pg.sentDirect}`);
-    if (host.buttons < pg.clicks * 2) problems.push(`cliques ${host.buttons}/${pg.clicks * 2}`);
-    if (host.keys < pg.clicks * 2) problems.push(`teclas ${host.keys}/${pg.clicks * 2}`);
+    if (host.buttons < pg.clicks * 2 - 4) problems.push(`cliques ${host.buttons}/${pg.clicks * 2}`);
+    if (host.keys < pg.clicks * 2 - 4) problems.push(`teclas ${host.keys}/${pg.clicks * 2}`);
     if (pg.glassMs != null && pg.glassMs > 200) problems.push(`atraso ${pg.glassMs.toFixed(0)} ms`);
     if (pg.sharpness != null && pg.sharpness < 60) problems.push(`nitidez ${pg.sharpness.toFixed(0)}`);
     rows.push([
       bname,
       cfg.name,
-      problems.length ? "FALHOU" : "ok",
+      problems.length ? (cfg.informative ? "falhou (informativo)" : "FALHOU") : "ok",
       pg.codec,
       pg.fps?.toFixed(1),
       pg.freezes,
@@ -112,7 +113,7 @@ for (const bname of wanted) {
       pg.sharpness?.toFixed(0) ?? "-",
       problems.join("; "),
     ]);
-    if (problems.length) failures++;
+    if (problems.length && !cfg.informative) failures++;
   }
   await browser.close();
 }

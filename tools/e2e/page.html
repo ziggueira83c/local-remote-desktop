@@ -20,7 +20,20 @@ const engine = new MediaEngine(null);
 const video = document.getElementById("v");
 engine.attachVideo(video);
 const answer = await engine.acceptOffer(sdp);
+const cands = (answer.match(/a=candidate:[^\r\n]*/g) || []).map((c) => c.split(" ").slice(4, 8).join(" "));
+log("candidatos locais: " + (cands.join(" | ") || "nenhum"));
 await fetch("/answer", { method: "POST", body: answer });
+{
+  const pc0 = engine.pc;
+  pc0.addEventListener("iceconnectionstatechange", () => log("ice: " + pc0.iceConnectionState));
+  pc0.addEventListener("connectionstatechange", () => log("conexão: " + pc0.connectionState));
+  setTimeout(async () => {
+    const st = await pc0.getStats();
+    const pairs = [];
+    st.forEach((s) => { if (s.type === "candidate-pair") pairs.push(`${s.state}${s.nominated ? "*" : ""} ${s.requestsSent ?? ""}/${s.responsesReceived ?? ""}`); });
+    log("pares ICE após 4 s: " + (pairs.join(", ") || "nenhum") + " · " + pc0.iceConnectionState);
+  }, 4000);
+}
 
 // --- quadros apresentados ---
 let first = 0, last = 0, frames = 0, freezes = 0, maxGap = 0;

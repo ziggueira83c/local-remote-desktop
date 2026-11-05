@@ -60,7 +60,7 @@ pub type InputHandler = Arc<dyn Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync>;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RtcCodecs {
     pub hevc: bool,
-    /// Desliga a proteção FEC (testes / diagnóstico).
+    /// Desliga a proteção FEC (que só liga com LRD_FEC=1, experimental).
     pub no_fec: bool,
 }
 const OPUS_RATE: u32 = 48_000;
@@ -111,7 +111,9 @@ impl RtcSender {
             video_codecs.push(("video/H265", PT_H265, H265_FMTP, video_fb()));
         }
         // Proteção contra perdas (FEC): RED como envelope + ULPFEC como paridade.
-        if !codecs.no_fec && std::env::var_os("LRD_NO_FEC").is_none() {
+        // Desligado por padrão: nos testes com Chromium (WebView2) e WebKit (Safari), o vídeo
+        // envelopado em RED não era decodificado. Perdas são cobertas por NACK + pacing.
+        if !codecs.no_fec && std::env::var_os("LRD_FEC").is_some() {
             video_codecs.push(("video/red", PT_RED, "", vec![]));
             video_codecs.push(("video/ulpfec", PT_ULPFEC, "", vec![]));
         }
@@ -329,19 +331,27 @@ impl RtcSender {
     }
 }
 
-/// Lê o RTCP do vídeo: PLI/FIR pedem quadro completo; REMB e perdas ajustam a taxa.
+/// Lê o RTCP do vídeo: PLI/FIR pedem quadro completo; perdas e quedas bruscas do REMB
+/// reduzem a taxa.
+///
+/// O REMB do navegador NÃO é usado como teto direto: ele começa em ~300 kbps e sobe só
+/// ~8% por segundo, e nunca passa de 1,5× o que está chegando. Usá-lo como teto prendia o
+/// vídeo em 400 kbps (imagem borrada e resolução reduzida) por quase um minuto. Numa rede
+/// local a banda sobra; só uma QUEDA do REMB (o navegador detectou fila crescendo) ou perda
+/// de pacotes indica congestionamento de verdade.
 async fn rate_control(
     sender: Arc<RTCRtpSender>,
     cap: std::sync::mpsc::Sender<CaptureCmd>,
     max_bitrate: u32,
     pacing: Arc<std::sync::atomic::AtomicU32>,
 ) {
-    let min_bitrate = 400_000u32;
+    let min_bitrate = 500_000u32.min(max_bitrate);
     let mut target = max_bitrate;
-    let mut remb_cap = max_bitrate;
     let mut last_change = Instant::now();
     let mut last_key = Instant::now() - Duration::from_secs(1);
     let mut last_increase = Instant::now();
+    let mut last_congestion = Instant::now() - Duration::from_secs(10);
+    let mut remb_prev: Option<f64> = None;
 
     while let Ok((packets, _)) = sender.read_rtcp().await {
         let mut desired = target;
@@ -353,26 +363,37 @@ async fn rate_control(
                     last_key = Instant::now();
                 }
             } else if let Some(r) = any.downcast_ref::<ReceiverEstimatedMaximumBitrate>() {
-                if r.bitrate.is_finite() && r.bitrate > 0.0 {
-                    remb_cap = ((r.bitrate * 0.9) as u32).clamp(min_bitrate, max_bitrate);
-                    desired = desired.min(remb_cap);
+                let r = r.bitrate as f64;
+                if r.is_finite() && r > 0.0 {
+                    if let Some(prev) = remb_prev {
+                        // Queda brusca = fila crescendo na rede: segue a estimativa.
+                        if r < prev * 0.85 && (r as u32) < target {
+                            desired = desired.min((r * 0.9) as u32);
+                            last_congestion = Instant::now();
+                        }
+                    }
+                    remb_prev = Some(r);
                 }
             } else if let Some(rr) = any.downcast_ref::<ReceiverReport>() {
                 for rep in &rr.reports {
                     let loss = rep.fraction_lost as f32 / 256.0;
-                    if loss > 0.08 {
-                        desired = ((target as f32) * (1.0 - loss * 0.5)) as u32;
-                    } else if loss < 0.02 && last_increase.elapsed() > Duration::from_secs(2) {
-                        desired = ((target as f32) * 1.08) as u32;
+                    if loss > 0.10 {
+                        desired = desired.min(((target as f32) * (1.0 - loss * 0.5)) as u32);
+                        last_congestion = Instant::now();
+                    } else if loss < 0.02
+                        && last_increase.elapsed() > Duration::from_secs(1)
+                        && last_congestion.elapsed() > Duration::from_secs(3)
+                    {
+                        desired = desired.max(((target as f32) * 1.15) as u32);
                         last_increase = Instant::now();
                     }
                 }
             }
         }
-        let desired = desired.clamp(min_bitrate, remb_cap.max(min_bitrate));
+        let desired = desired.clamp(min_bitrate, max_bitrate);
         let change = (desired as f32 - target as f32).abs() / target.max(1) as f32;
         let urgent = desired < target && change > 0.25;
-        if change > 0.08 && (urgent || last_change.elapsed() > Duration::from_millis(1000)) {
+        if change > 0.05 && (urgent || last_change.elapsed() > Duration::from_millis(1000)) {
             target = desired;
             last_change = Instant::now();
             tracing::debug!("taxa de vídeo → {} kbps", target / 1000);
