@@ -118,6 +118,7 @@ fn photo_goes_lossy_then_refines() {
     let f = frame(256, 128, |x, y| if x < 128 { noisy(x, y, 0) } else { ui(x, y, 0) });
     let k = enc.encode(&f, 60).unwrap();
     assert!(enc.last.lossy >= 4);
+    assert!(enc.encode(&f, 60).is_none()); // parou
     assert!(enc.refine_due());
     let r = enc.refine(2).unwrap();
     assert!(!enc.refine_due());
@@ -192,4 +193,24 @@ fn bench_1080p() {
     let t = Instant::now();
     let d = enc.encode(&c, 70).unwrap();
     println!("vídeo 400x300: {:?}, {} bytes", t.elapsed(), d.len());
+}
+
+#[test]
+fn static_text_next_to_motion_stays_exact() {
+    let mut enc = LrdEncoder::new();
+    // Bloco 0..64: metade esquerda = "texto" parado; metade direita = vídeo mudando sempre.
+    let f = |t: u32| frame(64, 64, move |x, y| if x < 32 { ui(x, y, 0) } else { noisy(x, y, t) });
+    let mut frames = Vec::new();
+    for t in 0..6 {
+        frames.push(enc.encode(&f(t), 60).unwrap());
+    }
+    assert!(enc.last.lossy > 0);
+    let (fb, _) = decode(&frames);
+    let want = f(5);
+    for y in 0..64usize {
+        for x in 0..32usize {
+            let o = (y * 64 + x) * 4;
+            assert_eq!(fb[o..o + 3], want.data[o..o + 3], "texto mudou em ({x},{y})");
+        }
+    }
 }

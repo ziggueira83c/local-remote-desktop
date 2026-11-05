@@ -487,6 +487,7 @@ export class MediaEngine {
     }
     this.lrdBacklog++;
     this.lrdBytes += bytes.length;
+    const hdr = LrdDecoder.header(bytes);
     this.lrdChain = this.lrdChain
       .then(() => dec.apply(bytes))
       .then((info) => {
@@ -505,7 +506,18 @@ export class MediaEngine {
       .catch((e) => console.warn("codecLRD", e))
       .finally(() => {
         this.lrdBacklog--;
+        // Confirma ao host: ele só manda mais quando a tela daqui acompanha.
+        if (hdr) this.sendAck(hdr.frameId);
       });
+  }
+
+  private sendAck(frameId: number) {
+    const dc = this.dcInput;
+    if (!dc || dc.readyState !== "open") return;
+    const b = new Uint8Array(5);
+    b[0] = 7;
+    new DataView(b.buffer).setUint32(1, frameId >>> 0, true);
+    dc.send(b);
   }
 
   private route(bytes: Uint8Array) {

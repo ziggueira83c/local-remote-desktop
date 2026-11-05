@@ -22,8 +22,8 @@ mod backend;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use lrd_protocol::lrd::{Writer, FILTER_LEFT};
@@ -37,6 +37,24 @@ const PHOTO_COLORS: u32 = 1024;
 const MOTION_COLORS: u32 = 160;
 /// Quadros seguidos mudando para considerar "movimento".
 const MOTION_STREAK: u8 = 3;
+/// Quadros enviados e ainda não aplicados no controlador, no máximo.
+const MAX_IN_FLIGHT: u32 = 3;
+
+/// Faixa de 16 colunas com mais cores que isso vai com perdas (dentro de um bloco com perdas).
+const STRIP_COLORS: u32 = 96;
+
+/// Bits das faixas de 16 colunas do bloco que começa em `tx` que cruzam `x..x+w`.
+fn full_strips(tx: u32, x: u32, w: u32) -> u8 {
+    let mut m = 0;
+    for st in 0..4u32 {
+        let (a, b) = (tx + st * 16, tx + st * 16 + 16);
+        if b > x && a < x + w {
+            m |= 1 << st;
+        }
+    }
+    m
+}
+
 /// Blocos refinados por quadro de refino (limita o tamanho dos quadros de refino).
 const REFINE_BATCH: usize = 160;
 
@@ -56,8 +74,13 @@ enum Class {
     Clean,
     Fill([u8; 3]),
     Lossless,
-    Lossy { photo: bool },
+    /// `mask`: faixas de 16 colunas do bloco que vão com perdas (bit s = faixa s); as demais
+    /// (texto, interface ao lado de um vídeo) vão sem perdas.
+    Lossy { photo: bool, mask: u8 },
 }
+
+/// (x, y, largura, altura)
+type Rect = (u32, u32, u32, u32);
 
 #[derive(Debug, Clone, Copy)]
 enum JobKind {
@@ -107,6 +130,9 @@ pub struct LrdEncoder {
     workers: usize,
     /// Tempo parado até refinar um bloco enviado com perdas.
     pub refine_after: Duration,
+    /// Último `frame_id` aplicado pelo controlador (`u32::MAX` = sem confirmações: não limita).
+    pub ack: Option<Arc<AtomicU32>>,
+    blocked_since: Option<Instant>,
     pub last: LrdStats,
 }
 
@@ -130,8 +156,33 @@ impl LrdEncoder {
             force_key: true,
             workers: (cpus / 2).clamp(1, 6),
             refine_after: Duration::from_millis(350),
+            ack: None,
+            blocked_since: None,
             last: LrdStats::default(),
         }
+    }
+
+    /// Pode mandar mais um quadro? Com confirmações do controlador, no máximo
+    /// `MAX_IN_FLIGHT` quadros sem confirmação: se a tela de lá não acompanha, as mudanças se
+    /// acumulam aqui (num quadro só, mais tarde) em vez de virar fila e atraso.
+    pub fn ready(&mut self) -> bool {
+        let Some(ack) = &self.ack else { return true };
+        let acked = ack.load(Ordering::Relaxed);
+        if acked == u32::MAX || self.reference.is_empty() {
+            return true;
+        }
+        let in_flight = self.frame_id.wrapping_sub(acked.wrapping_add(1));
+        if in_flight < MAX_IN_FLIGHT || in_flight > 1 << 30 {
+            self.blocked_since = None;
+            return true;
+        }
+        // Confirmação perdida (ou controlador travado): não espera para sempre.
+        let since = *self.blocked_since.get_or_insert_with(Instant::now);
+        if since.elapsed() > Duration::from_millis(1000) {
+            self.blocked_since = None;
+            return true;
+        }
+        false
     }
 
     pub fn force_keyframe(&mut self) {
@@ -178,12 +229,14 @@ impl LrdEncoder {
         let mut stats = LrdStats { total_tiles: n, keyframe: key, ..Default::default() };
         let mut outs: Vec<Out> = Vec::new();
 
-        // 1. O que mudou.
-        let mut dirty: Vec<bool> =
-            if key { vec![true; n] } else { (0..n).map(|i| self.tile_differs(cur, i)).collect() };
+        // 1. O que mudou: por bloco, o retângulo exato das mudanças (o resto do bloco, que o
+        //    controlador já tem certo, não é reenviado — texto parado ao lado de algo que se
+        //    mexe continua exato).
+        let mut dirty: Vec<Option<Rect>> =
+            if key { (0..n).map(|i| Some(self.tile_rect(i))).collect() } else { (0..n).map(|i| self.change_box(cur, i)).collect() };
 
         // 2. Rolagem.
-        if !key && dirty.iter().filter(|d| **d).count() >= 4 {
+        if !key && dirty.iter().filter(|d| d.is_some()).count() >= 4 {
             if let Some((x0, x1, y0, y1)) = self.dirty_bbox(&dirty) {
                 if y1 - y0 >= 2 * TILE {
                     if let Some((sy, dy, len)) = detect_scroll(&self.reference, cur, w, x0, x1, y0, y1) {
@@ -193,7 +246,7 @@ impl LrdEncoder {
                         for (i, d) in dirty.iter_mut().enumerate() {
                             let (_, ty, _, th) = self.tile_rect(i);
                             if ty + th > dy && ty < dy + len {
-                                *d = self.tile_differs(cur, i);
+                                *d = self.change_box(cur, i);
                             }
                         }
                     }
@@ -204,11 +257,13 @@ impl LrdEncoder {
         // 3. Classificação (em paralelo por faixas de linhas).
         for (i, d) in dirty.iter().enumerate() {
             let t = &mut self.tiles[i];
-            t.streak = if *d { t.streak.saturating_add(1) } else { 0 };
+            t.streak = if d.is_some() { t.streak.saturating_add(1) } else { 0 };
         }
         let classes = self.classify(cur, &dirty, key);
 
-        // 4. Agrupa blocos vizinhos da mesma classe em faixas horizontais.
+        // 4. Agrupa blocos vizinhos inteiros da mesma classe em faixas horizontais; blocos com
+        //    mudança parcial vão sozinhos, só com o retângulo alterado.
+        let full = |i: usize| dirty[i] == Some(self.tile_rect(i));
         let mut jobs: Vec<Job> = Vec::new();
         for r in 0..self.rows {
             let mut c = 0;
@@ -216,12 +271,23 @@ impl LrdEncoder {
                 let i = (r * self.cols + c) as usize;
                 let class = classes[i];
                 let mut end = c + 1;
-                while end < self.cols && classes[(r * self.cols + end) as usize] == class {
-                    end += 1;
+                let mixed = matches!(class, Class::Lossy { mask, .. } if mask != 0b1111);
+                if full(i) && !mixed {
+                    while end < self.cols
+                        && classes[(r * self.cols + end) as usize] == class
+                        && full((r * self.cols + end) as usize)
+                    {
+                        end += 1;
+                    }
                 }
-                let (x, y, _, th) = self.tile_rect(i);
-                let (lx, _, lw, _) = self.tile_rect((r * self.cols + end - 1) as usize);
-                let run_w = lx + lw - x;
+                let (x, y, run_w, th) = match dirty[i] {
+                    Some((bx, by, bw, bh)) if !full(i) => (bx, by, bw, bh),
+                    _ => {
+                        let (x, y, _, th) = self.tile_rect(i);
+                        let (lx, _, lw, _) = self.tile_rect((r * self.cols + end - 1) as usize);
+                        (x, y, lx + lw - x, th)
+                    }
+                };
                 match class {
                     Class::Clean => {}
                     Class::Fill(bgr) => {
@@ -232,9 +298,29 @@ impl LrdEncoder {
                         jobs.push(Job { kind: JobKind::Lossless, x, y, w: run_w, h: th });
                         stats.lossless += (end - c) as usize;
                     }
-                    Class::Lossy { .. } => {
+                    Class::Lossy { mask, .. } if mask == 0b1111 => {
                         jobs.push(Job { kind: JobKind::Jpeg(jpeg_quality), x, y, w: run_w, h: th });
                         stats.lossy += (end - c) as usize;
+                    }
+                    Class::Lossy { mask, .. } => {
+                        // Bloco misto: faixas de 16 colunas, juntando vizinhas do mesmo tipo.
+                        let (tx, _, _, _) = self.tile_rect(i);
+                        let mut s0 = 0u32;
+                        while s0 < 4 {
+                            let lossy = mask & (1 << s0) != 0;
+                            let mut s1 = s0 + 1;
+                            while s1 < 4 && (mask & (1 << s1) != 0) == lossy {
+                                s1 += 1;
+                            }
+                            let a = (tx + s0 * 16).max(x);
+                            let b = (tx + s1 * 16).min(x + run_w);
+                            if b > a {
+                                let kind = if lossy { JobKind::Jpeg(jpeg_quality) } else { JobKind::Lossless };
+                                jobs.push(Job { kind, x: a, y, w: b - a, h: th });
+                            }
+                            s0 = s1;
+                        }
+                        stats.lossy += 1;
                     }
                 }
                 c = end;
@@ -251,15 +337,18 @@ impl LrdEncoder {
                 continue;
             }
             stats.dirty_tiles += 1;
-            let (x, y, tw, th) = self.tile_rect(i);
-            copy_rect(cur, &mut self.reference, w, x, y, tw, th);
+            let Some((x, y, bw, bh)) = dirty[i] else { continue };
+            let whole = (x, y, bw, bh) == self.tile_rect(i);
+            copy_rect(cur, &mut self.reference, w, x, y, bw, bh);
             let t = &mut self.tiles[i];
             match class {
-                Class::Lossy { photo } => {
+                Class::Lossy { photo, .. } => {
                     t.lossy = true;
-                    t.photo = *photo;
+                    t.photo = *photo || (!whole && t.photo);
                     t.lossy_at = Some(now);
                 }
+                // Parte do bloco sem perdas: o resto pode continuar com perdas de antes.
+                _ if !whole => {}
                 _ => {
                     t.lossy = false;
                     t.photo = false;
@@ -280,7 +369,7 @@ impl LrdEncoder {
 
     /// Há blocos com perdas parados há tempo suficiente para refinar?
     pub fn refine_due(&self) -> bool {
-        self.tiles.iter().any(|t| t.lossy && t.lossy_at.is_some_and(|a| a.elapsed() >= self.refine_after))
+        self.tiles.iter().any(|t| t.lossy && t.streak == 0 && t.lossy_at.is_some_and(|a| a.elapsed() >= self.refine_after))
     }
 
     /// Reenvia sem perdas (ou JPEG quase perfeito, para fotos) os blocos parados.
@@ -294,7 +383,7 @@ impl LrdEncoder {
             if chosen >= REFINE_BATCH {
                 break;
             }
-            if t.lossy && t.lossy_at.is_some_and(|a| a.elapsed() >= self.refine_after) {
+            if t.lossy && t.streak == 0 && t.lossy_at.is_some_and(|a| a.elapsed() >= self.refine_after) {
                 mark[i] = Some(t.photo);
                 chosen += 1;
             }
@@ -357,20 +446,38 @@ impl LrdEncoder {
         wr.finish()
     }
 
-    fn tile_differs(&self, cur: &[u8], i: usize) -> bool {
+    /// Retângulo (x, y, w, h) dos pixels do bloco `i` diferentes do estado do controlador.
+    fn change_box(&self, cur: &[u8], i: usize) -> Option<Rect> {
         let (x, y, tw, th) = self.tile_rect(i);
         let stride = (self.width * 4) as usize;
         let (a, b) = ((x * 4) as usize, ((x + tw) * 4) as usize);
-        (y..y + th).any(|r| {
+        let (mut y0, mut y1, mut c0, mut c1) = (u32::MAX, 0u32, tw, 0u32);
+        for r in y..y + th {
             let o = r as usize * stride;
-            cur[o + a..o + b] != self.reference[o + a..o + b]
-        })
+            let (rc, rr) = (&cur[o + a..o + b], &self.reference[o + a..o + b]);
+            if rc == rr {
+                continue;
+            }
+            y0 = y0.min(r);
+            y1 = r + 1;
+            // Colunas: primeira e última diferentes nesta linha.
+            let first = rc.chunks_exact(4).zip(rr.chunks_exact(4)).position(|(p, q)| p[..3] != q[..3]);
+            let last = rc.chunks_exact(4).zip(rr.chunks_exact(4)).rposition(|(p, q)| p[..3] != q[..3]);
+            if let (Some(f), Some(l)) = (first, last) {
+                c0 = c0.min(f as u32);
+                c1 = c1.max(l as u32 + 1);
+            }
+        }
+        if y0 == u32::MAX || c1 <= c0 {
+            return None;
+        }
+        Some((x + c0, y0, c1 - c0, y1 - y0))
     }
 
-    fn dirty_bbox(&self, dirty: &[bool]) -> Option<(u32, u32, u32, u32)> {
+    fn dirty_bbox(&self, dirty: &[Option<Rect>]) -> Option<(u32, u32, u32, u32)> {
         let (mut x0, mut x1, mut y0, mut y1) = (u32::MAX, 0, u32::MAX, 0);
         for (i, d) in dirty.iter().enumerate() {
-            if *d {
+            if d.is_some() {
                 let (x, y, tw, th) = self.tile_rect(i);
                 x0 = x0.min(x);
                 y0 = y0.min(y);
@@ -381,7 +488,7 @@ impl LrdEncoder {
         (x0 < x1).then_some((x0, x1, y0, y1))
     }
 
-    fn classify(&self, cur: &[u8], dirty: &[bool], key: bool) -> Vec<Class> {
+    fn classify(&self, cur: &[u8], dirty: &[Option<Rect>], key: bool) -> Vec<Class> {
         let n = self.tiles.len();
         let out: Vec<Mutex<Class>> = (0..n).map(|_| Mutex::new(Class::Clean)).collect();
         let next = AtomicUsize::new(0);
@@ -398,20 +505,50 @@ impl LrdEncoder {
                         }
                         for c in 0..cols {
                             let i = r * cols + c;
-                            if !dirty[i] {
-                                continue;
-                            }
-                            let (x, y, tw, th) = self.tile_rect(i);
+                            let Some((x, y, tw, th)) = dirty[i] else { continue };
                             let (colors, first) = set.count(cur, self.width, x, y, tw, th, PHOTO_COLORS + 1);
                             let streak = self.tiles[i].streak;
-                            let class = if colors == 1 {
-                                Class::Fill(first)
+                            let lossy = if colors == 1 {
+                                None
                             } else if colors > PHOTO_COLORS {
-                                Class::Lossy { photo: true }
+                                Some(true)
                             } else if !key && colors > MOTION_COLORS && streak >= MOTION_STREAK {
-                                Class::Lossy { photo: false }
+                                Some(false)
                             } else {
-                                Class::Lossless
+                                None
+                            };
+                            let class = match lossy {
+                                None if colors == 1 => Class::Fill(first),
+                                None => Class::Lossless,
+                                Some(photo) => {
+                                    // Quais faixas de 16 colunas têm muitas cores.
+                                    let (tx, _, _, _) = self.tile_rect(i);
+                                    let mut mask = 0u8;
+                                    for st in 0..4u32 {
+                                        let a = (tx + st * 16).max(x);
+                                        let b = (tx + st * 16 + 16).min(x + tw);
+                                        if b <= a {
+                                            continue;
+                                        }
+                                        let (sc, _) = set.count(cur, self.width, a, y, b - a, th, STRIP_COLORS + 1);
+                                        if sc > STRIP_COLORS {
+                                            mask |= 1 << st;
+                                        }
+                                    }
+                                    // Faixas fora do retângulo alterado contam como "com perdas"
+                                    // para não quebrar a junção de blocos inteiros.
+                                    for st in 0..4u32 {
+                                        let (a, b) = (tx + st * 16, tx + st * 16 + 16);
+                                        if b <= x || a >= x + tw {
+                                            mask |= 1 << st;
+                                        }
+                                    }
+                                    if mask & full_strips(tx, x, tw) == 0 {
+                                        Class::Lossless
+                                    } else {
+                                        Class::Lossy { photo, mask }
+                                    }
+                                }
                             };
                             *out[i].lock().unwrap() = class;
                         }

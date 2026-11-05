@@ -342,6 +342,8 @@ impl Node {
         let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(1);
         // Áudio: fila curta; se a rede engasgar, blocos antigos são descartados na origem.
         let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(32);
+        // codecLRD: o controlador confirma cada quadro aplicado (canal de dados, mensagem 7).
+        let lrd_ack = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
         let capture = lrd_video::spawn_capture(
             CaptureParams {
                 display_id: Some(active.id),
@@ -355,6 +357,7 @@ impl Node {
                 })),
                 audio: if media.audio_allowed { Some(audio_tx) } else { None },
                 audio_enabled: media.audio_on,
+                lrd_ack: Some(lrd_ack.clone()),
             },
             frame_tx,
         );
@@ -466,7 +469,12 @@ impl Node {
         let geometry_dc = geometry.clone();
         let injector_dc = injector.clone();
         let last_move = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
+        let ack_dc = lrd_ack.clone();
         let dc_handler: crate::rtc::InputHandler = Arc::new(move |b: &[u8]| {
+            if b.len() >= 5 && b[0] == 7 {
+                ack_dc.store(u32::from_le_bytes([b[1], b[2], b[3], b[4]]), std::sync::atomic::Ordering::Relaxed);
+                return None;
+            }
             handle_dc_input(b, &perms_dc, &geometry_dc, injector_dc.as_deref(), &last_move)
         });
         let rtc_codecs = media.rtc_codecs;

@@ -126,9 +126,13 @@ fn synth(n: u64) -> RawFrame {
     RawFrame::cpu(W, H, data, PixelFormat::Bgra, lrd_protocol::now_us())
 }
 
-fn input_handler(c: Arc<Counters>) -> InputHandler {
+fn input_handler(c: Arc<Counters>, ack: Arc<std::sync::atomic::AtomicU32>) -> InputHandler {
     Arc::new(move |b: &[u8]| {
         match b.first()? {
+            7 if b.len() >= 5 => {
+                ack.store(u32::from_le_bytes([b[1], b[2], b[3], b[4]]), Ordering::Relaxed);
+                0
+            }
             1 => c.moves.fetch_add(1, Ordering::Relaxed),
             2 => c.buttons.fetch_add(1, Ordering::Relaxed),
             3 => c.keys.fetch_add(1, Ordering::Relaxed),
@@ -151,8 +155,10 @@ async fn start_rtc(st: &Arc<State>, browser_hevc: bool) -> anyhow::Result<String
     let (state_tx, mut state_rx) = tokio::sync::mpsc::unbounded_channel();
     let codecs = RtcCodecs { hevc: st.args.hevc && browser_hevc, no_fec: st.args.no_fec, lrd: st.args.lrd };
     *st.cap.lock().unwrap() = Some(cap_tx.clone());
+    let ack = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
     let (rtc, offer) =
-        RtcSender::start(cap_tx, st.args.bitrate, state_tx, input_handler(st.counters.clone()), codecs).await?;
+        RtcSender::start(cap_tx, st.args.bitrate, state_tx, input_handler(st.counters.clone(), ack.clone()), codecs)
+            .await?;
     *st.rtc.lock().await = Some(rtc.clone());
 
     // Codificador numa thread (como no app), quadros para a tarefa de envio.
@@ -166,6 +172,7 @@ async fn start_rtc(st: &Arc<State>, browser_hevc: bool) -> anyhow::Result<String
         if lrd {
             // codecLRD: nenhum quadro pode ser descartado depois de codificado (espera a fila).
             let mut enc = lrd_video::lrd::LrdEncoder::new();
+            enc.ack = Some(ack);
             let mut n = 0u64;
             let interval = Duration::from_micros(1_000_000 / FPS as u64);
             let mut next = Instant::now();
@@ -176,6 +183,18 @@ async fn start_rtc(st: &Arc<State>, browser_hevc: bool) -> anyhow::Result<String
                     }
                 }
                 let f = synth(n);
+                if !enc.ready() {
+                    // Controlador ainda aplicando: este quadro some (as mudanças vão no próximo).
+                    n += 1;
+                    next += interval;
+                    let now = Instant::now();
+                    if next > now {
+                        std::thread::sleep(next - now);
+                    } else {
+                        next = now;
+                    }
+                    continue;
+                }
                 let out = enc.encode(&f, q.jpeg_quality).or_else(|| enc.refine_due().then(|| enc.refine(lrd_protocol::now_us())).flatten());
                 if let Some(bytes) = out {
                     if let Ok(mut i) = info.lock() {
