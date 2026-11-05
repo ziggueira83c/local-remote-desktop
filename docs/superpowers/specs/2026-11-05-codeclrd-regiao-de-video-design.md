@@ -5,7 +5,7 @@
 
 ## 1. Objetivo
 
-Hoje, vídeo e jogo vão como JPEG quadro a quadro: ~227 KB por quadro 1080p, ou seja, 50+ Mbps a 30 qps. Esta mudança manda **só a região onde há vídeo/jogo** para o codificador de vídeo da placa (H.264), que envia apenas a diferença entre quadros. Texto e janelas continuam no codecLRD, sem perdas.
+Hoje, vídeo e jogo vão como JPEG quadro a quadro: ~227 KB por quadro 1080p, ou seja, 50+ Mbps a 30 qps. Esta mudança manda **só a região onde há vídeo/jogo** para o codificador de vídeo da placa (**H.265**, com H.264 só de reserva), que envia apenas a diferença entre quadros. Texto e janelas continuam no codecLRD, sem perdas.
 
 **Critérios de sucesso** (medidos no teste ponta a ponta do GitHub, Windows + Chrome, cenários 1920×1080):
 
@@ -20,16 +20,16 @@ No Safari (motor do app no Mac): o vídeo da região tem que ser decodificado e 
 
 **O que o usuário pediu:** reduzir a banda de vídeo e jogo bem abaixo de 50 Mbps e subir os quadros por segundo, sem perder o texto 100% nítido. Ele aceitou usar H.264/H.265 só dentro da região que se mexe.
 
-**Suposições minhas (corrigir se estiverem erradas):**
-- uma região de vídeo por vez basta (o maior vídeo da tela); um segundo vídeo simultâneo continua em JPEG;
-- H.264 apenas nesta versão (decodifica em todo WebView2 e Safari); H.265 fica para depois.
+**Decisões (aprovadas em 05/11, 15:58 — "pode decidir o melhor para desempenho sem perder qualidade; usar H.265"):**
+- **H.265 (HEVC)** é o codec da região. H.264 entra só como reserva automática quando um dos lados não suporta H.265 (codificador de hardware ausente no host, ou `VideoDecoder` sem HEVC no controlador).
+- Uma região de vídeo por vez (o maior vídeo da tela); um segundo vídeo simultâneo continua em JPEG.
 
 ## 2. Arquitetura
 
 ```text
 captura → LrdEncoder ─┬─ detector de região de vídeo (blocos em movimento contínuo)
                       ├─ fora da região: codecLRD de hoje (FILL / LZ4 / JPEG / COPY)
-                      └─ dentro da região: recorte → H264Encoder (NVENC / VideoToolbox / OpenH264)
+                      └─ dentro da região: recorte → H264Encoder em modo HEVC (NVENC / VideoToolbox; reserva H.264/OpenH264)
                          └─ operação nova VIDEO dentro do mesmo quadro codecLRD
 controlador → LrdDecoder ─┬─ operações de hoje (canvas)
                           └─ VIDEO → VideoDecoder (WebCodecs) → desenha o VideoFrame no retângulo
@@ -54,7 +54,7 @@ Tudo continua num quadro codecLRD só, pelo mesmo canal de dados confiável e or
 
 ### 2.3 Codificação da região
 
-- Recorte BGRA da região → `H264Encoder` (fachada atual: NVENC/QuickSync/AMF no Windows, VideoToolbox no Mac, OpenH264 de reserva), sempre H.264.
+- Recorte BGRA da região → `H264Encoder` (fachada atual) com `set_hevc(true)` quando o controlador decodifica H.265: NVENC HEVC (RTX 2060S) / VideoToolbox HEVC (Mac 2019). Se o hardware não tiver H.265, a fachada já cai para H.264 (e o OpenH264 é a última reserva). O codec usado vai marcado em cada operação.
 - Uma instância por região; recriada quando o tamanho muda. O primeiro quadro após criar é IDR.
 - **Taxa:** `bitrate_bps` do perfil de qualidade (Fluidez/Equilibrado/Nitidez) × fração da tela que a região ocupa, com piso de 1,5 Mbps. Exemplo: Equilibrado 8 Mbps, vídeo 720p em tela 1080p ⇒ ~3,6 Mbps.
 - Pedido de quadro completo do controlador (`Keyframe`) ⇒ IDR na região + quadro completo do codecLRD fora dela.
@@ -65,14 +65,18 @@ Tudo continua num quadro codecLRD só, pelo mesmo canal de dados confiável e or
 Operação nova, retrocompatível com o cabeçalho atual:
 
 ```text
-5 VIDEO : x y w h, u8 flags (bit 0 = IDR), u32 len, [unidade de acesso H.264 Annex B]
+5 VIDEO : x y w h, u8 flags (bit 0 = IDR, bit 1 = H.265), u32 len, [unidade de acesso Annex B]
 ```
 
-O host só usa VIDEO se o controlador declarar o codec `lrd-video` no Hello. O controlador declara apenas se `VideoDecoder.isConfigSupported({codec: "avc1.42E033", optimizeForLatency: true})` for verdadeiro. Sem isso, tudo segue como hoje.
+O controlador declara no Hello:
+- `lrd-video` se decodifica H.264: `VideoDecoder.isConfigSupported({codec: "avc1.42E033", optimizeForLatency: true})`;
+- `lrd-video-h265` se decodifica H.265: o mesmo teste com `codec: "hvc1.1.6.L120.B0"`.
+
+O host só usa VIDEO com `lrd-video` e só pede H.265 ao codificador com `lrd-video-h265`. Sem nenhum dos dois, tudo segue como hoje.
 
 ### 2.5 Decodificação (`lrdcodec.ts`)
 
-- Um `VideoDecoder` por região. É configurado no IDR com `codec` derivado do SPS (perfil/nível) e `codedWidth/Height = w×h`, com `optimizeForLatency: true`.
+- Um `VideoDecoder` por região. É configurado no IDR com o codec indicado no bit 1 (`hvc1.1.6.L120.B0` para H.265 Main; `avc1` com perfil/nível do SPS para H.264), `codedWidth/Height = w×h` e `optimizeForLatency: true`. Mudança de codec ou de tamanho ⇒ reconfigura no próximo IDR.
 - Ao aplicar o quadro: entrega a unidade de acesso e **espera o `VideoFrame` correspondente**. Não há quadros B, então sai 1 para 1. Depois desenha com `drawImage(frame, x, y, w, h)`, fecha o frame e só então aplica as demais operações e confirma o quadro.
 - Erro do decodificador ou quadro não-IDR sem decodificador configurado ⇒ pede quadro completo (caminho já existente).
 
@@ -96,7 +100,6 @@ O host só usa VIDEO se o controlador declarar o codec `lrd-video` no Hello. O c
 - Áreas alteradas e janelas movidas informadas pelo Windows/macOS.
 - Cópia 2D (arrastar janela).
 - Renderizador WebGL.
-- H.265.
 - Mais de uma região de vídeo.
 - Captura direta da GPU para a região: o recorte é feito na CPU, porque o quadro já está na memória para o codecLRD.
 
