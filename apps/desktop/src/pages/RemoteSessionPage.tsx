@@ -26,6 +26,7 @@ export function RemoteSessionPage() {
   const [audioBlocked, setAudioBlocked] = useState(false);
   const [rtc, setRtc] = useState<RtcStats | null>(null);
   const [lat, setLat] = useState<LatencyStats | null>(null);
+  const [lrdStats, setLrdStats] = useState<{ fps: number; kbps: number } | null>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
   const enhancerRef = useRef<Enhancer | null>(null);
   const [enhance, setEnhance] = useState(false);
@@ -116,7 +117,7 @@ export function RemoteSessionPage() {
 
   // Estatísticas do WebRTC (FPS, banda, latência, perdas) a cada segundo.
   useEffect(() => {
-    if (mediaMode !== "webrtc") {
+    if (mediaMode !== "webrtc" && mediaMode !== "lrd") {
       setRtc(null);
       return;
     }
@@ -127,6 +128,7 @@ export function RemoteSessionPage() {
         .then(setRtc)
         .catch(() => {});
       setLat(engine?.latency() ?? null);
+      setLrdStats(engine?.lrdStats() ?? null);
     }, 1000);
     return () => clearInterval(t);
   }, [mediaMode]);
@@ -443,6 +445,8 @@ export function RemoteSessionPage() {
               ? rtc
                 ? `WebRTC · ${rtc.fps.toFixed(0)} fps · ${(rtc.kbps / 1000).toFixed(1)} Mbps · ${(rtc.rttMs ?? metrics?.rttMs ?? 0).toFixed(0)} ms${lat?.glassMs != null ? ` · atraso ${lat.glassMs.toFixed(0)} ms` : ""}${rtc.lossPct >= 0.5 ? ` · perda ${rtc.lossPct.toFixed(1)}%` : ""}`
                 : "WebRTC"
+              : mediaMode === "lrd"
+                ? `codecLRD · ${lrdStats ? `${lrdStats.fps.toFixed(0)} fps · ${(lrdStats.kbps / 1000).toFixed(1)} Mbps` : "—"}${lat?.glassMs != null ? ` · atraso ${lat.glassMs.toFixed(0)} ms` : ""}`
               : `${mediaMode === "quic" ? (outbound.videoCodec === "h264" ? "H.264" : "JPEG") : "Conectando mídia"} · ${
                   metrics ? `${metrics.fps.toFixed(0)} fps · ${(metrics.kbps / 1000).toFixed(1)} Mbps · ${metrics.rttMs.toFixed(0)} ms` : "—"
                 }`}

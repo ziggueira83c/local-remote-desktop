@@ -106,8 +106,13 @@ impl Node {
         let rtc_codecs = crate::rtc::RtcCodecs {
             hevc: hello.codecs.iter().any(|c| c == lrd_protocol::codec::WEBRTC_H265),
             no_fec: false,
+            lrd: viewer_lrd,
         };
-        let codec = if viewer_webrtc || viewer_h264 {
+        // codecLRD (próprio) sempre que o controlador entende; senão H.264/JPEG.
+        let viewer_lrd = hello.codecs.iter().any(|c| c == lrd_protocol::codec::LRD);
+        let codec = if viewer_lrd {
+            VideoCodec::Lrd
+        } else if viewer_webrtc || viewer_h264 {
             VideoCodec::H264
         } else {
             VideoCodec::JpegTiles
@@ -302,6 +307,7 @@ impl Node {
             video_codec: match codec {
                 VideoCodec::H264 => lrd_protocol::codec::H264.into(),
                 VideoCodec::JpegTiles => lrd_protocol::codec::JPEG_TILES.into(),
+                VideoCodec::Lrd => lrd_protocol::codec::LRD.into(),
             },
             audio_enabled: audio_on,
         };
@@ -392,6 +398,11 @@ impl Node {
                 let via_quic = match &r {
                     Route::Pending => false,
                     Route::Quic => true,
+                    Route::Rtc(rtc) if media.codec == VideoCodec::Lrd => {
+                        // codecLRD e cursor pelo canal de dados (ordem garantida, direto ao JS).
+                        rtc.write_media(&frame).await;
+                        false
+                    }
                     Route::Rtc(rtc) => {
                         if frame[0] == lrd_protocol::video::FRAME_H264 {
                             rtc.write_video(&frame).await;
@@ -468,7 +479,7 @@ impl Node {
                 *route_r.lock().unwrap() = Route::Quic;
                 // O caminho QUIC (WebCodecs) decodifica só H.264.
                 let _ = cap_r.send(CaptureCmd::SetHevc(false));
-                if !media.viewer_h264 {
+                if media.codec != VideoCodec::Lrd && !media.viewer_h264 {
                     let _ = cap_r.send(CaptureCmd::SetCodec(VideoCodec::JpegTiles));
                 }
                 let _ = cap_r.send(CaptureCmd::Keyframe);

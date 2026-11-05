@@ -10,6 +10,7 @@ serde.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 image.workspace = true
+lz4_flex.workspace = true
 xcap.workspace = true
 openh264.workspace = true
 openh264-sys2.workspace = true
@@ -36,3 +37,6 @@ windows-sys.workspace = true
 screencapturekit.workspace = true
 core-foundation = "0.9"
 core-foundation-sys = "0.8"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(lrd_stub)"] }

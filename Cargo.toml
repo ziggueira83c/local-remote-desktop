@@ -50,6 +50,7 @@ if-addrs = "0.13"
 gethostname = "0.5"
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
+lz4_flex = "0.11"
 xcap = "0.9"
 openh264 = "0.9"
 openh264-sys2 = "0.9"

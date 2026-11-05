@@ -152,6 +152,7 @@ pub fn validate_frame(buf: &[u8]) -> bool {
                 && buf[1] <= 8
                 && (buf.len() - AUDIO_HEADER_LEN) % (2 * buf[1] as usize) == 0
         }
+        Some(&crate::lrd::FRAME_LRD) => crate::lrd::parse(buf).is_some(),
         Some(&FRAME_TILES) => {
             if buf.len() < TILES_HEADER_LEN {
                 return false;

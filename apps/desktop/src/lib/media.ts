@@ -3,11 +3,12 @@
 // - tipo 3: H.264 decodificado por hardware via WebCodecs
 // - tipo 4: áudio PCM (AudioPlayer)
 // Vídeo e áudio são apresentados no mesmo instante calculado por AvSync.
+import { FRAME_LRD, LrdDecoder } from "./lrdcodec";
 import { AudioPlayer } from "./audio";
 import { FrameRenderer, toBytes, type CursorState } from "./renderer";
 import { AvSync } from "./sync";
 
-export type MediaMode = "pending" | "webrtc" | "quic";
+export type MediaMode = "pending" | "webrtc" | "quic" | "lrd";
 
 export interface RtcStats {
   fps: number;
@@ -45,7 +46,8 @@ export interface MediaCallbacks {
 
 /** Codecs que esta interface consegue decodificar, em ordem de preferência. */
 export async function supportedCodecs(): Promise<string[]> {
-  const out = ["jpeg-tiles"];
+  // codecLRD primeiro: é o codec próprio do app (decodificado aqui mesmo, sem depender do navegador).
+  const out = ["lrd", "jpeg-tiles"];
   if (typeof RTCPeerConnection !== "undefined") {
     out.unshift("webrtc");
     try {
@@ -107,6 +109,13 @@ export class MediaEngine {
   private clock: { offsetMs: number; rttMs: number; at: number }[] = [];
   private inputRtt: number[] = [];
   private glass: number[] = [];
+  private lrd: LrdDecoder | null = null;
+  private lrdChain: Promise<void> = Promise.resolve();
+  private lrdBacklog = 0;
+  private chunks: Uint8Array[] = [];
+  private lrdFrames = 0;
+  private lrdBytes = 0;
+  private lrdMark = { time: performance.now(), frames: 0, bytes: 0 };
   private lastStats: { bytes: number; time: number; lost: number; recv: number } | null = null;
 
   constructor(audioCtx: AudioContext | null) {
@@ -172,6 +181,27 @@ export class MediaEngine {
         this.heldPointer = null;
         if (held && dc.readyState === "open") dc.send(held as unknown as ArrayBuffer);
       };
+    } else if (dc.label === "video") {
+      // Quadros do codecLRD (e cursor) em pedaços: 1º byte bit 7 = início, bit 6 = fim.
+      dc.onmessage = (ev) => {
+        const b = new Uint8Array(ev.data as ArrayBuffer);
+        if (b.length === 0) return;
+        if (b[0] & 0x80) this.chunks = [];
+        this.chunks.push(b.subarray(1));
+        if (b[0] & 0x40) {
+          const parts = this.chunks;
+          this.chunks = [];
+          let n = 0;
+          for (const p of parts) n += p.length;
+          const frame = new Uint8Array(n);
+          let o = 0;
+          for (const p of parts) {
+            frame.set(p, o);
+            o += p.length;
+          }
+          this.push(frame);
+        }
+      };
     } else if (dc.label === "input") {
       this.dcInput = dc;
       dc.onmessage = (ev) => this.onControlMessage(new Uint8Array(ev.data as ArrayBuffer));
@@ -236,6 +266,20 @@ export class MediaEngine {
     if (this.glass.length > 60) this.glass.shift();
   }
 
+  /** Quadros/s e banda do codecLRD desde a última chamada. */
+  lrdStats(): { fps: number; kbps: number } | null {
+    if (this.mode !== "lrd") return null;
+    const now = performance.now();
+    const dt = (now - this.lrdMark.time) / 1000;
+    if (dt <= 0) return null;
+    const r = {
+      fps: (this.lrdFrames - this.lrdMark.frames) / dt,
+      kbps: ((this.lrdBytes - this.lrdMark.bytes) * 8) / 1000 / dt,
+    };
+    this.lrdMark = { time: now, frames: this.lrdFrames, bytes: this.lrdBytes };
+    return r;
+  }
+
   latency(): LatencyStats {
     const median = (a: number[]) => {
       if (a.length === 0) return null;
@@ -243,7 +287,7 @@ export class MediaEngine {
       return s[Math.floor(s.length / 2)];
     };
     return {
-      glassMs: this.mode === "webrtc" ? median(this.glass) : null,
+      glassMs: this.mode === "webrtc" || this.mode === "lrd" ? median(this.glass) : null,
       inputRttMs: median(this.inputRtt),
       directInput: this.dcInput?.readyState === "open",
     };
@@ -376,6 +420,7 @@ export class MediaEngine {
     this.ctx = canvas.getContext("2d", { alpha: false });
     this.cb = cb;
     this.tiles = new FrameRenderer(canvas, cb.onResize, cb.onCursor, () => this.requestKeyframe(), cb.onDrawn);
+    this.lrd = new LrdDecoder(canvas, cb.onResize, () => this.requestKeyframe());
     const queued = this.pending;
     this.pending = [];
     for (const f of queued) this.route(f);
@@ -390,6 +435,7 @@ export class MediaEngine {
     this.canvas = null;
     this.ctx = null;
     this.tiles = null;
+    this.lrd = null;
     this.cb = null;
   }
 
@@ -430,9 +476,46 @@ export class MediaEngine {
     this.route(bytes);
   }
 
+  private pushLrd(bytes: Uint8Array) {
+    const dec = this.lrd;
+    if (!dec) return;
+    if (this.lrdBacklog > 90) {
+      // A tela daqui não acompanha: descarta e recomeça de um quadro completo.
+      dec.reset();
+      this.requestKeyframe();
+      return;
+    }
+    this.lrdBacklog++;
+    this.lrdBytes += bytes.length;
+    this.lrdChain = this.lrdChain
+      .then(() => dec.apply(bytes))
+      .then((info) => {
+        if (!info) return;
+        this.lrdFrames++;
+        const off = this.clockOffset();
+        if (off != null) {
+          const ms = performance.timeOrigin + performance.now() + off - info.captureUs / 1000;
+          if (ms >= 0 && ms < 5000) {
+            this.glass.push(ms);
+            if (this.glass.length > 60) this.glass.shift();
+          }
+        }
+        this.cb?.onDrawn();
+      })
+      .catch((e) => console.warn("codecLRD", e))
+      .finally(() => {
+        this.lrdBacklog--;
+      });
+  }
+
   private route(bytes: Uint8Array) {
+    if (bytes[0] === FRAME_LRD) {
+      this.setMode("lrd");
+      this.pushLrd(bytes);
+      return;
+    }
     // Mídia chegando pelo QUIC = modo de reserva (o cursor chega pelo QUIC nos dois modos).
-    if (bytes[0] === 1 || bytes[0] === 3) this.setMode("quic");
+    if ((bytes[0] === 1 || bytes[0] === 3) && this.mode !== "lrd") this.setMode("quic");
     if (bytes[0] === 3) this.pushH264(bytes);
     else this.tiles?.push(bytes);
   }

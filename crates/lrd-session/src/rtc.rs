@@ -60,6 +60,8 @@ pub type InputHandler = Arc<dyn Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync>;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RtcCodecs {
     pub hevc: bool,
+    /// Vídeo em codecLRD pelo canal de dados "video" (sem faixa de vídeo RTP).
+    pub lrd: bool,
     /// Desliga a proteção FEC (que só liga com LRD_FEC=1, experimental).
     pub no_fec: bool,
 }
@@ -74,8 +76,8 @@ pub enum RtcState {
 
 pub struct RtcSender {
     pc: Arc<RTCPeerConnection>,
-    video: Arc<VideoTrack>,
-    pacer: Pacer,
+    video: Option<(Arc<VideoTrack>, Pacer)>,
+    media_dc: Arc<RTCDataChannel>,
     audio: Arc<TrackLocalStaticSample>,
     opus: tokio::sync::Mutex<OpusState>,
     _channels: Vec<Arc<RTCDataChannel>>,
@@ -176,7 +178,7 @@ impl RtcSender {
             .build();
         let pc = Arc::new(api.new_peer_connection(RTCConfiguration { ice_servers: vec![], ..Default::default() }).await?);
 
-        let video = Arc::new(VideoTrack::new());
+        let video = (!codecs.lrd).then(|| Arc::new(VideoTrack::new()));
         let audio = Arc::new(TrackLocalStaticSample::new(
             RTCRtpCodecCapability {
                 mime_type: MIME_TYPE_OPUS.to_owned(),
@@ -188,11 +190,33 @@ impl RtcSender {
             "audio".to_owned(),
             "lrd".to_owned(),
         ));
-        let video_sender = pc.add_track(Arc::clone(&video) as Arc<dyn TrackLocal + Send + Sync>).await?;
+        let video_sender = match &video {
+            Some(v) => Some(pc.add_track(Arc::clone(v) as Arc<dyn TrackLocal + Send + Sync>).await?),
+            None => None,
+        };
         let audio_sender = pc.add_track(Arc::clone(&audio) as Arc<dyn TrackLocal + Send + Sync>).await?;
 
-        let pacer = Pacer::start(video.clone(), max_bitrate);
-        tokio::spawn(rate_control(video_sender, cap_cmds, max_bitrate, pacer.target_bps.clone()));
+        let video = match (video, video_sender) {
+            (Some(v), Some(sender)) => {
+                let pacer = Pacer::start(v.clone(), max_bitrate);
+                tokio::spawn(rate_control(sender, cap_cmds.clone(), max_bitrate, pacer.target_bps.clone()));
+                Some((v, pacer))
+            }
+            _ => None,
+        };
+
+        // Canal da mídia do codecLRD (confiável e ordenado: cada quadro depende do anterior).
+        let media_dc = pc
+            .create_data_channel("video", Some(RTCDataChannelInit { ordered: Some(true), ..Default::default() }))
+            .await?;
+        {
+            let cap = cap_cmds.clone();
+            media_dc.on_open(Box::new(move || {
+                // Canal aberto: começa com uma tela completa.
+                let _ = cap.send(CaptureCmd::Keyframe);
+                Box::pin(async {})
+            }));
+        }
 
         // Canais de dados para a entrada (criados aqui para entrarem na oferta).
         let pointer = pc
@@ -247,7 +271,7 @@ impl RtcSender {
         let sender = Arc::new(RtcSender {
             pc,
             video,
-            pacer,
+            media_dc,
             audio,
             opus: tokio::sync::Mutex::new(OpusState { encoder: None, pending: Vec::new(), resampler: Resampler::default() }),
             _channels: vec![pointer, reliable],
@@ -262,7 +286,10 @@ impl RtcSender {
 
     /// (H.264, H.265, FEC) negociados com o navegador. Válido depois de conectar.
     pub async fn negotiated(&self) -> (bool, bool, bool) {
-        self.video.negotiated().await
+        match &self.video {
+            Some((v, _)) => v.negotiated().await,
+            None => (false, false, false),
+        }
     }
 
     /// Envia um quadro H.264/H.265 no formato de `lrd_protocol::video` (o cabeçalho é removido).
@@ -272,13 +299,44 @@ impl RtcSender {
             return;
         }
         let capture_us = u64::from_le_bytes(frame[6..14].try_into().unwrap());
-        self.pacer
+        let Some((_, pacer)) = &self.video else { return };
+        pacer
             .send(OutFrame {
                 annexb: Bytes::copy_from_slice(&frame[H264_HEADER_LEN..]),
                 hevc: frame[1] & FLAG_HEVC != 0,
                 capture_us,
             })
             .await;
+    }
+
+    /// Envia um quadro (codecLRD, cursor) pelo canal de dados "video", em pedaços de até
+    /// 16 KiB (limite seguro de mensagem do SCTP em todos os navegadores). Primeiro byte de
+    /// cada pedaço: bit 7 = início do quadro, bit 6 = fim. Com a fila do canal cheia, espera
+    /// (a captura junta as mudanças enquanto isso — nada se perde).
+    pub async fn write_media(&self, frame: &[u8]) {
+        const CHUNK: usize = 16 * 1024 - 1;
+        const MAX_BUFFERED: usize = 2 * 1024 * 1024;
+        let dc = &self.media_dc;
+        let mut waited = 0;
+        while dc.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open {
+            if waited > 3000 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            waited += 5;
+        }
+        while dc.buffered_amount().await > MAX_BUFFERED {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let n = frame.len().div_ceil(CHUNK).max(1);
+        for (i, part) in frame.chunks(CHUNK).enumerate() {
+            let mut b = Vec::with_capacity(part.len() + 1);
+            b.push(if i == 0 { 0x80 } else { 0 } | if i == n - 1 { 0x40 } else { 0 });
+            b.extend_from_slice(part);
+            if dc.send(&Bytes::from(b)).await.is_err() {
+                return;
+            }
+        }
     }
 
     /// Recebe PCM (formato de `lrd_protocol::video`), converte para 48 kHz estéreo e envia em Opus.

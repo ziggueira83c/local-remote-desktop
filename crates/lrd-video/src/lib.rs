@@ -14,6 +14,7 @@ pub mod color;
 pub mod encoder;
 pub mod frame;
 pub mod h264;
+pub mod lrd;
 #[cfg(target_os = "macos")]
 mod hw_mac;
 #[cfg(target_os = "windows")]

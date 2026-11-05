@@ -37,6 +37,8 @@ pub enum CaptureCmd {
 pub enum VideoCodec {
     H264,
     JpegTiles,
+    /// codecLRD: codec próprio de tela (blocos sem perdas/JPEG/cópia de rolagem).
+    Lrd,
 }
 
 /// Cursor do computador acessado: posição global (coordenadas do SO), formato e visibilidade.
@@ -110,6 +112,7 @@ pub fn spawn_capture(params: CaptureParams, out: mpsc::Sender<Vec<u8>>) -> Captu
 enum Encoder {
     H264(H264Encoder),
     Tiles(TileEncoder),
+    Lrd(Box<crate::lrd::LrdEncoder>),
 }
 
 impl Encoder {
@@ -122,11 +125,18 @@ impl Encoder {
                 if e.zero_copy() { " · direto da GPU" } else { "" }
             ),
             Encoder::Tiles(_) => "JPEG (tiles)".into(),
+            Encoder::Lrd(e) => {
+                let l = e.last;
+                format!("codecLRD · {}/{} blocos · {} cópia(s)", l.dirty_tiles, l.total_tiles, l.copies)
+            }
         }
     }
 }
 
 fn make_encoder(codec: VideoCodec, q: &QualitySettings, hevc: bool) -> Encoder {
+    if codec == VideoCodec::Lrd {
+        return Encoder::Lrd(Box::new(crate::lrd::LrdEncoder::new()));
+    }
     if codec == VideoCodec::H264 {
         match H264Encoder::new(q) {
             Ok(mut e) => {
@@ -159,6 +169,9 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
     let mut display_id = display_id;
     let mut audio_enabled = audio_enabled && audio.is_some();
     let mut hevc = false;
+    let mut lrd_bytes: u64 = 0;
+    let mut lrd_rate: u32 = 0;
+    let mut lrd_rate_at = Instant::now();
     let mut encoder = make_encoder(codec, &quality, hevc);
     let mut source: Option<Source> = None;
     let mut win_audio: Option<crate::audio::AudioCapture> = None;
@@ -321,6 +334,22 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
             continue;
         }
 
+        // codecLRD: blocos enviados com perdas que pararam de mudar voltam sem perdas.
+        if pending.is_none() && !want_keyframe {
+            if let Encoder::Lrd(enc) = &mut encoder {
+                if enc.refine_due() {
+                    if let Some(bytes) = enc.refine(lrd_protocol::now_us()) {
+                        lrd_bytes += bytes.len() as u64;
+                        last_sent = Instant::now();
+                        if out.blocking_send(bytes).is_err() {
+                            return;
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+
         // Tela parada: refina com um quadro completo em alta qualidade.
         let mut refine_now = false;
         if pending.is_none() && !want_keyframe && !refined && last_change.elapsed() >= IDLE_REFINE_AFTER {
@@ -343,7 +372,7 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
         // senão, cópia para a memória + redução na CPU.
         let native_ok = match &mut encoder {
             Encoder::H264(e) => e.prepare_native(&raw, tw, th),
-            Encoder::Tiles(_) => false,
+            Encoder::Tiles(_) | Encoder::Lrd(_) => false,
         };
         let frame = if native_ok { raw } else { resize(raw, tw, th) };
 
@@ -369,6 +398,16 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
                 }
                 enc.encode(&frame, quality.jpeg_quality)
             }
+            Encoder::Lrd(enc) => {
+                if want_keyframe {
+                    enc.force_keyframe();
+                }
+                let r = enc.encode(&frame, quality.jpeg_quality);
+                if let Some(b) = &r {
+                    lrd_bytes += b.len() as u64;
+                }
+                r
+            }
         };
         let took = started.elapsed();
         want_keyframe = false;
@@ -385,6 +424,16 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
             st.bitrate_bps = match &encoder {
                 Encoder::H264(e) => e.bitrate(),
                 Encoder::Tiles(_) => 0,
+                Encoder::Lrd(_) => {
+                    // Taxa real enviada (média do último segundo).
+                    let dt = lrd_rate_at.elapsed().as_secs_f64();
+                    if dt >= 1.0 {
+                        lrd_rate = (lrd_bytes as f64 * 8.0 / dt) as u32;
+                        lrd_bytes = 0;
+                        lrd_rate_at = Instant::now();
+                    }
+                    lrd_rate
+                }
             };
         }
 

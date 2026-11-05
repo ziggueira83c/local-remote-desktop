@@ -31,6 +31,7 @@ struct Args {
     seconds: u64,
     hevc: bool,
     no_fec: bool,
+    lrd: bool,
     bitrate: u32,
 }
 
@@ -42,6 +43,7 @@ fn args() -> Args {
         seconds: 12,
         hevc: false,
         no_fec: false,
+        lrd: false,
         bitrate: 6_000_000,
     };
     let v: Vec<String> = std::env::args().collect();
@@ -56,6 +58,11 @@ fn args() -> Args {
             "--bitrate" => a.bitrate = next().parse().unwrap(),
             "--hevc" => {
                 a.hevc = true;
+                i += 1;
+                continue;
+            }
+            "--lrd" => {
+                a.lrd = true;
                 i += 1;
                 continue;
             }
@@ -85,6 +92,7 @@ struct State {
     rtc: tokio::sync::Mutex<Option<Arc<RtcSender>>>,
     counters: Arc<Counters>,
     encoder_info: Arc<Mutex<(String, bool, u64)>>,
+    cap: Mutex<Option<std::sync::mpsc::Sender<CaptureCmd>>>,
     started: Mutex<Option<Instant>>,
 }
 
@@ -141,7 +149,8 @@ fn input_handler(c: Arc<Counters>) -> InputHandler {
 async fn start_rtc(st: &Arc<State>, browser_hevc: bool) -> anyhow::Result<String> {
     let (cap_tx, cap_rx) = std::sync::mpsc::channel::<CaptureCmd>();
     let (state_tx, mut state_rx) = tokio::sync::mpsc::unbounded_channel();
-    let codecs = RtcCodecs { hevc: st.args.hevc && browser_hevc, no_fec: st.args.no_fec };
+    let codecs = RtcCodecs { hevc: st.args.hevc && browser_hevc, no_fec: st.args.no_fec, lrd: st.args.lrd };
+    *st.cap.lock().unwrap() = Some(cap_tx.clone());
     let (rtc, offer) =
         RtcSender::start(cap_tx, st.args.bitrate, state_tx, input_handler(st.counters.clone()), codecs).await?;
     *st.rtc.lock().await = Some(rtc.clone());
@@ -149,10 +158,44 @@ async fn start_rtc(st: &Arc<State>, browser_hevc: bool) -> anyhow::Result<String
     // Codificador numa thread (como no app), quadros para a tarefa de envio.
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
     let want_hevc = codecs.hevc;
+    let lrd = codecs.lrd;
     let bitrate = st.args.bitrate;
     let info = st.encoder_info.clone();
     std::thread::spawn(move || {
         let q = QualitySettings { jpeg_quality: 80, max_width: W, max_fps: FPS, bitrate_bps: bitrate };
+        if lrd {
+            // codecLRD: nenhum quadro pode ser descartado depois de codificado (espera a fila).
+            let mut enc = lrd_video::lrd::LrdEncoder::new();
+            let mut n = 0u64;
+            let interval = Duration::from_micros(1_000_000 / FPS as u64);
+            let mut next = Instant::now();
+            loop {
+                while let Ok(cmd) = cap_rx.try_recv() {
+                    if let CaptureCmd::Keyframe = cmd {
+                        enc.force_keyframe();
+                    }
+                }
+                let f = synth(n);
+                let out = enc.encode(&f, q.jpeg_quality).or_else(|| enc.refine_due().then(|| enc.refine(lrd_protocol::now_us())).flatten());
+                if let Some(bytes) = out {
+                    if let Ok(mut i) = info.lock() {
+                        let l = enc.last;
+                        *i = (format!("codecLRD {}/{} blocos, {} cópias, {} B", l.dirty_tiles, l.total_tiles, l.copies, l.bytes), false, 0);
+                    }
+                    if frame_tx.blocking_send(bytes).is_err() {
+                        return;
+                    }
+                }
+                n += 1;
+                next += interval;
+                let now = Instant::now();
+                if next > now {
+                    std::thread::sleep(next - now);
+                } else {
+                    next = now;
+                }
+            }
+        }
         let mut enc = H264Encoder::new(&q).expect("codificador");
         enc.set_hevc(want_hevc);
         let mut n = 0u64;
@@ -191,7 +234,11 @@ async fn start_rtc(st: &Arc<State>, browser_hevc: bool) -> anyhow::Result<String
     let rtc_send = rtc.clone();
     tokio::spawn(async move {
         while let Some(f) = frame_rx.recv().await {
-            rtc_send.write_video(&f).await;
+            if lrd {
+                rtc_send.write_media(&f).await;
+            } else {
+                rtc_send.write_video(&f).await;
+            }
         }
     });
     tokio::spawn(async move {
@@ -253,7 +300,10 @@ async fn handle(mut sock: TcpStream, st: Arc<State>) {
             Err(e) => respond(&mut sock, "500 Error", "text/plain", e.to_string().as_bytes()).await,
         },
         ("GET", "/config") => {
-            let cfg = format!(r#"{{"seconds":{},"hevc":{},"fec":{}}}"#, st.args.seconds, st.args.hevc, !st.args.no_fec);
+            let cfg = format!(
+                r#"{{"seconds":{},"hevc":{},"fec":{},"lrd":{}}}"#,
+                st.args.seconds, st.args.hevc, !st.args.no_fec, st.args.lrd
+            );
             respond(&mut sock, "200 OK", "application/json", cfg.as_bytes()).await
         }
         ("GET", "/offer") => {
@@ -274,6 +324,13 @@ async fn handle(mut sock: TcpStream, st: Arc<State>) {
                 Ok(()) => respond(&mut sock, "200 OK", "text/plain", b"ok").await,
                 Err(e) => respond(&mut sock, "500 Error", "text/plain", e.as_bytes()).await,
             }
+        }
+        ("GET", "/keyframe") => {
+            if let Some(c) = st.cap.lock().unwrap().as_ref() {
+                let _ = c.send(CaptureCmd::Keyframe);
+            }
+            println!("PAGE pediu quadro completo");
+            respond(&mut sock, "200 OK", "text/plain", b"ok").await
         }
         ("POST", "/log") => {
             println!("PAGE {body}");
@@ -327,6 +384,7 @@ async fn main() -> anyhow::Result<()> {
         rtc: tokio::sync::Mutex::new(None),
         counters: Arc::new(Counters::default()),
         encoder_info: Arc::new(Mutex::new((String::new(), false, 0))),
+        cap: Mutex::new(None),
         started: Mutex::new(None),
     });
     println!("LISTENING");

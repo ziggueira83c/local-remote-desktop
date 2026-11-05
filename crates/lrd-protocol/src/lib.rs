@@ -6,6 +6,7 @@
 
 pub mod framing;
 pub mod messages;
+pub mod lrd;
 pub mod video;
 
 pub use messages::*;
@@ -50,6 +51,8 @@ pub mod codec {
     pub const WEBRTC: &str = "webrtc";
     /// O controlador decodifica H.265 no WebRTC (com hardware).
     pub const WEBRTC_H265: &str = "webrtc-h265";
+    /// codecLRD: codec próprio de tela (ver `crate::lrd`).
+    pub const LRD: &str = "lrd";
 }
 
 /// Relógio monotônico do processo em microssegundos. Vídeo e áudio usam o mesmo relógio

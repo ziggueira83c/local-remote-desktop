@@ -8,6 +8,7 @@ const wanted = (process.argv[3] ?? "chromium,webkit").split(",");
 const SECONDS = 12;
 
 const configs = [
+  { name: "codecLRD", args: ["--lrd"], lrd: true },
   { name: "H.264", args: [] },
   { name: "H.264, 3% de perda", args: [], env: { LRD_TEST_DROP_PCT: "3" }, lossy: true },
   { name: "H.265 (se suportado)", args: ["--hevc"] },
@@ -115,7 +116,8 @@ for (const bname of wanted) {
     // Os Macs do GitHub são máquinas virtuais (codificador lento, ~16 quadros/s).
     if (!(pg.fps >= (process.platform === "darwin" ? 12 : 20))) problems.push(`fps ${pg.fps?.toFixed(1)}`);
     if (pg.freezes > (cfg.lossy ? 4 : 1)) problems.push(`${pg.freezes} travadas`);
-    if (!cfg.lossy && host.bitrateBps < 3_000_000) problems.push(`taxa caiu para ${(host.bitrateBps / 1e6).toFixed(1)} Mbps`);
+    if (cfg.lrd && !(pg.exactPct >= 99.9)) problems.push(`pixels exatos ${pg.exactPct?.toFixed(1)}%`);
+    if (!cfg.lossy && !cfg.lrd && host.bitrateBps < 3_000_000) problems.push(`taxa caiu para ${(host.bitrateBps / 1e6).toFixed(1)} Mbps`);
     if (pg.width !== 1280) problems.push(`largura ${pg.width}`);
     if (!pg.directInput) problems.push("comandos fora do canal direto");
     if (host.moves < pg.sentDirect * 0.8) problems.push(`movimentos ${host.moves}/${pg.sentDirect}`);
@@ -133,6 +135,7 @@ for (const bname of wanted) {
       pg.glassMs?.toFixed(0) ?? "-",
       pg.inputRttMs?.toFixed(1) ?? "-",
       pg.sharpness?.toFixed(0) ?? "-",
+      pg.exactPct != null ? pg.exactPct.toFixed(1) + "%" : "-",
       problems.join("; "),
     ]);
     if (problems.length && !cfg.informative) failures++;
@@ -140,6 +143,6 @@ for (const bname of wanted) {
   await browser.close();
 }
 
-console.log("\nnavegador | caso | resultado | codec | fps | travadas | atraso ms | comando ida/volta ms | nitidez | problemas");
+console.log("\nnavegador | caso | resultado | codec | fps | travadas | atraso ms | comando ida/volta ms | nitidez | exatos | problemas");
 for (const r of rows) console.log(r.join(" | "));
 process.exit(failures ? 1 : 0);

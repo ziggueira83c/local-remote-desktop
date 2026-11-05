@@ -4,6 +4,7 @@
 <body style="margin:0;background:#000">
 <video id="v" playsinline autoplay muted style="width:1280px;height:720px"></video>
 <canvas id="c" width="1280" height="720" style="display:none"></canvas>
+<canvas id="lrdc" width="16" height="16"></canvas>
 <script type="module">
 import { MediaEngine } from "/media.js";
 
@@ -19,6 +20,17 @@ const sdp = await (await fetch("/offer?h265=" + (h265 ? 1 : 0))).text();
 const engine = new MediaEngine(null);
 const video = document.getElementById("v");
 engine.attachVideo(video);
+const lrdCanvas = document.getElementById("lrdc");
+// Modo codecLRD: a tela é desenhada no <canvas> pelo decodificador do app.
+let lrdDrawn = null;
+engine.attach(lrdCanvas, {
+  onMode: (m) => log("modo: " + m),
+  onAudioBlocked: () => {},
+  onResize: (w, h) => log(`tamanho ${w}x${h}`),
+  onCursor: () => {},
+  onKeyframeNeeded: () => fetch("/keyframe"),
+  onDrawn: () => lrdDrawn?.(),
+});
 const answer = await engine.acceptOffer(sdp);
 const cands = (answer.match(/a=candidate:[^\r\n]*/g) || []).map((c) => c.split(" ").slice(4, 8).join(" "));
 log("candidatos locais: " + (cands.join(" | ") || "nenhum"));
@@ -49,10 +61,12 @@ const onFrame = (now, meta) => {
   }
   last = t;
   frames++;
+  if (cfg.lrd) return;
   engine.noteVideoFrame(meta);
   video.requestVideoFrameCallback(onFrame);
 };
-if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(onFrame);
+if (cfg.lrd) lrdDrawn = () => onFrame(0, {});
+else if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(onFrame);
 else log("sem requestVideoFrameCallback");
 
 // --- comandos pelo canal de dados ---
@@ -78,12 +92,27 @@ const clickTimer = setInterval(() => {
 const canvas = document.getElementById("c");
 const ctx = canvas.getContext("2d", { willReadFrequently: true });
 const sharpSamples = [];
+const exactSamples = [];
+const srcW = () => (cfg.lrd ? lrdCanvas.width : video.videoWidth);
+const srcH = () => (cfg.lrd ? lrdCanvas.height : video.videoHeight);
 const sharpTimer = setInterval(() => {
-  if (!video.videoWidth) return;
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
-  ctx.drawImage(video, 0, 0);
-  const sx = video.videoWidth / 1280, sy = video.videoHeight / 720;
+  if (srcW() < 100) return;
+  canvas.width = srcW();
+  canvas.height = srcH();
+  ctx.drawImage(cfg.lrd ? lrdCanvas : video, 0, 0);
+  if (srcW() === 1280) {
+    // Pixels exatos do xadrez (região parada): sem perdas ⇒ 100%.
+    const e = ctx.getImageData(100, 100, 256, 128).data;
+    let ok = 0;
+    for (let yy = 0; yy < 128; yy++)
+      for (let xx = 0; xx < 256; xx++) {
+        const want = (((100 + xx) >> 1) + ((100 + yy) >> 1)) % 2 === 0 ? 255 : 0;
+        const i = (yy * 256 + xx) * 4;
+        if (e[i] === want && e[i + 1] === want && e[i + 2] === want) ok++;
+      }
+    exactSamples.push((ok / (256 * 128)) * 100);
+  }
+  const sx = srcW() / 1280, sy = srcH() / 720;
   const d = ctx.getImageData(Math.round(110 * sx), Math.round(110 * sy), Math.round(200 * sx), Math.round(100 * sy)).data;
   const w = Math.round(200 * sx);
   let sum = 0, n = 0;
@@ -127,8 +156,9 @@ const dur = (last - first) / 1000;
 const result = {
   ua: navigator.userAgent,
   browserH265: h265,
-  codec, decoder,
-  width: video.videoWidth, height: video.videoHeight,
+  codec: cfg.lrd ? "codecLRD" : codec, decoder,
+  width: srcW(), height: srcH(),
+  exactPct: exactSamples.length ? exactSamples[exactSamples.length - 1] : null,
   fps: dur > 0 ? frames / dur : 0,
   frames, freezes, maxGapMs: Math.round(maxGap),
   p95GapMs: sorted.length ? Math.round(sorted[Math.floor(sorted.length * 0.95)]) : null,
