@@ -119,6 +119,7 @@ for (const bname of wanted) {
         ((l.kbPerFrame * 8 * (pg.fps || 0)) / 1000).toFixed(1), l.encodeMsAvg, l.encodeMsMax, l.sendMsAvg,
         pg.lrdApplyMsAvg?.toFixed(1), pg.lrdApplyMsP95?.toFixed(1), pg.lrdQueueApplyMsAvg?.toFixed(1),
         l.deferred, l.copies, l.lz4Mpx, l.jpegMpx, pg.inputRttMs?.toFixed(1) ?? "-",
+        `${l.videoKbPerFrame ?? 0} KB/q vídeo (${l.videoHevcFrames ?? 0}/${l.videoFrames ?? 0} H.265, decod. ${pg.lrdVideoCodec ?? "-"})`,
         pg.lrdProf ? `ops ${pg.lrdProf.opsPerFrame.toFixed(0)} · LZ4 ${pg.lrdProf.lz4Ms.toFixed(1)} · JPEG espera ${pg.lrdProf.jpegDecodeWaitMs.toFixed(1)} · JPEG desenho ${pg.lrdProf.jpegDrawMs.toFixed(1)} · cópia ${pg.lrdProf.copyMs.toFixed(1)} · cor ${pg.lrdProf.fillMs.toFixed(1)}` : "-",
       ]);
       continue;
@@ -166,7 +167,7 @@ for (const bname of wanted) {
 
 if (scenarioRows.length) {
   console.log("\nCENÁRIOS codecLRD");
-  console.log("navegador | cenário | qps | atraso ms | KB/quadro | Mbps | codificar ms (média) | codificar ms (máx) | envio ms | aplicar ms (média) | aplicar ms (p95) | fila+aplicar ms | adiados | cópias | LZ4 Mpx/q | JPEG Mpx/q | comando ms | decodificador ms/quadro");
+  console.log("navegador | cenário | qps | atraso ms | KB/quadro | Mbps | codificar ms (média) | codificar ms (máx) | envio ms | aplicar ms (média) | aplicar ms (p95) | fila+aplicar ms | adiados | cópias | LZ4 Mpx/q | JPEG Mpx/q | comando ms | região de vídeo | decodificador ms/quadro");
   for (const r of scenarioRows) console.log(r.join(" | "));
 }
 console.log("\nnavegador | caso | resultado | codec | fps | travadas | atraso ms | comando ida/volta ms | nitidez | exatos | problemas");

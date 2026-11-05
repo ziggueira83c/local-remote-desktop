@@ -6,7 +6,7 @@
 <canvas id="c" width="1280" height="720" style="display:none"></canvas>
 <canvas id="lrdc" width="16" height="16"></canvas>
 <script type="module">
-import { MediaEngine } from "/media.js";
+import { MediaEngine, supportedCodecs } from "/media.js";
 
 const log = (m) => fetch("/log", { method: "POST", body: String(m) });
 window.onerror = (e) => log("erro: " + e);
@@ -16,7 +16,11 @@ let h265 = false;
 try {
   h265 = !!RTCRtpReceiver.getCapabilities("video")?.codecs.some((c) => c.mimeType.toLowerCase() === "video/h265");
 } catch {}
-const sdp = await (await fetch("/offer?h265=" + (h265 ? 1 : 0))).text();
+const caps = await supportedCodecs();
+const lrdvideo = caps.includes("lrd-video") ? 1 : 0;
+const lrdh265 = caps.includes("lrd-video-h265") ? 1 : 0;
+log(`capacidades: ${caps.join(",")}`);
+const sdp = await (await fetch(`/offer?h265=${h265 ? 1 : 0}&lrdvideo=${lrdvideo}&lrdh265=${lrdh265}`)).text();
 const engine = new MediaEngine(null);
 const video = document.getElementById("v");
 engine.attachVideo(video);
@@ -158,6 +162,7 @@ const p95 = (a) => (a.length ? [...a].sort((x, y) => x - y)[Math.floor(a.length 
 const lt = engine.lrdTimes;
 const result = {
   lrdApplyMsAvg: avg(lt.apply), lrdApplyMsP95: p95(lt.apply),
+  lrdVideoCodec: engine.lrdVideoCodec(), lrdVideo: lrdvideo, lrdVideoH265Supported: lrdh265,
   lrdQueueApplyMsAvg: avg(lt.queueAndApply), lrdResets: lt.resets,
   lrdProf: (() => {
     const p = engine.lrdProfile();

@@ -61,7 +61,15 @@ export async function supportedCodecs(): Promise<string[]> {
   try {
     if (typeof VideoDecoder !== "undefined") {
       const r = await VideoDecoder.isConfigSupported({ codec: "avc1.42E033", optimizeForLatency: true });
-      if (r.supported) out.unshift("h264");
+      if (r.supported) {
+        out.unshift("h264");
+        // codecLRD com região de vídeo (H.265 de preferência, H.264 de reserva).
+        out.push("lrd-video");
+        const h = await VideoDecoder.isConfigSupported({ codec: "hvc1.1.6.L120.B0", optimizeForLatency: true }).catch(
+          () => ({ supported: false }),
+        );
+        if (h.supported) out.push("lrd-video-h265");
+      }
     }
   } catch {
     /* sem WebCodecs */
@@ -271,6 +279,11 @@ export class MediaEngine {
   /** Diagnóstico do decodificador codecLRD (ms acumulados por etapa). */
   lrdProfile() {
     return this.lrd?.prof ?? null;
+  }
+
+  /** Codec da região de vídeo do codecLRD, se houver. */
+  lrdVideoCodec(): string | null {
+    return this.lrd?.videoCodec ?? null;
   }
 
   /** Quadros/s e banda do codecLRD desde a última chamada. */

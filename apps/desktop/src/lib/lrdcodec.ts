@@ -9,6 +9,12 @@ const OP_FILL = 1;
 const OP_LZ4 = 2;
 const OP_JPEG = 3;
 const OP_COPY = 4;
+const OP_VIDEO = 5;
+const VIDEO_IDR = 1;
+const VIDEO_HEVC = 2;
+/** Codecs da região de vídeo (WebCodecs). */
+export const REGION_CODEC_H264 = "avc1.42E033";
+export const REGION_CODEC_H265 = "hvc1.1.6.L120.B0";
 const FILTER_LEFT = 1;
 
 /** Descompressão de um bloco LZ4 (formato "block", sem cabeçalho de frame). */
@@ -68,7 +74,8 @@ type Op =
   | (Rect & { kind: typeof OP_FILL; b: number; g: number; r: number })
   | (Rect & { kind: typeof OP_LZ4; filter: number; rawLen: number; data: Uint8Array })
   | (Rect & { kind: typeof OP_JPEG; img: Promise<ImageBitmap> })
-  | (Rect & { kind: typeof OP_COPY; sx: number; sy: number });
+  | (Rect & { kind: typeof OP_COPY; sx: number; sy: number })
+  | (Rect & { kind: typeof OP_VIDEO; flags: number; data: Uint8Array });
 
 export interface LrdFrameInfo {
   keyframe: boolean;
@@ -80,7 +87,14 @@ export interface LrdFrameInfo {
 
 export class LrdDecoder {
   /** Diagnóstico: ms acumulados por tipo de operação e quantidade de operações. */
-  prof = { fill: 0, lz4: 0, jpeg: 0, copy: 0, jpegWait: 0, ops: 0, frames: 0 };
+  prof = { fill: 0, lz4: 0, jpeg: 0, copy: 0, jpegWait: 0, video: 0, ops: 0, frames: 0 };
+  /** Codec da região de vídeo em uso ("hvc1…"/"avc1…"), para diagnóstico. */
+  videoCodec: string | null = null;
+  // Região de vídeo: decodificador (WebCodecs) e onde desenhar cada quadro decodificado.
+  private vdec: VideoDecoder | null = null;
+  private vconfig = "";
+  private vrects = new Map<number, Rect>();
+  private vwaiter: (() => void) | null = null;
   private expected = -1;
   private waitingKey = true;
   private ctx: CanvasRenderingContext2D | null;
@@ -148,7 +162,16 @@ export class LrdDecoder {
     const ctx = this.ctx;
     if (!ctx) return null;
     try {
-      ops.forEach((o, i) => this.draw(ctx, o, bitmaps[i]));
+      // Quadro sem vídeo: termina de desenhar o vídeo pendente antes (senão um quadro de
+      // vídeo atrasado poderia cobrir a área que acabou de voltar sem perdas).
+      if (this.vdec && !ops.some((o) => o.kind === OP_VIDEO) && this.vdec.decodeQueueSize + this.vrects.size > 0) {
+        await this.vdec.flush().catch(() => {});
+      }
+      for (let i = 0; i < ops.length; i++) {
+        const o = ops[i];
+        if (o.kind === OP_VIDEO) await this.video(o, info.frameId);
+        else this.draw(ctx, o, bitmaps[i]);
+      }
     } catch (e) {
       console.warn("codecLRD: falha ao desenhar", e);
       this.waitingKey = true;
@@ -160,7 +183,69 @@ export class LrdDecoder {
     return info;
   }
 
+  /**
+   * Entrega a unidade de acesso ao decodificador de vídeo. O quadro decodificado é desenhado
+   * no retângulo dele assim que sai (callback `output`); aqui espera no máximo um pouco por
+   * ele, para o quadro ficar pronto junto com o resto quando o decodificador é rápido.
+   */
+  private async video(o: Extract<Op, { kind: typeof OP_VIDEO }>, frameId: number) {
+    const t0 = performance.now();
+    const idr = (o.flags & VIDEO_IDR) !== 0;
+    const codec = o.flags & VIDEO_HEVC ? REGION_CODEC_H265 : REGION_CODEC_H264;
+    const config = `${codec}|${o.w}|${o.h}`;
+    if (idr && (config !== this.vconfig || !this.vdec || this.vdec.state !== "configured")) {
+      this.closeVideo();
+      const dec = new VideoDecoder({
+        output: (frame) => {
+          const r = this.vrects.get(frame.timestamp);
+          this.vrects.delete(frame.timestamp);
+          if (r && this.ctx && dec === this.vdec) this.ctx.drawImage(frame, r.x, r.y, r.w, r.h);
+          frame.close();
+          const wake = this.vwaiter;
+          this.vwaiter = null;
+          wake?.();
+        },
+        error: (e) => {
+          console.warn("codecLRD: erro no decodificador de vídeo", e);
+          if (dec === this.vdec) {
+            this.closeVideo();
+            this.waitingKey = true;
+            this.needKeyframe();
+          }
+        },
+      });
+      dec.configure({ codec, codedWidth: o.w, codedHeight: o.h, optimizeForLatency: true });
+      this.vdec = dec;
+      this.vconfig = config;
+      this.videoCodec = codec;
+    }
+    if (!this.vdec || this.vconfig !== config) {
+      throw new Error("vídeo sem quadro inicial (IDR)");
+    }
+    // Timestamp único por quadro (o frame_id do codecLRD), usado para achar o retângulo.
+    this.vrects.set(frameId, { x: o.x, y: o.y, w: o.w, h: o.h });
+    const done = new Promise<void>((resolve) => {
+      this.vwaiter = resolve;
+      setTimeout(resolve, 40);
+    });
+    this.vdec.decode(new EncodedVideoChunk({ type: idr ? "key" : "delta", timestamp: frameId, data: o.data }));
+    await done;
+    this.prof.video += performance.now() - t0;
+  }
+
+  private closeVideo() {
+    try {
+      this.vdec?.close();
+    } catch {
+      /* já fechado */
+    }
+    this.vdec = null;
+    this.vconfig = "";
+    this.vrects.clear();
+  }
+
   reset() {
+    this.closeVideo();
     this.waitingKey = true;
     this.expected = -1;
   }
@@ -211,6 +296,15 @@ export class LrdDecoder {
           o += 4;
           if (!inside(sx, sy, w, h)) throw new Error("cópia fora do quadro");
           ops.push({ kind, x, y, w, h, sx, sy });
+          break;
+        }
+        case OP_VIDEO: {
+          const flags = b[o];
+          const len = v.getUint32(o + 1, true);
+          o += 5;
+          if (o + len > b.length) throw new Error("vídeo truncado");
+          ops.push({ kind, x, y, w, h, flags, data: b.subarray(o, o + len) });
+          o += len;
           break;
         }
         default:
