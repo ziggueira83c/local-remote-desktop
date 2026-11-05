@@ -366,6 +366,7 @@ async fn rate_control(
     let mut last_increase = Instant::now();
     let mut last_congestion = Instant::now() - Duration::from_secs(10);
     let mut remb_prev: Option<f64> = None;
+    let mut remb_caught_up = false;
 
     while let Ok((packets, _)) = sender.read_rtcp().await {
         let mut desired = target;
@@ -379,7 +380,12 @@ async fn rate_control(
             } else if let Some(r) = any.downcast_ref::<ReceiverEstimatedMaximumBitrate>() {
                 let r = r.bitrate as f64;
                 if r.is_finite() && r > 0.0 {
-                    if let Some(prev) = remb_prev {
+                    // O REMB só vale como sinal depois de ter alcançado a taxa atual (antes disso
+                    // ele está apenas subindo devagar, e oscilações iniciais não são congestionamento).
+                    if r >= target as f64 * 0.8 {
+                        remb_caught_up = true;
+                    }
+                    if let (Some(prev), true) = (remb_prev, remb_caught_up) {
                         // Queda brusca = fila crescendo na rede: segue a estimativa.
                         if r < prev * 0.85 && (r as u32) < target {
                             desired = desired.min((r * 0.9) as u32);
@@ -398,7 +404,7 @@ async fn rate_control(
                         && last_increase.elapsed() > Duration::from_secs(1)
                         && last_congestion.elapsed() > Duration::from_secs(3)
                     {
-                        desired = desired.max(((target as f32) * 1.15) as u32);
+                        desired = desired.max(((target as f32) * 1.25) as u32);
                         last_increase = Instant::now();
                     }
                 }
