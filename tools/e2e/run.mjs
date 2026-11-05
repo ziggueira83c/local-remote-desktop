@@ -40,10 +40,28 @@ function runHost(port, cfg) {
   });
 }
 
+// Navegador com a mesma interface mínima: newPage() → { goto, close }.
 const launchers = {
   chromium: () =>
     chromium.launch({ args: ["--autoplay-policy=no-user-gesture-required", "--use-fake-ui-for-media-stream"] }),
   webkit: () => webkit.launch(),
+  // Safari de verdade (mesmo motor do WKWebView do app no Mac), via safaridriver.
+  safari: async () => {
+    const { Builder } = await import("selenium-webdriver");
+    const driver = await new Builder().forBrowser("safari").build();
+    return {
+      newPage: async () => ({
+        on: () => {},
+        goto: (url) => driver.get(url),
+        close: async () => {
+          try {
+            await driver.get("about:blank");
+          } catch {}
+        },
+      }),
+      close: () => driver.quit(),
+    };
+  },
 };
 
 const rows = [];
@@ -65,7 +83,7 @@ for (const bname of wanted) {
     const page = await browser.newPage();
     page.on("console", (m) => console.log("    console:", m.text()));
     page.on("pageerror", (e) => console.log("    pageerror:", e.message));
-    await page.goto(`http://127.0.0.1:${port}/`);
+    page.goto(`http://127.0.0.1:${port}/`).catch((e) => console.log("    goto:", e.message));
     let res;
     try {
       res = (await done).result;
@@ -85,6 +103,9 @@ for (const bname of wanted) {
     console.log("   host:", JSON.stringify(host));
     console.log("   page:", JSON.stringify(pg));
     const hevcCase = cfg.args.includes("--hevc");
+    if (!pg.directInput && pg.frames === 0) {
+      console.log("   (conexão WebRTC não se formou neste navegador)");
+    }
     if (hevcCase && !host.negH265) {
       console.log("   (H.265 não negociado neste navegador/máquina — caso ignorado)");
       rows.push([bname, cfg.name, "ignorado", "", "", "", "", "", ""]);

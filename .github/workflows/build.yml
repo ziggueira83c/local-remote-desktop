@@ -108,7 +108,7 @@ jobs:
         include:
           - name: mac
             os: macos-latest
-            browsers: webkit,chromium
+            browsers: safari,chromium
             exe: rtc_e2e
           - name: windows
             os: windows-latest
@@ -131,7 +131,8 @@ jobs:
         shell: bash
         run: |
           npm install --no-fund --no-audit
-          npx playwright install ${{ matrix.browsers == 'chromium' && 'chromium' || 'chromium webkit' }}
+          npx playwright install chromium
+          if [ "$RUNNER_OS" = "macOS" ]; then sudo safaridriver --enable; fi
           npx esbuild ../../apps/desktop/src/lib/media.ts --bundle --format=esm --target=es2021 --outfile=dist/media.js
       - name: Rodar
         shell: bash

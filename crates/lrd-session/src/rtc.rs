@@ -149,6 +149,10 @@ impl RtcSender {
         )?;
 
         let mut registry = Registry::new();
+        // Só em testes: perda simulada, registrada antes do NACK (fica mais perto da rede).
+        if let Some(pct) = std::env::var("LRD_TEST_DROP_PCT").ok().and_then(|v| v.parse::<u32>().ok()) {
+            registry.add(Box::new(crate::test_loss::LossBuilder { pct }));
+        }
         registry = configure_nack(registry, &mut media);
         registry = configure_rtcp_reports(registry);
 

@@ -65,6 +65,7 @@ const inputTimer = setInterval(() => {
 }, 20);
 let clicks = 0;
 const clickTimer = setInterval(() => {
+  if (!engine.latency().directInput) return; // só conta o que foi pelo canal direto
   engine.sendInput({ type: "button", button: 0, pressed: true });
   engine.sendInput({ type: "button", button: 0, pressed: false });
   engine.sendInput({ type: "key", hid: 0x04, pressed: true });

@@ -154,8 +154,6 @@ const MIN_PACING_BPS: u64 = 60_000_000;
 
 async fn run(track: Arc<VideoTrack>, mut rx: mpsc::Receiver<OutFrame>, target_bps: Arc<AtomicU32>) {
     let mut seq: u16 = rand_u16();
-    let test_drop = std::env::var("LRD_TEST_DROP_PCT").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
-    let mut rng_state = seq as u32 | 1;
     while let Some(frame) = rx.recv().await {
         let Some(b) = track.binding.lock().await.clone() else { continue };
         let pt = if frame.hevc { b.pt_h265 } else { b.pt_h264 };
@@ -222,15 +220,6 @@ async fn run(track: Arc<VideoTrack>, mut rx: mpsc::Receiver<OutFrame>, target_bp
                 }
             }
             sent += p.payload.len() + 12;
-            if test_drop > 0 {
-                // Teste de perdas (só com LRD_TEST_DROP_PCT): xorshift simples.
-                rng_state ^= rng_state << 13;
-                rng_state ^= rng_state >> 17;
-                rng_state ^= rng_state << 5;
-                if rng_state % 100 < test_drop {
-                    continue;
-                }
-            }
             if let Err(e) = b.writer.write_rtp(&p).await {
                 tracing::debug!("RTP: {e}");
             }

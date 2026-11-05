@@ -8,6 +8,7 @@ mod node;
 pub mod rtc;
 #[doc(hidden)]
 pub mod rtp_video;
+mod test_loss;
 mod viewer;
 
 use std::path::PathBuf;
