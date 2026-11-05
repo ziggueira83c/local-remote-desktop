@@ -155,8 +155,8 @@ mod tests {
             let f = frame("video-tela-cheia", 3);
             let rgb: Vec<u8> = f.data.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
             for (name, func) in [
-                ("jpeg-encoder (novo)", super::backend::jpeg_encode as fn(&[u8], u32, u32, u8) -> Option<Vec<u8>>),
-                ("image (antigo)", super::backend::jpeg_encode_image_crate),
+                ("jpeg-encoder (novo)", super::super::backend::jpeg_encode as fn(&[u8], u32, u32, u8) -> Option<Vec<u8>>),
+                ("image (antigo)", super::super::backend::jpeg_encode_image_crate),
             ] {
                 let t = std::time::Instant::now();
                 let mut size = 0;

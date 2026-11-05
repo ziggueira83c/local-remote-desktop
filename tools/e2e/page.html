@@ -159,6 +159,12 @@ const lt = engine.lrdTimes;
 const result = {
   lrdApplyMsAvg: avg(lt.apply), lrdApplyMsP95: p95(lt.apply),
   lrdQueueApplyMsAvg: avg(lt.queueAndApply), lrdResets: lt.resets,
+  lrdProf: (() => {
+    const p = engine.lrdProfile();
+    if (!p || !p.frames) return null;
+    const f = p.frames;
+    return { opsPerFrame: p.ops / f, fillMs: p.fill / f, lz4Ms: p.lz4 / f, jpegDrawMs: p.jpeg / f, jpegDecodeWaitMs: p.jpegWait / f, copyMs: p.copy / f };
+  })(),
   ua: navigator.userAgent,
   browserH265: h265,
   codec: cfg.lrd ? "codecLRD" : codec, decoder,

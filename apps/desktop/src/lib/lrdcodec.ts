@@ -79,6 +79,8 @@ export interface LrdFrameInfo {
 }
 
 export class LrdDecoder {
+  /** Diagnóstico: ms acumulados por tipo de operação e quantidade de operações. */
+  prof = { fill: 0, lz4: 0, jpeg: 0, copy: 0, jpegWait: 0, ops: 0, frames: 0 };
   private expected = -1;
   private waitingKey = true;
   private ctx: CanvasRenderingContext2D | null;
@@ -138,7 +140,11 @@ export class LrdDecoder {
       this.onResize(info.width, info.height);
     }
     // JPEGs decodificam em paralelo; as operações são aplicadas na ordem do quadro.
+    const tWait = performance.now();
     const bitmaps = await Promise.all(ops.map((o) => (o.kind === OP_JPEG ? o.img : null)));
+    this.prof.jpegWait += performance.now() - tWait;
+    this.prof.ops += ops.length;
+    this.prof.frames++;
     const ctx = this.ctx;
     if (!ctx) return null;
     try {
@@ -216,6 +222,17 @@ export class LrdDecoder {
   }
 
   private draw(ctx: CanvasRenderingContext2D, o: Op, bitmap: ImageBitmap | null) {
+    const t0 = performance.now();
+    this.drawOp(ctx, o, bitmap);
+    const dt = performance.now() - t0;
+    const p = this.prof;
+    if (o.kind === OP_FILL) p.fill += dt;
+    else if (o.kind === OP_LZ4) p.lz4 += dt;
+    else if (o.kind === OP_JPEG) p.jpeg += dt;
+    else p.copy += dt;
+  }
+
+  private drawOp(ctx: CanvasRenderingContext2D, o: Op, bitmap: ImageBitmap | null) {
     switch (o.kind) {
       case OP_FILL:
         ctx.fillStyle = `rgb(${o.r},${o.g},${o.b})`;

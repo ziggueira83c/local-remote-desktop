@@ -268,6 +268,11 @@ export class MediaEngine {
     if (this.glass.length > 60) this.glass.shift();
   }
 
+  /** Diagnóstico do decodificador codecLRD (ms acumulados por etapa). */
+  lrdProfile() {
+    return this.lrd?.prof ?? null;
+  }
+
   /** Quadros/s e banda do codecLRD desde a última chamada. */
   lrdStats(): { fps: number; kbps: number } | null {
     if (this.mode !== "lrd") return null;
