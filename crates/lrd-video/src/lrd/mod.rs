@@ -689,7 +689,8 @@ const MERGE_ROWS: u32 = 4;
 
 /// Junta retângulos do mesmo tipo empilhados exatamente (mesmo x e largura, um logo abaixo
 /// do outro) em retângulos maiores: menos operações para o controlador decodificar.
-fn merge_vertical(mut jobs: Vec<Job>) -> Vec<Job> {
+fn merge_vertical(jobs: Vec<Job>) -> Vec<Job> {
+    let mut jobs = merge_horizontal(jobs);
     if jobs.len() < 2 {
         return jobs;
     }
@@ -707,6 +708,32 @@ fn merge_vertical(mut jobs: Vec<Job>) -> Vec<Job> {
             let same_kind = key(last).0 == key(&j).0 && key(last).1 == key(&j).1;
             if same_kind && last.x == j.x && last.w == j.w && last.y + last.h == j.y && last.h + j.h <= MERGE_ROWS * TILE {
                 last.h += j.h;
+                continue;
+            }
+        }
+        out.push(j);
+    }
+    out
+}
+
+/// Junta retângulos do mesmo tipo lado a lado (mesmo y e altura, encostados): as bordas
+/// de cima/baixo de uma região que não começa no alinhamento dos blocos viram uma faixa só.
+fn merge_horizontal(mut jobs: Vec<Job>) -> Vec<Job> {
+    if jobs.len() < 2 {
+        return jobs;
+    }
+    let kind = |j: &Job| -> (u8, u8) {
+        match j.kind {
+            JobKind::Lossless => (0, 0),
+            JobKind::Jpeg(q) => (1, q),
+        }
+    };
+    jobs.sort_by_key(|j| (kind(j), j.y, j.h, j.x));
+    let mut out: Vec<Job> = Vec::with_capacity(jobs.len());
+    for j in jobs {
+        if let Some(last) = out.last_mut() {
+            if kind(last) == kind(&j) && last.y == j.y && last.h == j.h && last.x + last.w == j.x {
+                last.w += j.w;
                 continue;
             }
         }

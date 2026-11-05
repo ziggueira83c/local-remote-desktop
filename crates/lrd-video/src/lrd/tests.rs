@@ -261,3 +261,34 @@ fn video_region_uses_few_large_operations() {
     // 6 linhas de blocos ⇒ no máximo 2 retângulos (até 4 linhas de blocos por operação).
     assert!(ops.len() <= 2, "{} operações para um vídeo retangular", ops.len());
 }
+
+#[test]
+fn unaligned_video_region_uses_few_operations() {
+    // Vídeo fora do alinhamento dos blocos (x 100..740, y 40..424).
+    let f = |t: u32| frame(1024, 512, move |x, y| if (100..740).contains(&x) && (40..424).contains(&y) { noisy(x, y, t) } else { ui(x, y, 0) });
+    let mut enc = LrdEncoder::new();
+    enc.encode(&f(0), 60).unwrap();
+    let mut last = Vec::new();
+    for t in 1..5 {
+        last = enc.encode(&f(t), 60).unwrap();
+    }
+    let (_, ops) = lrd_protocol::lrd::parse(&last).unwrap();
+    assert!(ops.len() <= 12, "{} operações para um vídeo retangular desalinhado", ops.len());
+    // E continua exato onde não é vídeo.
+    let mut frames = vec![];
+    let mut enc2 = LrdEncoder::new();
+    for t in 0..5 {
+        frames.push(enc2.encode(&f(t), 60).unwrap());
+    }
+    let (fb, _) = decode(&frames);
+    let want = f(4);
+    for y in 0..512usize {
+        for x in 0..1024usize {
+            let inside = (96..752).contains(&x) && (0..448).contains(&y);
+            if !inside {
+                let o = (y * 1024 + x) * 4;
+                assert_eq!(fb[o..o + 3], want.data[o..o + 3], "pixel ({x},{y})");
+            }
+        }
+    }
+}
