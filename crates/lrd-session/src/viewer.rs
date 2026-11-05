@@ -150,6 +150,7 @@ impl Node {
             .filter(|c| {
                 *c == lrd_protocol::codec::WEBRTC
                     || *c == lrd_protocol::codec::WEBRTC_H265
+                    || *c == lrd_protocol::codec::LRD
                     || *c == lrd_protocol::codec::H264
                     || *c == lrd_protocol::codec::JPEG_TILES
             })
@@ -326,7 +327,7 @@ impl Node {
                             conn_r.close(quinn::VarInt::from_u32(1), reason::PROTOCOL_ERROR.as_bytes());
                             return;
                         }
-                        if frame[0] == FRAME_TILES || frame[0] == FRAME_H264 {
+                        if frame[0] == FRAME_TILES || frame[0] == FRAME_H264 || frame[0] == lrd_protocol::lrd::FRAME_LRD {
                             stats_r.frames.fetch_add(1, Ordering::Relaxed);
                         }
                         stats_r.bytes.fetch_add(frame.len() as u64, Ordering::Relaxed);

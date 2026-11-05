@@ -103,13 +103,13 @@ impl Node {
         // WebRTC sempre usa H.264. Sem WebRTC: H.264 via WebCodecs se possível, senão JPEG.
         let viewer_webrtc = hello.codecs.iter().any(|c| c == lrd_protocol::codec::WEBRTC);
         let viewer_h264 = hello.codecs.iter().any(|c| c == lrd_protocol::codec::H264);
+        let viewer_lrd = hello.codecs.iter().any(|c| c == lrd_protocol::codec::LRD);
         let rtc_codecs = crate::rtc::RtcCodecs {
             hevc: hello.codecs.iter().any(|c| c == lrd_protocol::codec::WEBRTC_H265),
             no_fec: false,
             lrd: viewer_lrd,
         };
         // codecLRD (próprio) sempre que o controlador entende; senão H.264/JPEG.
-        let viewer_lrd = hello.codecs.iter().any(|c| c == lrd_protocol::codec::LRD);
         let codec = if viewer_lrd {
             VideoCodec::Lrd
         } else if viewer_webrtc || viewer_h264 {
