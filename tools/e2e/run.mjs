@@ -17,7 +17,7 @@ const configs = [
 function runHost(port, cfg) {
   return new Promise((resolve, reject) => {
     const p = spawn(bin, ["--port", String(port), "--seconds", String(SECONDS), ...cfg.args], {
-      env: { ...process.env, RUST_LOG: "info", ...(cfg.env ?? {}) },
+      env: { ...process.env, RUST_LOG: "info", LRD_TEST_LOOPBACK: "1", ...(cfg.env ?? {}) },
       stdio: ["ignore", "pipe", "inherit"],
     });
     let out = "";

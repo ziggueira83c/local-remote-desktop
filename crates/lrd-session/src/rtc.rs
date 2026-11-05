@@ -158,6 +158,10 @@ impl RtcSender {
 
         let mut settings = SettingEngine::default();
         settings.set_network_types(vec![webrtc::ice::network_type::NetworkType::Udp4]);
+        // Testes com navegador na mesma máquina: o Safari responde pelo 127.0.0.1.
+        if std::env::var_os("LRD_TEST_LOOPBACK").is_some() {
+            settings.set_include_loopback_candidate(true);
+        }
 
         let api = APIBuilder::new()
             .with_media_engine(media)
