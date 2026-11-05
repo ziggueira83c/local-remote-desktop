@@ -52,8 +52,13 @@ function runHost(port, cfg) {
 
 // Navegador com a mesma interface mínima: newPage() → { goto, close }.
 const launchers = {
+  // Navegador instalado: Edge no Windows (mesmo motor do WebView2 do app), Chrome no Mac.
+  // O Chromium que vem com o Playwright não decodifica H.264/H.265.
   chromium: () =>
-    chromium.launch({ args: ["--autoplay-policy=no-user-gesture-required", "--use-fake-ui-for-media-stream"] }),
+    chromium.launch({
+      channel: process.platform === "win32" ? "msedge" : "chrome",
+      args: ["--autoplay-policy=no-user-gesture-required", "--use-fake-ui-for-media-stream"],
+    }),
   webkit: () => webkit.launch(),
   // Safari de verdade (mesmo motor do WKWebView do app no Mac), via safaridriver.
   safari: async () => {
@@ -114,6 +119,22 @@ for (const bname of wanted) {
     console.log("   host:", JSON.stringify(host));
     if (cfg.scenario) {
       const l = host.lrd;
+      // Metas da especificação 2026-11-05 (região de vídeo), medidas no Windows.
+      const mbps = (l.kbPerFrame * 8 * 1024 * (pg.fps || 0)) / 1e6;
+      const targets = { "video-720p": 8, "video-tela-cheia": 12 };
+      const before = { digitando: 1.6, rolagem: 15, "arrastar-janela": 125 };
+      const sproblems = [];
+      if (process.platform === "win32" && targets[cfg.scenario] != null) {
+        if (mbps > targets[cfg.scenario]) sproblems.push(`${mbps.toFixed(1)} Mbps > ${targets[cfg.scenario]}`);
+        if (!(pg.fps >= 28)) sproblems.push(`${pg.fps?.toFixed(1)} qps < 28`);
+      }
+      if (process.platform === "win32" && before[cfg.scenario] != null && l.kbPerFrame > before[cfg.scenario] * 1.2) {
+        sproblems.push(`${l.kbPerFrame} KB/q (antes ${before[cfg.scenario]})`);
+      }
+      if (sproblems.length) {
+        console.log(`   META NÃO ATINGIDA (${cfg.scenario}): ${sproblems.join("; ")}`);
+        failures++;
+      }
       scenarioRows.push([
         bname, cfg.scenario, pg.fps?.toFixed(1), pg.glassMs?.toFixed(0) ?? "-", l.kbPerFrame,
         ((l.kbPerFrame * 8 * (pg.fps || 0)) / 1000).toFixed(1), l.encodeMsAvg, l.encodeMsMax, l.sendMsAvg,
@@ -137,7 +158,9 @@ for (const bname of wanted) {
     const problems = [];
     // Os Macs do GitHub são máquinas virtuais (codificador lento, ~16 quadros/s).
     if (!(pg.fps >= (process.platform === "darwin" ? 12 : 20))) problems.push(`fps ${pg.fps?.toFixed(1)}`);
-    if (pg.freezes > (cfg.lossy ? 4 : 1)) problems.push(`${pg.freezes} travadas`);
+    // Mac do GitHub é máquina virtual: tolera uma travada a mais.
+    const maxFreezes = (cfg.lossy ? 4 : 1) + (process.platform === "darwin" ? 1 : 0);
+    if (pg.freezes > maxFreezes) problems.push(`${pg.freezes} travadas`);
     if (cfg.lrd && !(pg.exactPct >= 99.9)) problems.push(`pixels exatos ${pg.exactPct?.toFixed(1)}%`);
     if (!cfg.lossy && !cfg.lrd && host.bitrateBps < 3_000_000) problems.push(`taxa caiu para ${(host.bitrateBps / 1e6).toFixed(1)} Mbps`);
     if (pg.width !== 1280) problems.push(`largura ${pg.width}`);
