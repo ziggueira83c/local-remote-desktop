@@ -123,10 +123,11 @@ fn photo_goes_lossy_then_refines() {
     let r = enc.refine(2).unwrap();
     assert!(!enc.refine_due());
     let (fb, _) = decode(&[k, r]);
-    // Fotos são refinadas com JPEG de alta qualidade (aqui o falso: 3 bits baixos zerados).
-    for (p, q) in fb.chunks_exact(4).zip(f.data.chunks_exact(4)) {
-        for c in 0..3 {
-            assert!((p[c] as i32 - (q[c] & 0xF8) as i32).abs() <= 0 || p[c] == q[c]);
+    // A metade de interface (x >= 128) fica exata; a foto é refinada em JPEG de alta qualidade.
+    for y in 0..128usize {
+        for x in 128..256usize {
+            let o = (y * 256 + x) * 4;
+            assert_eq!(fb[o..o + 3], f.data[o..o + 3], "interface mudou em ({x},{y})");
         }
     }
 }
