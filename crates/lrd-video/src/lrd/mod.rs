@@ -977,6 +977,7 @@ pub fn apply_frame(bytes: &[u8], fb: &mut Vec<u8>, dims: &mut (u32, u32)) -> Opt
                     }
                 }
             }
+            Op::Video { .. } => return None, // decodificado na Task 3 (marca a região)
             Op::Copy { x, y, w, h: hh, sx, sy } => {
                 if sx != x {
                     return None; // o codificador só gera cópia vertical

@@ -27,6 +27,8 @@
 //!            u32 raw_len (= w*h*3), u32 comp_len, [bloco LZ4 de BGR linha a linha]
 //!   3 JPEG : x y w h, u32 len, [JPEG]
 //!   4 COPY : x y w h, u16 src_x, u16 src_y   (como memmove: origem lida antes de escrever)
+//!   5 VIDEO: x y w h, u8 flags (bit 0 = IDR, bit 1 = H.265; senão H.264), u32 len,
+//!            [unidade de acesso Annex B] — região de vídeo/jogo com codec temporal
 //! ```
 
 pub const FRAME_LRD: u8 = 5;
@@ -37,6 +39,11 @@ pub const OP_FILL: u8 = 1;
 pub const OP_LZ4: u8 = 2;
 pub const OP_JPEG: u8 = 3;
 pub const OP_COPY: u8 = 4;
+pub const OP_VIDEO: u8 = 5;
+
+/// Flags da operação VIDEO.
+pub const VIDEO_IDR: u8 = 1;
+pub const VIDEO_HEVC: u8 = 2;
 
 pub const FILTER_NONE: u8 = 0;
 pub const FILTER_LEFT: u8 = 1;
@@ -61,6 +68,7 @@ pub enum Op<'a> {
     Lz4 { x: u32, y: u32, w: u32, h: u32, filter: u8, raw_len: usize, data: &'a [u8] },
     Jpeg { x: u32, y: u32, w: u32, h: u32, data: &'a [u8] },
     Copy { x: u32, y: u32, w: u32, h: u32, sx: u32, sy: u32 },
+    Video { x: u32, y: u32, w: u32, h: u32, flags: u8, data: &'a [u8] },
 }
 
 /// Escreve um quadro. `ops` já serializadas (ver `push_*`).
@@ -113,6 +121,13 @@ impl Writer {
         self.rect(OP_COPY, x, y, w, h);
         self.buf.extend_from_slice(&(sx as u16).to_le_bytes());
         self.buf.extend_from_slice(&(sy as u16).to_le_bytes());
+    }
+
+    pub fn video(&mut self, x: u32, y: u32, w: u32, h: u32, flags: u8, data: &[u8]) {
+        self.rect(OP_VIDEO, x, y, w, h);
+        self.buf.push(flags);
+        self.buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        self.buf.extend_from_slice(data);
     }
 
     pub fn op_count(&self) -> usize {
@@ -199,6 +214,14 @@ pub fn parse(b: &[u8]) -> Option<(Header, Vec<Op<'_>>)> {
                 }
                 Op::Copy { x, y, w, h: hh, sx, sy }
             }
+            OP_VIDEO => {
+                let flags = *b.get(o)?;
+                let len = u32_at(b, o + 1)?;
+                o += 5;
+                let data = b.get(o..o + len)?;
+                o += len;
+                Op::Video { x, y, w, h: hh, flags, data }
+            }
             _ => return None,
         };
         ops.push(op);
@@ -234,5 +257,17 @@ mod tests {
         let mut extra = f.clone();
         extra.push(0);
         assert!(parse(&extra).is_none());
+    }
+
+    #[test]
+    fn video_op_roundtrip() {
+        let mut w = Writer::new(false, 1280, 720, 9, 3);
+        w.video(16, 32, 640, 368, VIDEO_IDR | VIDEO_HEVC, &[0, 0, 0, 1, 0x40]);
+        let f = w.finish();
+        let (_, ops) = parse(&f).unwrap();
+        assert_eq!(ops, vec![Op::Video { x: 16, y: 32, w: 640, h: 368, flags: 3, data: &[0, 0, 0, 1, 0x40] }]);
+        let mut bad = Writer::new(false, 1280, 720, 9, 3);
+        bad.video(1000, 0, 640, 368, VIDEO_IDR, &[1]);
+        assert!(parse(&bad.finish()).is_none());
     }
 }

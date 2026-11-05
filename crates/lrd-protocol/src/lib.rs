@@ -53,6 +53,10 @@ pub mod codec {
     pub const WEBRTC_H265: &str = "webrtc-h265";
     /// codecLRD: codec próprio de tela (ver `crate::lrd`).
     pub const LRD: &str = "lrd";
+    /// codecLRD com região de vídeo: o controlador decodifica H.264 (WebCodecs).
+    pub const LRD_VIDEO: &str = "lrd-video";
+    /// ... e também H.265.
+    pub const LRD_VIDEO_H265: &str = "lrd-video-h265";
 }
 
 /// Relógio monotônico do processo em microssegundos. Vídeo e áudio usam o mesmo relógio
