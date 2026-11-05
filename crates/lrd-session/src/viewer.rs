@@ -151,6 +151,8 @@ impl Node {
                 *c == lrd_protocol::codec::WEBRTC
                     || *c == lrd_protocol::codec::WEBRTC_H265
                     || *c == lrd_protocol::codec::LRD
+                    || *c == lrd_protocol::codec::LRD_VIDEO
+                    || *c == lrd_protocol::codec::LRD_VIDEO_H265
                     || *c == lrd_protocol::codec::H264
                     || *c == lrd_protocol::codec::JPEG_TILES
             })

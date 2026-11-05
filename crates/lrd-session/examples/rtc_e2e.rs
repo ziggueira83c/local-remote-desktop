@@ -96,6 +96,9 @@ struct LrdMeter {
     copies: AtomicU64,
     jpeg_px: AtomicU64,
     lz4_px: AtomicU64,
+    video_bytes: AtomicU64,
+    video_frames: AtomicU64,
+    video_hevc: AtomicU64,
 }
 
 #[derive(Default)]
@@ -174,7 +177,8 @@ fn input_handler(c: Arc<Counters>, ack: Arc<std::sync::atomic::AtomicU32>) -> In
     })
 }
 
-async fn start_rtc(st: &Arc<State>, browser_hevc: bool) -> anyhow::Result<String> {
+/// `video_region`: região de vídeo do codecLRD, `Some(h265)` se o navegador decodifica.
+async fn start_rtc(st: &Arc<State>, browser_hevc: bool, video_region: Option<bool>) -> anyhow::Result<String> {
     let (cap_tx, cap_rx) = std::sync::mpsc::channel::<CaptureCmd>();
     let (state_tx, mut state_rx) = tokio::sync::mpsc::unbounded_channel();
     let codecs = RtcCodecs { hevc: st.args.hevc && browser_hevc, no_fec: st.args.no_fec, lrd: st.args.lrd };
@@ -199,6 +203,9 @@ async fn start_rtc(st: &Arc<State>, browser_hevc: bool) -> anyhow::Result<String
         if lrd {
             // codecLRD: nenhum quadro pode ser descartado depois de codificado (espera a fila).
             let mut enc = lrd_video::lrd::LrdEncoder::new();
+            if let Some(h265) = video_region {
+                enc.enable_video(lrd_video::lrd::hardware_region_encoder(h265, FPS, 8_000_000), 8_000_000);
+            }
             enc.ack = Some(ack);
             let mut n = 0u64;
             let interval = Duration::from_micros(1_000_000 / FPS as u64);
@@ -245,6 +252,11 @@ async fn start_rtc(st: &Arc<State>, browser_hevc: bool) -> anyhow::Result<String
                     meter.copies.fetch_add(l.copies as u64, Ordering::Relaxed);
                     meter.jpeg_px.fetch_add(l.jpeg_px as u64, Ordering::Relaxed);
                     meter.lz4_px.fetch_add(l.lz4_px as u64, Ordering::Relaxed);
+                    if l.video_bytes > 0 {
+                        meter.video_bytes.fetch_add(l.video_bytes as u64, Ordering::Relaxed);
+                        meter.video_frames.fetch_add(1, Ordering::Relaxed);
+                        meter.video_hevc.fetch_add(l.video_hevc as u64, Ordering::Relaxed);
+                    }
                     if let Ok(mut i) = info.lock() {
                         let l = enc.last;
                         *i = (format!("codecLRD {}/{} blocos, {} cópias, {} B", l.dirty_tiles, l.total_tiles, l.copies, l.bytes), false, 0);
@@ -377,7 +389,8 @@ async fn handle(mut sock: TcpStream, st: Arc<State>) {
         }
         ("GET", "/offer") => {
             let browser_hevc = path.contains("h265=1");
-            match start_rtc(&st, browser_hevc).await {
+            let video_region = path.contains("lrdvideo=1").then_some(path.contains("lrdh265=1"));
+            match start_rtc(&st, browser_hevc, video_region).await {
                 Ok(sdp) => respond(&mut sock, "200 OK", "application/sdp", sdp.as_bytes()).await,
                 Err(e) => respond(&mut sock, "500 Error", "text/plain", format!("{e:#}").as_bytes()).await,
             }
@@ -415,7 +428,7 @@ async fn handle(mut sock: TcpStream, st: Arc<State>) {
             let m = &st.lrd_meter;
             let mf = m.frames.load(Ordering::Relaxed).max(1) as f64;
             let lrd_json = format!(
-                r#"{{"scenario":"{}","frames":{},"kbPerFrame":{:.1},"encodeMsAvg":{:.2},"encodeMsMax":{:.1},"sendMsAvg":{:.2},"deferred":{},"copies":{},"jpegMpx":{:.3},"lz4Mpx":{:.3}}}"#,
+                r#"{{"scenario":"{}","frames":{},"kbPerFrame":{:.1},"encodeMsAvg":{:.2},"encodeMsMax":{:.1},"sendMsAvg":{:.2},"deferred":{},"copies":{},"jpegMpx":{:.3},"lz4Mpx":{:.3},"videoKbPerFrame":{:.1},"videoFrames":{},"videoHevcFrames":{}}}"#,
                 st.args.scenario.clone().unwrap_or_default(),
                 m.frames.load(Ordering::Relaxed),
                 m.bytes.load(Ordering::Relaxed) as f64 / mf / 1024.0,
@@ -426,6 +439,9 @@ async fn handle(mut sock: TcpStream, st: Arc<State>) {
                 m.copies.load(Ordering::Relaxed),
                 m.jpeg_px.load(Ordering::Relaxed) as f64 / mf / 1e6,
                 m.lz4_px.load(Ordering::Relaxed) as f64 / mf / 1e6,
+                m.video_bytes.load(Ordering::Relaxed) as f64 / mf / 1024.0,
+                m.video_frames.load(Ordering::Relaxed),
+                m.video_hevc.load(Ordering::Relaxed),
             );
             let host = format!(
                 r#"{{"lrd":{lrd_json},"encoder":"{}","encoderHevc":{},"bitrateBps":{},"negH264":{},"negH265":{},"negFec":{},"moves":{},"buttons":{},"keys":{},"scrolls":{},"pings":{},"dropPct":"{}"}}"#,

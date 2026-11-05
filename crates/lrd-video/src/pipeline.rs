@@ -63,6 +63,9 @@ pub struct CaptureParams {
     pub audio_enabled: bool,
     /// codecLRD: último quadro aplicado no controlador (controle de fluxo).
     pub lrd_ack: Option<Arc<std::sync::atomic::AtomicU32>>,
+    /// codecLRD com região de vídeo: `Some(h265)` quando o controlador decodifica H.264
+    /// (`lrd-video`), e H.265 também (`lrd-video-h265`).
+    pub lrd_video: Option<bool>,
 }
 
 /// Números do pipeline, lidos a cada segundo para o painel de diagnóstico.
@@ -129,7 +132,15 @@ impl Encoder {
             Encoder::Tiles(_) => "JPEG (tiles)".into(),
             Encoder::Lrd(e) => {
                 let l = e.last;
-                format!("codecLRD · {}/{} blocos · {} cópia(s)", l.dirty_tiles, l.total_tiles, l.copies)
+                match l.video_rect {
+                    Some((_, _, w, h)) => format!(
+                        "codecLRD + vídeo {} {w}×{h} · {}/{} blocos",
+                        if l.video_hevc { "H.265" } else { "H.264" },
+                        l.dirty_tiles,
+                        l.total_tiles
+                    ),
+                    None => format!("codecLRD · {}/{} blocos · {} cópia(s)", l.dirty_tiles, l.total_tiles, l.copies),
+                }
             }
         }
     }
@@ -140,10 +151,17 @@ fn make_encoder(
     q: &QualitySettings,
     hevc: bool,
     ack: &Option<Arc<std::sync::atomic::AtomicU32>>,
+    lrd_video: Option<bool>,
 ) -> Encoder {
     if codec == VideoCodec::Lrd {
         let mut e = crate::lrd::LrdEncoder::new();
         e.ack = ack.clone();
+        if let Some(h265) = lrd_video {
+            e.enable_video(
+                crate::lrd::hardware_region_encoder(h265, q.max_fps, q.bitrate_bps),
+                q.bitrate_bps,
+            );
+        }
         return Encoder::Lrd(Box::new(e));
     }
     if codec == VideoCodec::H264 {
@@ -171,7 +189,7 @@ fn effective_max_width(q: &QualitySettings, bitrate: Option<u32>) -> u32 {
 const IDLE_REFINE_AFTER: Duration = Duration::from_millis(350);
 
 fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8>>, stats: Arc<Mutex<PipelineStats>>) {
-    let CaptureParams { display_id, quality, codec, cursor, audio, audio_enabled, lrd_ack } = params;
+    let CaptureParams { display_id, quality, codec, cursor, audio, audio_enabled, lrd_ack, lrd_video } = params;
     let mut codec = codec;
     let mut quality = quality;
     let mut bitrate_override: Option<u32> = None;
@@ -181,7 +199,7 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
     let mut lrd_bytes: u64 = 0;
     let mut lrd_rate: u32 = 0;
     let mut lrd_rate_at = Instant::now();
-    let mut encoder = make_encoder(codec, &quality, hevc, &lrd_ack);
+    let mut encoder = make_encoder(codec, &quality, hevc, &lrd_ack, lrd_video);
     let mut source: Option<Source> = None;
     let mut win_audio: Option<crate::audio::AudioCapture> = None;
 
@@ -208,7 +226,7 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
                 Ok(CaptureCmd::SetQuality(q)) => {
                     if q != quality {
                         quality = q;
-                        encoder = make_encoder(codec, &quality, hevc, &lrd_ack);
+                        encoder = make_encoder(codec, &quality, hevc, &lrd_ack, lrd_video);
                         bitrate_override = None;
                         if cfg!(target_os = "macos") {
                             source = None; // o ScreenCaptureKit aplica tamanho e FPS
@@ -231,7 +249,7 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
                 Ok(CaptureCmd::SetCodec(c)) => {
                     if c != codec {
                         codec = c;
-                        encoder = make_encoder(codec, &quality, hevc, &lrd_ack);
+                        encoder = make_encoder(codec, &quality, hevc, &lrd_ack, lrd_video);
                         last_encoded = None;
                         want_keyframe = true;
                     }

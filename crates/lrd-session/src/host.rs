@@ -104,6 +104,9 @@ impl Node {
         let viewer_webrtc = hello.codecs.iter().any(|c| c == lrd_protocol::codec::WEBRTC);
         let viewer_h264 = hello.codecs.iter().any(|c| c == lrd_protocol::codec::H264);
         let viewer_lrd = hello.codecs.iter().any(|c| c == lrd_protocol::codec::LRD);
+        // Região de vídeo: H.265 se o controlador decodifica; H.264 se só isso.
+        let viewer_lrd_video = viewer_lrd && hello.codecs.iter().any(|c| c == lrd_protocol::codec::LRD_VIDEO);
+        let viewer_lrd_h265 = hello.codecs.iter().any(|c| c == lrd_protocol::codec::LRD_VIDEO_H265);
         let rtc_codecs = crate::rtc::RtcCodecs {
             hevc: hello.codecs.iter().any(|c| c == lrd_protocol::codec::WEBRTC_H265),
             no_fec: false,
@@ -313,7 +316,7 @@ impl Node {
         };
         write_envelope(&mut send, &Envelope::new(&session_id, 2, Payload::ConnectResponse(resp))).await?;
 
-        let media = MediaOptions { codec, webrtc: viewer_webrtc, viewer_h264, audio_allowed, audio_on, rtc_codecs };
+        let media = MediaOptions { codec, webrtc: viewer_webrtc, viewer_h264, audio_allowed, audio_on, rtc_codecs, lrd_video: viewer_lrd_video.then_some(viewer_lrd_h265) };
         self.run_inbound(conn, send, recv, session_id, device_name, address, granted, displays, active, injector, media)
             .await
     }
@@ -358,6 +361,7 @@ impl Node {
                 audio: if media.audio_allowed { Some(audio_tx) } else { None },
                 audio_enabled: media.audio_on,
                 lrd_ack: Some(lrd_ack.clone()),
+                lrd_video: media.lrd_video,
             },
             frame_tx,
         );
@@ -738,6 +742,8 @@ struct MediaOptions {
     audio_on: bool,
     /// Codecs extras do WebRTC aceitos pelo controlador (H.265).
     rtc_codecs: crate::rtc::RtcCodecs,
+    /// Região de vídeo do codecLRD: `Some(h265)`.
+    lrd_video: Option<bool>,
 }
 
 fn audio_supported() -> bool {
