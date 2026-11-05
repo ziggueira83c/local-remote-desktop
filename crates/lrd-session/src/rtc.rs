@@ -158,6 +158,12 @@ impl RtcSender {
 
         let mut settings = SettingEngine::default();
         settings.set_network_types(vec![webrtc::ice::network_type::NetworkType::Udp4]);
+        // ICE-lite: o navegador conduz a conexão (ele testa os nossos endereços e escolhe o par).
+        // Sem isso, com Safari/WKWebView (que só informa nomes ".local" via mDNS), o lado Rust
+        // não conseguia formar pares e a conexão ficava em "checking" — tela preta e queda
+        // para o caminho de reserva (imagem borrada e travando).
+        settings.set_lite(true);
+        settings.set_ice_multicast_dns_mode(webrtc::ice::mdns::MulticastDnsMode::Disabled);
         // Testes com navegador na mesma máquina: o Safari responde pelo 127.0.0.1.
         if std::env::var_os("LRD_TEST_LOOPBACK").is_some() {
             settings.set_include_loopback_candidate(true);
