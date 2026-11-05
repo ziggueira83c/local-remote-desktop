@@ -80,7 +80,7 @@ enum Class {
 }
 
 /// (x, y, largura, altura)
-type Rect = (u32, u32, u32, u32);
+pub(crate) type Rect = (u32, u32, u32, u32);
 
 #[derive(Debug, Clone, Copy)]
 enum JobKind {
@@ -990,6 +990,7 @@ pub fn apply_frame(bytes: &[u8], fb: &mut Vec<u8>, dims: &mut (u32, u32)) -> Opt
 }
 
 pub mod scenarios;
+mod region;
 
 #[cfg(test)]
 mod tests;
