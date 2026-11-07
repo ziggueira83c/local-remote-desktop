@@ -107,6 +107,16 @@ export class LrdDecoder {
     private needKeyframe: () => void,
   ) {
     this.ctx = canvas.getContext("2d", { alpha: false });
+    // O navegador pode descartar o contexto 2D (o Safari faz isso sob pressão de memória) e
+    // devolvê-lo em branco: a tela daqui deixa de bater com a do host ⇒ quadro completo.
+    canvas.addEventListener("contextlost", () => {
+      this.waitingKey = true;
+    });
+    canvas.addEventListener("contextrestored", () => {
+      this.ctx = canvas.getContext("2d", { alpha: false });
+      this.reset();
+      this.needKeyframe();
+    });
   }
 
   /** Lê o cabeçalho; `null` se não for um quadro codecLRD válido. */

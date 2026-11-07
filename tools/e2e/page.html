@@ -46,6 +46,8 @@ const engine = new MediaEngine(null);
 const video = document.getElementById("v");
 engine.attachVideo(video);
 const lrdCanvas = document.getElementById("lrdc");
+lrdCanvas.addEventListener("contextlost", () => log("canvas codecLRD: contexto perdido"));
+lrdCanvas.addEventListener("contextrestored", () => log("canvas codecLRD: contexto restaurado"));
 // Modo codecLRD: a tela é desenhada no <canvas> pelo decodificador do app.
 let lrdDrawn = null;
 engine.attach(lrdCanvas, {
