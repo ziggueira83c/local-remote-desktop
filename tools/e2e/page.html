@@ -97,6 +97,18 @@ const canvas = document.getElementById("c");
 const ctx = canvas.getContext("2d", { willReadFrequently: true });
 const sharpSamples = [];
 const exactSamples = [];
+const exactDirectSamples = [];
+// Pixels exatos do xadrez de 2 px a partir de dados RGBA lidos em (100,100) 256×128.
+const exactOf = (e) => {
+  let ok = 0;
+  for (let yy = 0; yy < 128; yy++)
+    for (let xx = 0; xx < 256; xx++) {
+      const want = (((100 + xx) >> 1) + ((100 + yy) >> 1)) % 2 === 0 ? 255 : 0;
+      const i = (yy * 256 + xx) * 4;
+      if (e[i] === want && e[i + 1] === want && e[i + 2] === want) ok++;
+    }
+  return (ok / (256 * 128)) * 100;
+};
 const srcW = () => (cfg.lrd ? lrdCanvas.width : video.videoWidth);
 const srcH = () => (cfg.lrd ? lrdCanvas.height : video.videoHeight);
 const sharpTimer = setInterval(() => {
@@ -106,15 +118,9 @@ const sharpTimer = setInterval(() => {
   ctx.drawImage(cfg.lrd ? lrdCanvas : video, 0, 0);
   if (srcW() === 1280) {
     // Pixels exatos do xadrez (região parada): sem perdas ⇒ 100%.
-    const e = ctx.getImageData(100, 100, 256, 128).data;
-    let ok = 0;
-    for (let yy = 0; yy < 128; yy++)
-      for (let xx = 0; xx < 256; xx++) {
-        const want = (((100 + xx) >> 1) + ((100 + yy) >> 1)) % 2 === 0 ? 255 : 0;
-        const i = (yy * 256 + xx) * 4;
-        if (e[i] === want && e[i + 1] === want && e[i + 2] === want) ok++;
-      }
-    exactSamples.push((ok / (256 * 128)) * 100);
+    exactSamples.push(exactOf(ctx.getImageData(100, 100, 256, 128).data));
+    // codecLRD: também direto do canvas exibido (sem a cópia por drawImage).
+    if (cfg.lrd) exactDirectSamples.push(exactOf(lrdCanvas.getContext("2d").getImageData(100, 100, 256, 128).data));
   }
   const sx = srcW() / 1280, sy = srcH() / 720;
   const d = ctx.getImageData(Math.round(110 * sx), Math.round(110 * sy), Math.round(200 * sx), Math.round(100 * sy)).data;
@@ -175,6 +181,7 @@ const result = {
   codec: cfg.lrd ? "codecLRD" : codec, decoder,
   width: srcW(), height: srcH(),
   exactPct: exactSamples.length ? exactSamples[exactSamples.length - 1] : null,
+  exactDirectPct: exactDirectSamples.length ? exactDirectSamples[exactDirectSamples.length - 1] : null,
   fps: dur > 0 ? frames / dur : 0,
   frames, freezes, maxGapMs: Math.round(maxGap),
   p95GapMs: sorted.length ? Math.round(sorted[Math.floor(sorted.length * 0.95)]) : null,

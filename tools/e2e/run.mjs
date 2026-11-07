@@ -161,7 +161,7 @@ for (const bname of wanted) {
     // Mac do GitHub é máquina virtual: tolera uma travada a mais.
     const maxFreezes = (cfg.lossy ? 4 : 1) + (process.platform === "darwin" ? 1 : 0);
     if (pg.freezes > maxFreezes) problems.push(`${pg.freezes} travadas`);
-    if (cfg.lrd && !(pg.exactPct >= 99.9)) problems.push(`pixels exatos ${pg.exactPct?.toFixed(1)}%`);
+    if (cfg.lrd && !(pg.exactPct >= 99.9)) problems.push(`pixels exatos ${pg.exactPct?.toFixed(1)}% (direto do canvas ${pg.exactDirectPct?.toFixed(1)}%)`);
     if (!cfg.lossy && !cfg.lrd && host.bitrateBps < 3_000_000) problems.push(`taxa caiu para ${(host.bitrateBps / 1e6).toFixed(1)} Mbps`);
     if (pg.width !== 1280) problems.push(`largura ${pg.width}`);
     if (!pg.directInput) problems.push("comandos fora do canal direto");
