@@ -602,6 +602,21 @@ impl Node {
             }
         });
 
+        // Área de transferência compartilhada (se permitida e ligada nas configurações).
+        let clip = if self.settings().share_clipboard {
+            let perms_cb = perms.clone();
+            let ctrl_cb = ctrl_tx.clone();
+            let sid_cb = session_id.clone();
+            crate::clipboard::ClipboardSync::start(move |text| {
+                if perms_cb.read().unwrap().sync_clipboard {
+                    let msg = Payload::ClipboardText(lrd_protocol::ClipboardText { text });
+                    let _ = ctrl_cb.try_send(Envelope::new(&sid_cb, 0, msg));
+                }
+            })
+        } else {
+            None
+        };
+
         let control = tokio::spawn(async move {
             loop {
                 let env = match read_envelope(&mut recv).await {
@@ -629,6 +644,13 @@ impl Node {
                     }
                     Some(Payload::SetAudio(a)) => {
                         let _ = cap_cmds.send(CaptureCmd::SetAudio(a.enabled && media.audio_allowed));
+                    }
+                    Some(Payload::ClipboardText(c)) => {
+                        if perms_c.read().unwrap().sync_clipboard {
+                            if let Some(cl) = &clip {
+                                cl.apply_remote(c.text);
+                            }
+                        }
                     }
                     Some(Payload::SessionClose(_)) => {
                         conn_c.close(quinn::VarInt::from_u32(0), reason::USER_CLOSED.as_bytes());

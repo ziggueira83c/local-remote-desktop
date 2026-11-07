@@ -1,6 +1,7 @@
 // Sem janela de console no Windows em builds de release.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod admin;
 mod commands;
 
 use std::path::PathBuf;
@@ -31,6 +32,11 @@ fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    // Acesso total ligado e o app foi aberto sem ser administrador: abre pela tarefa elevada.
+    if admin::redirect_to_elevated() {
+        return;
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -73,6 +79,9 @@ fn main() {
             commands::clear_history,
             commands::request_screen_permission,
             commands::request_accessibility_permission,
+            commands::admin_status,
+            commands::admin_enable,
+            commands::admin_disable,
         ])
         .build(tauri::generate_context!())
         .expect("erro ao iniciar o aplicativo")

@@ -451,3 +451,86 @@ fn encoder_failure_disables_video() {
     assert_eq!(v, 0);
     assert!(j > 0, "a área deveria seguir em JPEG");
 }
+
+#[test]
+fn static_text_with_blinking_caret_turns_region_off_and_stays_exact() {
+    // Vídeo para e vira texto parado com um cursor de texto piscando (≈ a cada 500 ms) dentro
+    // da antiga região: a região precisa desligar e o texto voltar exato (sem ficar embaçado).
+    let log = SArc::new(SMutex::new(StubLog::default()));
+    let mut enc = LrdEncoder::new();
+    enc.enable_video(stub_factory(log.clone(), false), 8_000_000);
+    let mut now = Instant::now();
+    let mut frames = Vec::new();
+    for t in 0..10 {
+        now += Duration::from_millis(33);
+        frames.extend(enc.encode_at(&video_frame(t, 768), 60, now));
+    }
+    let text = |on: bool| frame(1024, 512, move |x, y| if on && (300..302).contains(&x) && (200..216).contains(&y) { [0, 0, 0] } else { ui(x, y, 0) });
+    let mut last = None;
+    for k in 0..90 {
+        now += Duration::from_millis(33);
+        let f = text((k / 15) % 2 == 0);
+        let b = enc.encode_at(&f, 60, now);
+        if k >= 60 {
+            if let Some(b) = &b {
+                assert_eq!(count_ops(b).0, 0, "região de vídeo ainda ligada no quadro {k}");
+            }
+        }
+        frames.extend(b);
+        last = Some(f);
+    }
+    let (fb, _) = decode(&frames);
+    assert!(bgr_eq(&fb, &last.unwrap().data), "texto parado não voltou exato");
+}
+
+#[test]
+fn screen_stops_without_new_frames_still_refines() {
+    // A captura não entrega quadro nenhum depois que a tela para (Windows/Mac só entregam
+    // quando algo muda). O texto que foi com perdas tem que voltar exato mesmo assim.
+    let mut enc = LrdEncoder::new();
+    let grad = |x: u32, y: u32, t: u32| [((x + t) % 256) as u8, ((y / 8) * 16 + t) as u8, 9];
+    let mut now = Instant::now();
+    let mut frames = Vec::new();
+    for t in 0..5 {
+        now += Duration::from_millis(33);
+        frames.extend(enc.encode_at(&frame(128, 128, |x, y| grad(x, y, t)), 60, now));
+    }
+    assert!(enc.last.lossy > 0);
+    let last = frame(128, 128, |x, y| grad(x, y, 4));
+    for _ in 0..40 {
+        now += Duration::from_millis(50);
+        frames.extend(enc.idle_tick(60, now));
+        if enc.refine_due_at(now) {
+            frames.extend(enc.refine_at(0, now));
+        }
+    }
+    let (fb, _) = decode(&frames);
+    assert!(bgr_eq(&fb, &last.data), "texto parado ficou com perdas");
+}
+
+#[test]
+fn video_region_turns_off_when_frames_stop() {
+    let log = SArc::new(SMutex::new(StubLog::default()));
+    let mut enc = LrdEncoder::new();
+    enc.enable_video(stub_factory(log.clone(), false), 8_000_000);
+    let mut now = Instant::now();
+    let mut frames = Vec::new();
+    for t in 0..10 {
+        now += Duration::from_millis(33);
+        frames.extend(enc.encode_at(&video_frame(t, 768), 60, now));
+    }
+    // A tela para no último quadro do vídeo e a captura não entrega mais nada.
+    for _ in 0..40 {
+        now += Duration::from_millis(50);
+        frames.extend(enc.idle_tick(60, now));
+        if enc.refine_due_at(now) {
+            frames.extend(enc.refine_at(0, now));
+        }
+    }
+    assert!(!enc.needs_idle_tick(), "deveria ter terminado");
+    let (fb, _) = decode(&frames);
+    // O decodificador de referência pinta a região de vídeo como [1,2,3]: depois que a região
+    // desliga, a área é reenviada pelo caminho normal e nenhum pixel pode ficar assim.
+    let painted = fb.chunks_exact(4).filter(|p| p[..3] == [1, 2, 3]).count();
+    assert!(painted == 0, "região de vídeo não desligou: {painted} pixels do vídeo");
+}

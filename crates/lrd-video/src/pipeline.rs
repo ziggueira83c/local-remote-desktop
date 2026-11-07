@@ -187,6 +187,8 @@ fn effective_max_width(q: &QualitySettings, bitrate: Option<u32>) -> u32 {
 }
 
 const IDLE_REFINE_AFTER: Duration = Duration::from_millis(350);
+/// codecLRD: intervalo dos "quadros parados" sintéticos quando a captura para de entregar.
+const LRD_IDLE_TICK: Duration = Duration::from_millis(100);
 
 fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8>>, stats: Arc<Mutex<PipelineStats>>) {
     let CaptureParams { display_id, quality, codec, cursor, audio, audio_enabled, lrd_ack, lrd_video } = params;
@@ -209,6 +211,7 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
     let mut last_sent = Instant::now() - Duration::from_secs(1);
     let mut last_change = Instant::now();
     let mut refined = true;
+    let mut last_idle_tick = Instant::now();
     let mut last_cursor: Option<(u16, u16, u8, bool)> = None;
     let mut failures = 0u32;
 
@@ -373,6 +376,19 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
         // codecLRD: blocos enviados com perdas que pararam de mudar voltam sem perdas.
         if pending.is_none() && !want_keyframe {
             if let Encoder::Lrd(enc) = &mut encoder {
+                // Tela parada: a captura não entrega mais quadros, mas o codificador ainda
+                // precisa "ver" a tela parada para refinar e desligar a região de vídeo.
+                if last_change.elapsed() >= LRD_IDLE_TICK && last_idle_tick.elapsed() >= LRD_IDLE_TICK && enc.needs_idle_tick() {
+                    last_idle_tick = Instant::now();
+                    if let Some(bytes) = enc.idle_tick(quality.jpeg_quality, Instant::now()) {
+                        lrd_bytes += bytes.len() as u64;
+                        last_sent = Instant::now();
+                        if out.blocking_send(bytes).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                }
                 if enc.refine_due() {
                     if let Some(bytes) = enc.refine(lrd_protocol::now_us()) {
                         lrd_bytes += bytes.len() as u64;

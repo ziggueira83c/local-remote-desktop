@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, errorMessage, type AppSettings } from "../lib/api";
+import { api, errorMessage, type AdminStatus, type AppSettings } from "../lib/api";
 import { useStore } from "../store";
 import { checkForUpdate, installUpdate, subscribe, type UpdateState } from "../lib/updater";
 import { getVersion } from "@tauri-apps/api/app";
@@ -22,6 +22,41 @@ export function SettingsPage() {
   useEffect(() => {
     api.getSettings().then(setS).catch((e) => toast("error", errorMessage(e)));
   }, []);
+  const [admin, setAdmin] = useState<AdminStatus | null>(null);
+  const [adminBusy, setAdminBusy] = useState(false);
+  const [uacNormal, setUacNormal] = useState(true);
+  useEffect(() => {
+    api
+      .adminStatus()
+      .then((a) => {
+        setAdmin(a);
+        if (a.enabled) setUacNormal(a.uacOnNormalDesktop);
+      })
+      .catch(() => {});
+  }, []);
+  const adminEnable = async () => {
+    setAdminBusy(true);
+    try {
+      const a = await api.adminEnable(uacNormal);
+      setAdmin(a);
+      toast("info", a.elevated ? "Acesso total ativado." : "Acesso total ativado. O app vai reabrir como administrador…");
+    } catch (e) {
+      toast("error", errorMessage(e));
+    } finally {
+      setAdminBusy(false);
+    }
+  };
+  const adminDisable = async () => {
+    setAdminBusy(true);
+    try {
+      setAdmin(await api.adminDisable());
+      toast("info", "Acesso total desativado. Vale a partir da próxima vez que o app abrir.");
+    } catch (e) {
+      toast("error", errorMessage(e));
+    } finally {
+      setAdminBusy(false);
+    }
+  };
 
   if (!s) return <div className="page">Carregando…</div>;
 
@@ -76,6 +111,14 @@ export function SettingsPage() {
           <input value={s.deviceName} onChange={(e) => update("deviceName", e.target.value)} maxLength={63} />
           <span className="field__help">É o nome que os outros computadores veem na lista e no pedido de acesso.</span>
         </label>
+        <label className="check">
+          <input type="checkbox" checked={s.shareClipboard} onChange={(e) => update("shareClipboard", e.target.checked)} />
+          Copiar e colar texto entre os computadores durante a sessão
+        </label>
+        <span className="field__help">
+          Texto copiado (Ctrl+C / Cmd+C) em um computador fica pronto para colar no outro, nos dois sentidos. Vale
+          quando o acesso é de controle remoto; desligue aqui para não compartilhar.
+        </span>
       </div>
 
       <div className="card">
@@ -199,6 +242,59 @@ export function SettingsPage() {
           Permitir acesso com a senha sem pedir aprovação {local?.hasAccessPassword ? "" : "(defina uma senha primeiro)"}
         </label>
         <span className="field__help">Lembre de clicar em “Salvar” no fim da página para ativar ou desativar.</span>
+      </div>
+
+      <div className="card">
+        <h2 className="card__title">Acesso total (administrador)</h2>
+        {admin?.supported ? (
+          <>
+            <p className="field__help">
+              Sem isto, o Windows não deixa quem acessa este computador controlar janelas de administrador — como o
+              Gerenciador de Tarefas, instaladores e o Editor do Registro — nem responder aos pedidos de permissão (UAC).
+              Ligando, o LRD passa a abrir sempre como administrador (e também ao entrar no Windows), pedindo a
+              confirmação do UAC só agora, uma vez.
+            </p>
+            <p className="small">
+              Agora: {admin.elevated ? <span className="pill pill--ok">rodando como administrador</span> : <span className="pill pill--warn">rodando sem privilégios de administrador</span>}{" "}
+              {admin.enabled && <span className="pill pill--ok">acesso total ligado</span>}
+            </p>
+            <label className="check">
+              <input type="checkbox" checked={uacNormal} onChange={(e) => setUacNormal(e.target.checked)} disabled={adminBusy} />
+              Mostrar os pedidos de permissão do Windows (UAC) na tela normal, para poder aceitá-los remotamente
+            </label>
+            <span className="field__help">
+              Por padrão o Windows mostra esses pedidos numa tela protegida que nenhum programa de acesso remoto
+              consegue ver. Desmarcado, eles continuam lá (mais seguro, mas só dá para aceitar estando na frente do
+              computador). A tela de bloqueio e o Ctrl+Alt+Del continuam fora do alcance remoto.
+            </span>
+            <div className="page__actions" style={{ justifyContent: "flex-start", gap: 8 }}>
+              {admin.enabled ? (
+                <>
+                  <button className="btn btn--small" onClick={adminEnable} disabled={adminBusy}>
+                    {admin.elevated ? "Aplicar" : "Reabrir como administrador"}
+                  </button>
+                  <button className="btn btn--small btn--ghost" onClick={adminDisable} disabled={adminBusy}>
+                    Desligar acesso total
+                  </button>
+                </>
+              ) : (
+                <button className="btn btn--small btn--primary" onClick={adminEnable} disabled={adminBusy}>
+                  {adminBusy ? "Aguardando o Windows…" : "Ligar acesso total"}
+                </button>
+              )}
+            </div>
+            <span className="field__help">
+              Dê esse acesso só a quem você confia: com ele, quem controla este computador pode fazer qualquer
+              alteração de administrador. Cada conexão continua precisando da sua aprovação ou da senha de acesso.
+            </span>
+          </>
+        ) : (
+          <p className="field__help">
+            No Mac não é preciso: com as permissões de Gravação de Tela e Acessibilidade, o LRD já controla qualquer
+            janela, inclusive o Monitor de Atividade. Os pedidos de senha de administrador do macOS aparecem na tela
+            normal, sem tela protegida.
+          </p>
+        )}
       </div>
 
       <div className="card">

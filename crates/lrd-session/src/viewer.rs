@@ -352,6 +352,27 @@ impl Node {
             }
         });
 
+        // Área de transferência compartilhada: só com a permissão concedida pelo outro lado.
+        let clip = if self.settings().share_clipboard && permissions.sync_clipboard {
+            let ctrl_cb = ctrl_tx.clone();
+            let sid_cb = session_id.clone();
+            let node_cb = self.clone();
+            crate::clipboard::ClipboardSync::start(move |text| {
+                let allowed = node_cb
+                    .outbound
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|h| h.session_id == sid_cb && h.permissions.sync_clipboard);
+                if allowed {
+                    let msg = Payload::ClipboardText(lrd_protocol::ClipboardText { text });
+                    let _ = ctrl_cb.try_send(Envelope::new(&sid_cb, 0, msg));
+                }
+            })
+        } else {
+            None
+        };
+
         // Leitor de controle.
         let node_c = self.clone();
         let sid_c = session_id.clone();
@@ -387,6 +408,11 @@ impl Node {
                     }
                     Some(Payload::WebRtcSignal(sig)) if sig.kind == "offer" => {
                         node_c.events.emit(NodeEvent::WebRtcOffer { session_id: sid_c.clone(), sdp: sig.sdp });
+                    }
+                    Some(Payload::ClipboardText(c)) => {
+                        if let Some(cl) = &clip {
+                            cl.apply_remote(c.text);
+                        }
                     }
                     _ => {}
                 }

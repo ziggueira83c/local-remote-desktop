@@ -46,15 +46,16 @@ impl RegionTracker {
         self.last_activity = None;
     }
 
-    /// `moving_tiles`: um por bloco (linha a linha), verdadeiro se o bloco foi classificado com
-    /// perdas neste quadro. `inside_changed`: a região ativa mudou neste quadro.
-    pub fn update(&mut self, moving_tiles: &[bool], inside_changed: bool, now: Instant) -> Option<Rect> {
+    /// `moving_tiles`: um por bloco (linha a linha), verdadeiro se o bloco se mexeu neste quadro
+    /// (com perdas fora da região, ou mudou dentro dela). A região só se mantém enquanto algum
+    /// bloco se mexe de forma contínua: mudanças esporádicas (cursor piscando, relógio) não contam.
+    pub fn update(&mut self, moving_tiles: &[bool], now: Instant) -> Option<Rect> {
         let mut any_video = false;
         for (s, m) in self.streak.iter_mut().zip(moving_tiles) {
             *s = if *m { s.saturating_add(1) } else { 0 };
             any_video |= *s >= STREAK_TO_VIDEO;
         }
-        if any_video || (inside_changed && self.active.is_some()) {
+        if any_video {
             self.last_activity = Some(now);
         }
         if let Some(cand) = self.candidate() {
@@ -171,9 +172,9 @@ mod tests {
         let mut clk = Clock(Instant::now());
         let m = mask(&[(5, 3, 25, 15)]);
         for _ in 0..5 {
-            assert_eq!(t.update(&m, false, clk.tick()), None);
+            assert_eq!(t.update(&m, clk.tick()), None);
         }
-        let r = t.update(&m, false, clk.tick()).expect("deveria ligar no 6º quadro");
+        let r = t.update(&m, clk.tick()).expect("deveria ligar no 6º quadro");
         assert_eq!((r.0 % 16, r.1 % 16, r.2 % 2, r.3 % 2), (0, 0, 0, 0));
         assert!(contains(r, 5 * 64, 3 * 64, 25 * 64, 15 * 64), "{r:?}");
     }
@@ -184,7 +185,7 @@ mod tests {
         let mut clk = Clock(Instant::now());
         let m = mask(&[(10, 5, 11, 6)]);
         for _ in 0..20 {
-            assert_eq!(t.update(&m, false, clk.tick()), None);
+            assert_eq!(t.update(&m, clk.tick()), None);
         }
     }
 
@@ -195,7 +196,7 @@ mod tests {
         let m = mask(&[(1, 1, 3, 3), (10, 5, 16, 9)]);
         let mut r = None;
         for _ in 0..6 {
-            r = t.update(&m, false, clk.tick());
+            r = t.update(&m, clk.tick());
         }
         let r = r.unwrap();
         assert!(contains(r, 640, 320, 1024, 576), "{r:?}");
@@ -209,12 +210,12 @@ mod tests {
         let m = mask(&[(5, 3, 25, 15)]);
         let mut r = None;
         for _ in 0..6 {
-            r = t.update(&m, false, clk.tick());
+            r = t.update(&m, clk.tick());
         }
         let first = r.unwrap();
         for k in 0..30 {
             let m = if k % 2 == 0 { mask(&[(5, 3, 24, 15)]) } else { mask(&[(5, 3, 26, 15)]) };
-            assert_eq!(t.update(&m, true, clk.tick()), Some(first));
+            assert_eq!(t.update(&m, clk.tick()), Some(first));
         }
     }
 
@@ -225,38 +226,40 @@ mod tests {
         let m = mask(&[(5, 3, 20, 15)]);
         let mut r = None;
         for _ in 0..6 {
-            r = t.update(&m, false, clk.tick());
+            r = t.update(&m, clk.tick());
         }
         let first = r.unwrap();
         let m = mask(&[(5, 3, 23, 15)]);
         let mut r2 = None;
         for _ in 0..6 {
-            r2 = t.update(&m, true, clk.tick());
+            r2 = t.update(&m, clk.tick());
         }
         let r2 = r2.unwrap();
         assert!(r2.2 >= first.2 + 128, "{first:?} → {r2:?}");
     }
 
     #[test]
-    fn stays_while_inside_changes_then_turns_off() {
+    fn stays_while_video_continues_then_turns_off() {
         let mut t = RegionTracker::new(W, H);
         let mut clk = Clock(Instant::now());
         let m = mask(&[(5, 3, 25, 15)]);
         for _ in 0..6 {
-            t.update(&m, false, clk.tick());
+            t.update(&m, clk.tick());
+        }
+        // Vídeo continua só numa parte da região: a região fica.
+        let part = mask(&[(8, 5, 14, 10)]);
+        for _ in 0..60 {
+            assert!(t.update(&part, clk.tick()).is_some());
         }
         let none = mask(&[]);
-        for _ in 0..60 {
-            assert!(t.update(&none, true, clk.tick()).is_some());
-        }
         // 27 quadros × 33 ms ≈ 891 ms sem atividade: ainda ligada.
         for _ in 0..27 {
-            assert!(t.update(&none, false, clk.tick()).is_some());
+            assert!(t.update(&none, clk.tick()).is_some());
         }
         // Passando de 1 s: desliga.
         let mut off = false;
         for _ in 0..4 {
-            off |= t.update(&none, false, clk.tick()).is_none();
+            off |= t.update(&none, clk.tick()).is_none();
         }
         assert!(off);
     }
@@ -268,10 +271,37 @@ mod tests {
         let m = mask(&[(5, 3, 25, 15)]);
         let mut r = None;
         for _ in 0..6 {
-            r = t.update(&m, false, clk.tick());
+            r = t.update(&m, clk.tick());
         }
         let r = r.unwrap();
         assert!(r.0 + r.2 <= 25 * 64 + 15, "{r:?}");
         assert!(r.1 + r.3 <= 15 * 64 + 15, "{r:?}");
+    }
+}
+
+#[cfg(test)]
+mod blink_tests {
+    use super::*;
+    #[test]
+    fn sporadic_changes_do_not_keep_region_alive() {
+        let mut t = RegionTracker::new(1920, 1080);
+        let mut now = Instant::now();
+        let cols = 30usize;
+        let all: Vec<bool> = (0..cols * 17).map(|i| (5..25).contains(&(i % cols)) && (3..15).contains(&(i / cols))).collect();
+        for _ in 0..6 {
+            now += Duration::from_millis(33);
+            t.update(&all, now);
+        }
+        assert!(t.active.is_some());
+        // Um bloco muda 1 quadro a cada 15 (cursor piscando): desliga em ~1 s.
+        let mut off_at = None;
+        for k in 0..90 {
+            now += Duration::from_millis(33);
+            let m: Vec<bool> = (0..cols * 17).map(|i| k % 15 == 0 && i == 7 * cols + 10).collect();
+            if t.update(&m, now).is_none() && off_at.is_none() {
+                off_at = Some(k);
+            }
+        }
+        assert!(off_at.is_some_and(|k| k <= 35), "{off_at:?}");
     }
 }

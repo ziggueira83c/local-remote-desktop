@@ -56,6 +56,7 @@ impl Permissions {
                 control_mouse: true,
                 control_keyboard: true,
                 switch_displays: true,
+                sync_clipboard: true,
                 ..Default::default()
             },
             Profile::FullControl => Permissions {

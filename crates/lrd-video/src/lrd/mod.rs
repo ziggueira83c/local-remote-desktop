@@ -303,9 +303,18 @@ impl LrdEncoder {
         // 0. Região de vídeo ativa: copia a região para a referência antes de comparar — o
         //    caminho normal deixa de enxergá-la (ela vai pelo codificador temporal).
         let region = self.video_mut().and_then(|v| v.enc.as_ref().map(|(r, _)| *r));
+        // Blocos dentro da região que mudaram neste quadro (por bloco: um cursor de texto
+        // piscando mexe em um bloco só e não pode manter a região inteira viva).
+        let mut inside_moving = vec![false; self.tiles.len()];
         let mut inside_changed = false;
         if let Some(r) = region {
-            inside_changed = !rect_equal(cur, &self.reference, w, r);
+            for (i, m) in inside_moving.iter_mut().enumerate() {
+                let t = self.tile_rect(i);
+                if overlaps(t, r) && self.change_box(cur, i).is_some() {
+                    *m = true;
+                    inside_changed = true;
+                }
+            }
             copy_rect(cur, &mut self.reference, w, r.0, r.1, r.2, r.3);
         }
 
@@ -365,7 +374,7 @@ impl LrdEncoder {
         stats.classify_us = t_classify.elapsed().as_micros() as u32;
 
         // 3b. Região de vídeo: detector + codificador temporal.
-        if let Some(out) = self.video_step(cur, &classes, inside_changed, region, frame.timestamp_us, now) {
+        if let Some(out) = self.video_step(cur, &classes, &inside_moving, inside_changed, region, frame.timestamp_us, now) {
             stats.video_bytes = out.data_len();
             if let Out::Video { x, y, w: vw, h: vh, flags, .. } = &out {
                 stats.video_rect = Some((*x, *y, *vw, *vh));
@@ -500,11 +509,40 @@ impl LrdEncoder {
 
     /// Há blocos com perdas parados há tempo suficiente para refinar?
     pub fn refine_due(&self) -> bool {
-        self.tiles.iter().any(|t| t.lossy && t.streak == 0 && t.lossy_at.is_some_and(|a| a.elapsed() >= self.refine_after))
+        self.refine_due_at(Instant::now())
+    }
+
+    pub fn refine_due_at(&self, now: Instant) -> bool {
+        self.tiles.iter().any(|t| t.lossy && t.streak == 0 && t.lossy_at.is_some_and(|a| now.saturating_duration_since(a) >= self.refine_after))
+    }
+
+    /// A tela parou e a captura não entrega mais quadros (Windows e Mac só entregam quando algo
+    /// muda): ainda há trabalho que depende de "ver" a tela parada? (blocos marcados como em
+    /// movimento, região de vídeo ligada ou área liberada a reenviar.)
+    pub fn needs_idle_tick(&mut self) -> bool {
+        if self.reference.is_empty() {
+            return false;
+        }
+        let video = self.video_mut().is_some_and(|v| v.enc.is_some() || v.release.is_some());
+        video || self.tiles.iter().any(|t| t.streak > 0)
+    }
+
+    /// Codifica "a mesma tela de novo" sem quadro novo da captura: zera o movimento dos blocos
+    /// (o refino passa a valer), deixa a região de vídeo desligar e reenvia a área liberada.
+    pub fn idle_tick(&mut self, jpeg_quality: u8, now: Instant) -> Option<Vec<u8>> {
+        if !self.needs_idle_tick() {
+            return None;
+        }
+        let still = RawFrame::cpu(self.width, self.height, self.reference.clone(), PixelFormat::Bgra, lrd_protocol::now_us());
+        self.encode_at(&still, jpeg_quality, now)
     }
 
     /// Reenvia sem perdas (ou JPEG quase perfeito, para fotos) os blocos parados.
     pub fn refine(&mut self, capture_us: u64) -> Option<Vec<u8>> {
+        self.refine_at(capture_us, Instant::now())
+    }
+
+    pub fn refine_at(&mut self, capture_us: u64, now: Instant) -> Option<Vec<u8>> {
         if self.reference.is_empty() {
             return None;
         }
@@ -514,7 +552,7 @@ impl LrdEncoder {
             if chosen >= REFINE_BATCH {
                 break;
             }
-            if t.lossy && t.streak == 0 && t.lossy_at.is_some_and(|a| a.elapsed() >= self.refine_after) {
+            if t.lossy && t.streak == 0 && t.lossy_at.is_some_and(|a| now.saturating_duration_since(a) >= self.refine_after) {
                 mark[i] = Some(t.photo);
                 chosen += 1;
             }
@@ -588,6 +626,7 @@ impl LrdEncoder {
         &mut self,
         cur: &[u8],
         classes: &[Class],
+        inside_moving: &[bool],
         inside_changed: bool,
         region: Option<Rect>,
         capture_us: u64,
@@ -599,14 +638,11 @@ impl LrdEncoder {
         if v.disabled {
             return None;
         }
-        // A região ativa fica escondida do caminho normal; o detector precisa enxergá-la como
-        // "em movimento" quando o conteúdo dela mudou, senão ela encolheria para só a parte nova.
-        let moving: Vec<bool> = classes
-            .iter()
-            .zip(&tile_rects)
-            .map(|(c, t)| matches!(c, Class::Lossy { .. }) || (inside_changed && region.is_some_and(|r| inside(*t, r))))
-            .collect();
-        let next = v.tracker.update(&moving, inside_changed, now);
+        // A região ativa fica escondida do caminho normal; o detector enxerga os blocos dela
+        // que mudaram neste quadro como "em movimento" (bloco a bloco).
+        let moving: Vec<bool> =
+            classes.iter().zip(inside_moving).map(|(c, m)| *m || matches!(c, Class::Lossy { .. })).collect();
+        let next = v.tracker.update(&moving, now);
         let mut force = std::mem::take(&mut v.force_idr);
         if next != region {
             // Área que sai da região volta pelo caminho normal no próximo quadro.
@@ -998,15 +1034,6 @@ fn inside(t: Rect, r: Rect) -> bool {
 
 fn overlaps(a: Rect, b: Rect) -> bool {
     a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3
-}
-
-/// Pixels (BGR) do retângulo iguais nos dois quadros?
-fn rect_equal(a: &[u8], b: &[u8], width: u32, r: Rect) -> bool {
-    let stride = (width * 4) as usize;
-    (r.1..r.1 + r.3).all(|y| {
-        let o = y as usize * stride + r.0 as usize * 4;
-        a[o..o + r.2 as usize * 4] == b[o..o + r.2 as usize * 4]
-    })
 }
 
 /// BGR da região, com cada byte menos o do pixel à esquerda (predição; decodificação soma).

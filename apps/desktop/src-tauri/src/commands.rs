@@ -162,3 +162,41 @@ pub async fn request_accessibility_permission(state: State<'_, AppState>) -> Cmd
     state.node.request_accessibility_permission();
     Ok(())
 }
+
+// ---------- Acesso total (administrador, Windows) ----------
+
+#[tauri::command]
+pub async fn admin_status() -> CmdResult<crate::admin::AdminStatus> {
+    tauri::async_runtime::spawn_blocking(crate::admin::status).await.map_err(|e| e.to_string())
+}
+
+/// Liga o acesso total (um pedido do UAC). Se este processo ainda não é administrador, o app
+/// reabre sozinho já elevado.
+#[tauri::command]
+pub async fn admin_enable(app: tauri::AppHandle, uac_on_normal_desktop: bool) -> CmdResult<crate::admin::AdminStatus> {
+    let st = tauri::async_runtime::spawn_blocking(move || {
+        crate::admin::enable(uac_on_normal_desktop)?;
+        Ok::<_, String>(crate::admin::status())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    if !st.elevated {
+        crate::admin::relaunch_elevated_later()?;
+        // Sai logo depois de responder à interface (a nova instância abre em ~2 s).
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            app.exit(0);
+        });
+    }
+    Ok(st)
+}
+
+#[tauri::command]
+pub async fn admin_disable() -> CmdResult<crate::admin::AdminStatus> {
+    tauri::async_runtime::spawn_blocking(|| {
+        crate::admin::disable()?;
+        Ok::<_, String>(crate::admin::status())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}

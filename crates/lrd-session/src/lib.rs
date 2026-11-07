@@ -2,6 +2,7 @@
 //! controlada (host). Toda conexão é autenticada por certificado (RN-005) e toda sessão de
 //! entrada exige aprovação explícita no computador controlado (RN-006).
 
+pub mod clipboard;
 mod host;
 mod node;
 #[doc(hidden)]
@@ -50,6 +51,8 @@ pub struct AppSettings {
     pub enhance_strength: f32,
     /// Aceitar conexões com a senha de acesso sem pedir aprovação (exige senha definida).
     pub password_access: bool,
+    /// Copiar e colar texto entre os computadores durante a sessão.
+    pub share_clipboard: bool,
 }
 
 impl Default for AppSettings {
@@ -67,6 +70,7 @@ impl Default for AppSettings {
             enhance_image: false,
             enhance_strength: 0.5,
             password_access: false,
+            share_clipboard: true,
         }
     }
 }

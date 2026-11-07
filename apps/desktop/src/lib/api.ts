@@ -26,7 +26,7 @@ export const PROFILE_PERMISSIONS: Record<Profile, Permissions> = {
     viewScreen: true,
     controlMouse: true,
     controlKeyboard: true,
-    syncClipboard: false,
+    syncClipboard: true,
     transferFiles: false,
     switchDisplays: true,
   },
@@ -126,6 +126,7 @@ export interface AppSettings {
   enhanceImage: boolean;
   enhanceStrength: number;
   passwordAccess: boolean;
+  shareClipboard: boolean;
 }
 
 export type NodeEvent =
@@ -201,6 +202,14 @@ export interface HostStats {
   transport: string;
 }
 
+/** Acesso total (Windows): rodar o LRD como administrador. */
+export interface AdminStatus {
+  supported: boolean;
+  elevated: boolean;
+  enabled: boolean;
+  uacOnNormalDesktop: boolean;
+}
+
 export const api = {
   getLocalDevice: () => invoke<LocalDeviceInfo>("get_local_device"),
   listDiscovered: () => invoke<DiscoveredDevice[]>("list_discovered"),
@@ -228,6 +237,9 @@ export const api = {
   clearHistory: () => invoke<void>("clear_history"),
   requestScreenPermission: () => invoke<boolean>("request_screen_permission"),
   requestAccessibilityPermission: () => invoke<void>("request_accessibility_permission"),
+  adminStatus: () => invoke<AdminStatus>("admin_status"),
+  adminEnable: (uacOnNormalDesktop: boolean) => invoke<AdminStatus>("admin_enable", { uacOnNormalDesktop }),
+  adminDisable: () => invoke<AdminStatus>("admin_disable"),
 };
 
 export function errorMessage(e: unknown): string {

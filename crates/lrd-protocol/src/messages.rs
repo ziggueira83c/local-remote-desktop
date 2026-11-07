@@ -11,7 +11,7 @@ pub struct Envelope {
     pub session_id: String,
     #[prost(uint64, tag = "3")]
     pub sequence: u64,
-    #[prost(oneof = "envelope::Payload", tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21")]
+    #[prost(oneof = "envelope::Payload", tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22")]
     pub payload: Option<envelope::Payload>,
 }
 
@@ -42,6 +42,8 @@ pub mod envelope {
         WebRtcSignal(super::WebRtcSignal),
         #[prost(message, tag = "21")]
         HostStats(super::HostStats),
+        #[prost(message, tag = "22")]
+        ClipboardText(super::ClipboardText),
     }
 }
 
@@ -242,6 +244,13 @@ pub struct HostStats {
 pub struct SetAudio {
     #[prost(bool, tag = "1")]
     pub enabled: bool,
+}
+
+/// Texto copiado num computador, para colar no outro (nos dois sentidos).
+#[derive(Clone, PartialEq, Message)]
+pub struct ClipboardText {
+    #[prost(string, tag = "1")]
+    pub text: String,
 }
 
 impl Envelope {
