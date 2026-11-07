@@ -302,6 +302,7 @@ use std::sync::{Arc as SArc, Mutex as SMutex};
 struct StubLog {
     created: Vec<(u32, u32)>,
     idrs: usize,
+    rois: Vec<Option<(u32, u32, u32, u32)>>,
 }
 
 struct StubRegion {
@@ -325,6 +326,9 @@ impl RegionEncoder for StubRegion {
         Some(RegionOut { annexb, idr, hevc: true })
     }
     fn set_bitrate(&mut self, _bps: u32) {}
+    fn set_roi(&mut self, roi: Option<(u32, u32, u32, u32)>) {
+        self.log.lock().unwrap().rois.push(roi);
+    }
 }
 
 fn stub_factory(log: SArc<SMutex<StubLog>>, fail: bool) -> super::RegionFactory {
@@ -379,6 +383,8 @@ fn motion_goes_through_full_screen_video_only_where_it_changed() {
     }
     // Um codificador só, do tamanho da tela, criado uma vez.
     assert_eq!(log.lock().unwrap().created, vec![(1024, 512)]);
+    // Vídeo de verdade (muitas cores): sem área de qualidade de texto.
+    assert!(log.lock().unwrap().rois.iter().all(|r| r.is_none()), "{:?}", log.lock().unwrap().rois);
     // Nenhum JPEG: o que se mexe vai pelo vídeo; os retângulos cobrem só a área do vídeo.
     for f in &frames[1..] {
         let (v, j) = count_ops(f);
@@ -539,6 +545,11 @@ fn dragging_a_big_window_goes_through_video() {
     }
     assert!(video >= 8, "janela arrastada foi pelo vídeo só em {video} quadros");
     assert_eq!(big_lossless, 0, "quadros com muito LZ4 durante o arraste");
+    // A janela é interface (texto): recebe mais qualidade no vídeo.
+    let rois = log.lock().unwrap().rois.clone();
+    let last_roi = rois.iter().rev().find_map(|r| *r).expect("sem área de qualidade para o texto");
+    assert!(last_roi.0 <= 100 + 99 && last_roi.0 + last_roi.2 >= 612 + 99 - 64, "área {last_roi:?}");
+    assert!(last_roi.1 <= 80 && last_roi.1 + last_roi.3 >= 400, "área {last_roi:?}");
     for _ in 0..20 {
         now += Duration::from_millis(50);
         frames.extend(enc.idle_tick(60, now));

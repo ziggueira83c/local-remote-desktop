@@ -25,6 +25,9 @@ pub struct Encoded {
 pub trait Backend: Send {
     fn encode(&mut self, frame: &RawFrame, force_keyframe: bool) -> Result<Option<Encoded>>;
     fn set_bitrate(&mut self, bps: u32);
+    /// Área (x, y, w, h) que recebe mais qualidade no próximo quadro, com o delta de QP
+    /// (negativo = melhor). Só alguns codificadores suportam; os outros ignoram.
+    fn set_roi(&mut self, _roi: Option<(u32, u32, u32, u32, i32)>) {}
     fn name(&self) -> &'static str;
     /// Aceita quadros na GPU (`RawFrame::native`).
     fn accepts_native(&self) -> bool {
@@ -54,6 +57,7 @@ pub struct H264Encoder {
     native_failed: bool,
     /// Dispositivo do modo GPU em uso (`None` = modo CPU).
     native_key: Option<usize>,
+    roi: Option<(u32, u32, u32, u32, i32)>,
 }
 
 impl H264Encoder {
@@ -61,6 +65,7 @@ impl H264Encoder {
         // O motor de verdade é criado no primeiro quadro (precisa das dimensões).
         Ok(H264Encoder {
             backend: Box::new(NullBackend),
+            roi: None,
             dims: (0, 0),
             quality: *q,
             bitrate: q.bitrate_bps,
@@ -198,6 +203,11 @@ impl H264Encoder {
 
     /// Codifica um quadro e devolve o quadro de rede pronto. `frame` vem da CPU no tamanho
     /// final (dimensões pares), ou da GPU depois de `prepare_native` devolver `true`.
+    /// Ver `Backend::set_roi`; vale para os próximos quadros até mudar.
+    pub fn set_roi(&mut self, roi: Option<(u32, u32, u32, u32, i32)>) {
+        self.roi = roi;
+    }
+
     pub fn encode(&mut self, frame: &RawFrame) -> Option<Vec<u8>> {
         let native = frame.native.is_some() && self.native_key.is_some() && self.backend.accepts_native();
         let (w, h) = if native { self.dims } else { (frame.width, frame.height) };
@@ -210,6 +220,7 @@ impl H264Encoder {
             self.force_key = true;
         }
         let force = std::mem::take(&mut self.force_key);
+        self.backend.set_roi(self.roi);
         let out = match self.backend.encode(frame, force) {
             Ok(o) => o,
             Err(e) => {

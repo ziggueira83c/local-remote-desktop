@@ -424,7 +424,18 @@ impl LrdEncoder {
         //     com perdas; se o codificador falhar, eles vão em JPEG.
         if jobs.iter().any(|j| matches!(j.kind, JobKind::Video)) {
             let rects: Vec<Rect> = jobs.iter().filter(|j| matches!(j.kind, JobKind::Video)).map(|j| (j.x, j.y, j.w, j.h)).collect();
-            match self.encode_video(cur, key, frame.timestamp_us) {
+            // Texto/interface indo pelo vídeo (poucas cores): mais qualidade nessa área.
+            let mut tb: Option<(u32, u32, u32, u32)> = None; // x0, y0, x1, y1
+            for i in 0..n {
+                if let (Class::Lossy { photo: false, .. }, Some((x, y, bw, bh))) = (classes[i], dirty[i]) {
+                    tb = Some(match tb {
+                        None => (x, y, x + bw, y + bh),
+                        Some((a, b, c, d)) => (a.min(x), b.min(y), c.max(x + bw), d.max(y + bh)),
+                    });
+                }
+            }
+            let roi = tb.map(|(a, b, c, d)| (a, b, c - a, d - b)).filter(|r| (r.2 as u64 * r.3 as u64) * 2 < w as u64 * h as u64);
+            match self.encode_video(cur, key, frame.timestamp_us, roi) {
                 Some((flags, data)) => {
                     stats.video_bytes = data.len();
                     stats.video_rect = Some((0, 0, w, h));
@@ -611,7 +622,7 @@ impl LrdEncoder {
 
     /// Um quadro da tela inteira pelo codificador temporal: (flags, Annex B). `None` = sem
     /// codificador (falhou ao criar: desliga o vídeo) ou quadro não saiu.
-    fn encode_video(&mut self, cur: &[u8], key: bool, capture_us: u64) -> Option<(u8, Vec<u8>)> {
+    fn encode_video(&mut self, cur: &[u8], key: bool, capture_us: u64, roi: Option<Rect>) -> Option<(u8, Vec<u8>)> {
         let (w, h) = (self.width, self.height);
         let v = self.video.as_mut()?.get_mut().unwrap_or_else(|e| e.into_inner());
         if v.disabled {
@@ -633,6 +644,7 @@ impl LrdEncoder {
             }
         }
         let (_, enc) = v.enc.as_mut()?;
+        enc.set_roi(roi);
         let frame = RawFrame::cpu(w, h, cur.to_vec(), PixelFormat::Bgra, capture_us);
         match enc.encode(&frame, force) {
             Some(out) => Some((if out.idr { VIDEO_IDR } else { 0 } | if out.hevc { VIDEO_HEVC } else { 0 }, out.annexb)),

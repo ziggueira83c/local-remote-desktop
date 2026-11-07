@@ -27,6 +27,9 @@ pub struct MfEncoder {
     transform: IMFTransform,
     events: IMFMediaEventGenerator,
     codec: Option<ICodecAPI>,
+    /// O codificador aceitou qualidade por região (CODECAPI_AVEncVideoROIEnabled).
+    roi_enabled: bool,
+    roi: Option<(u32, u32, u32, u32, i32)>,
     width: u32,
     height: u32,
     fps: u32,
@@ -157,6 +160,8 @@ impl MfEncoder {
             transform.SetInputType(0, &in_type, 0).context("SetInputType")?;
 
             let codec: Option<ICodecAPI> = transform.cast().ok();
+            let roi_enabled = codec.as_ref().is_some_and(|c| c.SetValue(&CODECAPI_AVEncVideoROIEnabled, &VARIANT::from(1u32)).is_ok());
+            tracing::info!("codificador {name}: qualidade por região {}", if roi_enabled { "disponível" } else { "indisponível" });
             if let Some(c) = &codec {
                 let _ = c.SetValue(&CODECAPI_AVLowLatencyMode, &VARIANT::from(true));
                 let _ = c.SetValue(&CODECAPI_AVEncCommonRateControlMode, &VARIANT::from(eAVEncCommonRateControlMode_CBR.0 as u32));
@@ -175,6 +180,8 @@ impl MfEncoder {
                 transform,
                 events,
                 codec,
+                roi_enabled,
+                roi: None,
                 width,
                 height,
                 fps: fps.max(1),
@@ -331,6 +338,14 @@ impl Backend for MfEncoder {
             };
             let sample = MFCreateSample()?;
             sample.AddBuffer(&buffer)?;
+            if let (true, Some((x, y, w, h, delta))) = (self.roi_enabled, self.roi) {
+                let area = ROI_AREA {
+                    rect: windows::Win32::Foundation::RECT { left: x as i32, top: y as i32, right: (x + w) as i32, bottom: (y + h) as i32 },
+                    QPDelta: delta,
+                };
+                let bytes = std::slice::from_raw_parts(&area as *const ROI_AREA as *const u8, std::mem::size_of::<ROI_AREA>());
+                let _ = sample.SetBlob(&MFSampleExtension_ROIRectangle, bytes);
+            }
             let duration = 10_000_000i64 / self.fps as i64;
             sample.SetSampleTime(self.frame_index * duration)?;
             sample.SetSampleDuration(duration)?;
@@ -360,6 +375,10 @@ impl Backend for MfEncoder {
             annexb.extend_from_slice(&e.annexb);
         }
         Ok(Some(Encoded { annexb, keyframe }))
+    }
+
+    fn set_roi(&mut self, roi: Option<(u32, u32, u32, u32, i32)>) {
+        self.roi = roi;
     }
 
     fn set_bitrate(&mut self, bps: u32) {

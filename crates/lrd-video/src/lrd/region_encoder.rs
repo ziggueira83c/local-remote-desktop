@@ -12,6 +12,8 @@ pub struct RegionOut {
 pub trait RegionEncoder: Send {
     fn encode(&mut self, frame: &RawFrame, force_idr: bool) -> Option<RegionOut>;
     fn set_bitrate(&mut self, bps: u32);
+    /// Área com mais qualidade no próximo quadro (texto em movimento); `None` = nenhuma.
+    fn set_roi(&mut self, _roi: Option<(u32, u32, u32, u32)>) {}
 }
 
 /// Cria um codificador para uma região de (largura, altura); `None` = indisponível.
@@ -23,6 +25,8 @@ pub type RegionFactory = Box<dyn FnMut(u32, u32) -> Option<Box<dyn RegionEncoder
 pub fn hardware_region_encoder(hevc: bool, fps: u32, bitrate_bps: u32) -> RegionFactory {
     use crate::h264::H264Encoder;
     use crate::QualitySettings;
+
+    const TEXT_QP_DELTA: i32 = -8;
 
     struct Hw(H264Encoder);
 
@@ -44,6 +48,11 @@ pub fn hardware_region_encoder(hevc: bool, fps: u32, bitrate_bps: u32) -> Region
 
         fn set_bitrate(&mut self, bps: u32) {
             self.0.set_bitrate(bps);
+        }
+
+        fn set_roi(&mut self, roi: Option<(u32, u32, u32, u32)>) {
+            // QP 8 abaixo do resto: texto em movimento bem mais nítido, sem estourar a taxa.
+            self.0.set_roi(roi.map(|(x, y, w, h)| (x, y, w, h, TEXT_QP_DELTA)));
         }
     }
 
