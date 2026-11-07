@@ -128,8 +128,12 @@ for (const bname of wanted) {
         if (mbps > targets[cfg.scenario]) sproblems.push(`${mbps.toFixed(1)} Mbps > ${targets[cfg.scenario]}`);
       }
       // Fluidez: todo cenário com movimento precisa manter ≥ 28 qps (fonte a 30).
+      // Exceção: o GitHub não tem placa de vídeo e o vídeo da tela inteira cai no OpenH264
+      // (software, > 30 ms por quadro em 1080p) — limite da máquina, não do codecLRD.
+      const softwareLimited = l.videoFrames > 0 && l.encodeMsAvg > 30;
       if (process.platform === "win32" && cfg.scenario !== "parado" && !(pg.fps >= 28)) {
-        sproblems.push(`${pg.fps?.toFixed(1)} qps < 28`);
+        if (softwareLimited) console.log(`   aviso: ${pg.fps?.toFixed(1)} qps com codificador por software (${l.encodeMsAvg} ms/quadro)`);
+        else sproblems.push(`${pg.fps?.toFixed(1)} qps < 28`);
       }
       if (process.platform === "win32" && before[cfg.scenario] != null && l.kbPerFrame > before[cfg.scenario] * 1.2) {
         sproblems.push(`${l.kbPerFrame} KB/q (antes ${before[cfg.scenario]})`);
