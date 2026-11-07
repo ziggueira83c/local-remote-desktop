@@ -29,6 +29,9 @@
 //!   4 COPY : x y w h, u16 src_x, u16 src_y   (como memmove: origem lida antes de escrever)
 //!   5 VIDEO: x y w h, u8 flags (bit 0 = IDR, bit 1 = H.265; senão H.264), u32 len,
 //!            [unidade de acesso Annex B] — região de vídeo/jogo com codec temporal
+//!   6 VIDEO_RECTS: x y w h (área do vídeo), u8 flags (como VIDEO), u16 n, n × (u16 x, y, w, h
+//!            absolutos, dentro da área), u32 len, [Annex B] — o quadro decodificado só é
+//!            desenhado nesses retângulos (o resto da tela fica com o que já estava, sem perdas)
 //! ```
 
 pub const FRAME_LRD: u8 = 5;
@@ -40,6 +43,7 @@ pub const OP_LZ4: u8 = 2;
 pub const OP_JPEG: u8 = 3;
 pub const OP_COPY: u8 = 4;
 pub const OP_VIDEO: u8 = 5;
+pub const OP_VIDEO_RECTS: u8 = 6;
 
 /// Flags da operação VIDEO.
 pub const VIDEO_IDR: u8 = 1;
@@ -69,6 +73,7 @@ pub enum Op<'a> {
     Jpeg { x: u32, y: u32, w: u32, h: u32, data: &'a [u8] },
     Copy { x: u32, y: u32, w: u32, h: u32, sx: u32, sy: u32 },
     Video { x: u32, y: u32, w: u32, h: u32, flags: u8, data: &'a [u8] },
+    VideoRects { x: u32, y: u32, w: u32, h: u32, flags: u8, rects: Vec<(u32, u32, u32, u32)>, data: &'a [u8] },
 }
 
 /// Escreve um quadro. `ops` já serializadas (ver `push_*`).
@@ -126,6 +131,21 @@ impl Writer {
     pub fn video(&mut self, x: u32, y: u32, w: u32, h: u32, flags: u8, data: &[u8]) {
         self.rect(OP_VIDEO, x, y, w, h);
         self.buf.push(flags);
+        self.buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        self.buf.extend_from_slice(data);
+    }
+
+    /// Vídeo da área (x, y, w, h), desenhado só em `rects` (absolutos, até 65 535).
+    pub fn video_rects(&mut self, x: u32, y: u32, w: u32, h: u32, flags: u8, rects: &[(u32, u32, u32, u32)], data: &[u8]) {
+        self.rect(OP_VIDEO_RECTS, x, y, w, h);
+        self.buf.push(flags);
+        let n = rects.len().min(u16::MAX as usize);
+        self.buf.extend_from_slice(&(n as u16).to_le_bytes());
+        for r in &rects[..n] {
+            for v in [r.0, r.1, r.2, r.3] {
+                self.buf.extend_from_slice(&(v as u16).to_le_bytes());
+            }
+        }
         self.buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
         self.buf.extend_from_slice(data);
     }
@@ -222,6 +242,25 @@ pub fn parse(b: &[u8]) -> Option<(Header, Vec<Op<'_>>)> {
                 o += len;
                 Op::Video { x, y, w, h: hh, flags, data }
             }
+            OP_VIDEO_RECTS => {
+                let flags = *b.get(o)?;
+                let n = u16_at(b, o + 1)? as usize;
+                o += 3;
+                let mut rects = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let r = (u16_at(b, o)?, u16_at(b, o + 2)?, u16_at(b, o + 4)?, u16_at(b, o + 6)?);
+                    o += 8;
+                    if r.2 == 0 || r.3 == 0 || r.0 < x || r.1 < y || r.0 + r.2 > x + w || r.1 + r.3 > y + hh {
+                        return None;
+                    }
+                    rects.push(r);
+                }
+                let len = u32_at(b, o)?;
+                o += 4;
+                let data = b.get(o..o + len)?;
+                o += len;
+                Op::VideoRects { x, y, w, h: hh, flags, rects, data }
+            }
             _ => return None,
         };
         ops.push(op);
@@ -268,6 +307,21 @@ mod tests {
         assert_eq!(ops, vec![Op::Video { x: 16, y: 32, w: 640, h: 368, flags: 3, data: &[0, 0, 0, 1, 0x40] }]);
         let mut bad = Writer::new(false, 1280, 720, 9, 3);
         bad.video(1000, 0, 640, 368, VIDEO_IDR, &[1]);
+        assert!(parse(&bad.finish()).is_none());
+    }
+
+    #[test]
+    fn video_rects_roundtrip() {
+        let mut w = Writer::new(false, 1280, 720, 9, 3);
+        w.video_rects(0, 0, 1280, 720, VIDEO_HEVC, &[(64, 0, 128, 64), (0, 640, 1280, 80)], &[0, 0, 1, 2]);
+        let f = w.finish();
+        let (_, ops) = parse(&f).unwrap();
+        assert_eq!(
+            ops,
+            vec![Op::VideoRects { x: 0, y: 0, w: 1280, h: 720, flags: 2, rects: vec![(64, 0, 128, 64), (0, 640, 1280, 80)], data: &[0, 0, 1, 2] }]
+        );
+        let mut bad = Writer::new(false, 1280, 720, 9, 3);
+        bad.video_rects(0, 0, 640, 360, 0, &[(600, 0, 64, 64)], &[1]);
         assert!(parse(&bad.finish()).is_none());
     }
 }

@@ -126,7 +126,10 @@ for (const bname of wanted) {
       const sproblems = [];
       if (process.platform === "win32" && targets[cfg.scenario] != null) {
         if (mbps > targets[cfg.scenario]) sproblems.push(`${mbps.toFixed(1)} Mbps > ${targets[cfg.scenario]}`);
-        if (!(pg.fps >= 28)) sproblems.push(`${pg.fps?.toFixed(1)} qps < 28`);
+      }
+      // Fluidez: todo cenário com movimento precisa manter ≥ 28 qps (fonte a 30).
+      if (process.platform === "win32" && cfg.scenario !== "parado" && !(pg.fps >= 28)) {
+        sproblems.push(`${pg.fps?.toFixed(1)} qps < 28`);
       }
       if (process.platform === "win32" && before[cfg.scenario] != null && l.kbPerFrame > before[cfg.scenario] * 1.2) {
         sproblems.push(`${l.kbPerFrame} KB/q (antes ${before[cfg.scenario]})`);
@@ -141,7 +144,7 @@ for (const bname of wanted) {
         pg.lrdApplyMsAvg?.toFixed(1), pg.lrdApplyMsP95?.toFixed(1), pg.lrdQueueApplyMsAvg?.toFixed(1),
         l.deferred, l.copies, l.lz4Mpx, l.jpegMpx, pg.inputRttMs?.toFixed(1) ?? "-",
         `${l.videoKbPerFrame ?? 0} KB/q vídeo (${l.videoHevcFrames ?? 0}/${l.videoFrames ?? 0} H.265, decod. ${pg.lrdVideoCodec ?? "-"})`,
-        pg.lrdProf ? `ops ${pg.lrdProf.opsPerFrame.toFixed(0)} · LZ4 ${pg.lrdProf.lz4Ms.toFixed(1)} · JPEG espera ${pg.lrdProf.jpegDecodeWaitMs.toFixed(1)} · JPEG desenho ${pg.lrdProf.jpegDrawMs.toFixed(1)} · cópia ${pg.lrdProf.copyMs.toFixed(1)} · cor ${pg.lrdProf.fillMs.toFixed(1)}` : "-",
+        pg.lrdProf ? `ops ${pg.lrdProf.opsPerFrame.toFixed(0)} · vídeo atrasado ${pg.lrdProf.videoLate} · LZ4 ${pg.lrdProf.lz4Ms.toFixed(1)} · JPEG espera ${pg.lrdProf.jpegDecodeWaitMs.toFixed(1)} · JPEG desenho ${pg.lrdProf.jpegDrawMs.toFixed(1)} · cópia ${pg.lrdProf.copyMs.toFixed(1)} · cor ${pg.lrdProf.fillMs.toFixed(1)}` : "-",
       ]);
       continue;
     }

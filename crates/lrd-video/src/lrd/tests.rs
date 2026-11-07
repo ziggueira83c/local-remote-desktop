@@ -293,7 +293,7 @@ fn unaligned_video_region_uses_few_operations() {
     }
 }
 
-// ---------- região de vídeo (Task 3) ----------
+// ---------- vídeo da tela inteira ----------
 
 use super::region_encoder::{RegionEncoder, RegionOut};
 use std::sync::{Arc as SArc, Mutex as SMutex};
@@ -347,140 +347,137 @@ fn ops_of(bytes: &[u8]) -> Vec<lrd_protocol::lrd::Op<'_>> {
 
 fn count_ops(bytes: &[u8]) -> (usize, usize) {
     let ops = ops_of(bytes);
-    let v = ops.iter().filter(|o| matches!(o, lrd_protocol::lrd::Op::Video { .. })).count();
+    let v = ops.iter().filter(|o| matches!(o, lrd_protocol::lrd::Op::VideoRects { .. })).count();
     let j = ops.iter().filter(|o| matches!(o, lrd_protocol::lrd::Op::Jpeg { .. })).count();
     (v, j)
 }
 
+
+fn video_rects(bytes: &[u8]) -> Vec<(u32, u32, u32, u32)> {
+    ops_of(bytes)
+        .into_iter()
+        .filter_map(|o| match o {
+            lrd_protocol::lrd::Op::VideoRects { x, y, w, h, rects, .. } => {
+                assert_eq!((x, y), (0, 0));
+                assert_eq!((w, h), (1024, 512), "o vídeo é sempre da tela inteira");
+                Some(rects)
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
 #[test]
-fn video_region_replaces_jpeg_and_keeps_text_exact() {
+fn motion_goes_through_full_screen_video_only_where_it_changed() {
     let log = SArc::new(SMutex::new(StubLog::default()));
     let mut enc = LrdEncoder::new();
     enc.enable_video(stub_factory(log.clone(), false), 8_000_000);
     let mut frames = Vec::new();
-    for t in 0..12 {
+    for t in 0..6 {
         frames.push(enc.encode(&video_frame(t, 768), 60).unwrap());
     }
-    for f in &frames[8..] {
-        assert_eq!(count_ops(f), (1, 0), "esperado só a operação de vídeo");
+    // Um codificador só, do tamanho da tela, criado uma vez.
+    assert_eq!(log.lock().unwrap().created, vec![(1024, 512)]);
+    // Nenhum JPEG: o que se mexe vai pelo vídeo; os retângulos cobrem só a área do vídeo.
+    for f in &frames[1..] {
+        let (v, j) = count_ops(f);
+        assert_eq!((v, j), (1, 0));
+        for (x, y, w, h) in video_rects(f) {
+            assert!(x >= 128 && x + w <= 768 && y >= 64 && y + h <= 448, "retângulo fora do vídeo: {:?}", (x, y, w, h));
+        }
     }
-    assert_eq!(log.lock().unwrap().created.len(), 1);
+    // O texto em volta continua exato.
     let (fb, _) = decode(&frames);
-    let want = video_frame(11, 768);
+    let want = video_frame(5, 768);
     for y in 0..512usize {
         for x in 0..1024usize {
-            if (128..768).contains(&x) && (64..448).contains(&y) {
-                continue;
-            }
-            let o = (y * 1024 + x) * 4;
-            assert_eq!(fb[o..o + 3], want.data[o..o + 3], "pixel ({x},{y})");
-        }
-    }
-}
-
-#[test]
-fn region_resize_starts_with_idr() {
-    let log = SArc::new(SMutex::new(StubLog::default()));
-    let mut enc = LrdEncoder::new();
-    enc.enable_video(stub_factory(log.clone(), false), 8_000_000);
-    for t in 0..10 {
-        enc.encode(&video_frame(t, 768), 60).unwrap();
-    }
-    let mut saw_resize = false;
-    for t in 10..24 {
-        let b = enc.encode(&video_frame(t, 960), 60).unwrap();
-        for op in ops_of(&b) {
-            if let lrd_protocol::lrd::Op::Video { w, flags, .. } = op {
-                if w > 640 && !saw_resize {
-                    assert!(flags & lrd_protocol::lrd::VIDEO_IDR != 0, "primeiro quadro do tamanho novo sem IDR");
-                    saw_resize = true;
-                }
+            if !((128..768).contains(&x) && (64..448).contains(&y)) {
+                let o = (y * 1024 + x) * 4;
+                assert_eq!(fb[o..o + 3], want.data[o..o + 3], "pixel ({x},{y})");
             }
         }
     }
-    assert!(saw_resize, "a região não cresceu");
-    assert_eq!(log.lock().unwrap().created.len(), 2);
 }
 
 #[test]
-fn keyframe_request_forces_idr_and_full_frame() {
+fn typing_text_stays_lossless_without_video() {
+    // Interface parada com um cursor de texto piscando e letras aparecendo: sem vídeo, exato.
     let log = SArc::new(SMutex::new(StubLog::default()));
     let mut enc = LrdEncoder::new();
     enc.enable_video(stub_factory(log.clone(), false), 8_000_000);
-    for t in 0..10 {
-        enc.encode(&video_frame(t, 768), 60).unwrap();
-    }
-    enc.force_keyframe();
-    let b = enc.encode(&video_frame(10, 768), 60).unwrap();
-    let (h, ops) = lrd_protocol::lrd::parse(&b).unwrap();
-    assert!(h.keyframe);
-    assert!(ops.iter().any(|o| matches!(o, lrd_protocol::lrd::Op::Video { flags, .. } if flags & lrd_protocol::lrd::VIDEO_IDR != 0)));
-}
-
-#[test]
-fn released_area_returns_exact() {
-    let log = SArc::new(SMutex::new(StubLog::default()));
-    let mut enc = LrdEncoder::new();
-    enc.enable_video(stub_factory(log.clone(), false), 8_000_000);
-    let mut now = Instant::now();
+    let text = |k: u32| {
+        frame(1024, 512, move |x, y| {
+            let caret = (k / 15) % 2 == 0 && (300 + k..302 + k).contains(&x) && (200..216).contains(&y);
+            let typed = (300..300 + k).contains(&x) && (202..214).contains(&y) && (x + y) % 3 == 0;
+            if caret || typed { [0, 0, 0] } else { ui(x, y, 0) }
+        })
+    };
     let mut frames = Vec::new();
-    for t in 0..10 {
-        now += Duration::from_millis(33);
-        frames.extend(enc.encode_at(&video_frame(t, 768), 60, now));
-    }
-    // O vídeo para: a área vira interface parada. Passa 1,5 s.
-    let still = frame(1024, 512, |x, y| ui(x, y, 0));
-    for _ in 0..45 {
-        now += Duration::from_millis(33);
-        frames.extend(enc.encode_at(&still, 60, now));
+    for k in 0..60 {
+        if let Some(b) = enc.encode(&text(k), 60) {
+            assert_eq!(count_ops(&b), (0, 0), "texto foi pelo vídeo/JPEG no quadro {k}");
+            frames.push(b);
+        }
     }
     let (fb, _) = decode(&frames);
-    assert!(bgr_eq(&fb, &still.data), "a área liberada não voltou exata");
+    assert!(bgr_eq(&fb, &text(59).data));
 }
 
 #[test]
-fn encoder_failure_disables_video() {
+fn video_area_refines_lossless_when_it_stops() {
     let log = SArc::new(SMutex::new(StubLog::default()));
     let mut enc = LrdEncoder::new();
-    enc.enable_video(stub_factory(log.clone(), true), 8_000_000);
+    enc.enable_video(stub_factory(log.clone(), false), 8_000_000);
+    // Conteúdo com muitas cores em movimento que para (ex.: página com imagens rolando).
+    let grad = |t: u32| frame(1024, 512, move |x, y| [((x + t * 7) % 256) as u8, ((y + t * 3) % 256) as u8, ((x ^ y) % 256) as u8]);
+    let mut now = Instant::now();
+    let mut frames = Vec::new();
+    for t in 0..6 {
+        now += Duration::from_millis(33);
+        frames.extend(enc.encode_at(&grad(t), 60, now));
+    }
+    assert!(frames.iter().any(|f| count_ops(f).0 == 1), "deveria ter ido pelo vídeo");
+    // Para: a captura não entrega mais nada; o refino reenvia a área sem perdas/JPEG alto.
+    for _ in 0..20 {
+        now += Duration::from_millis(50);
+        frames.extend(enc.idle_tick(60, now));
+        if enc.refine_due_at(now) {
+            frames.extend(enc.refine_at(0, now));
+        }
+    }
+    let (fb, _) = decode(&frames);
+    let painted = fb.chunks_exact(4).filter(|p| p[..3] == [1, 2, 3]).count();
+    assert_eq!(painted, 0, "{painted} pixels ainda só com o vídeo depois de parar");
+}
+
+#[test]
+fn keyframe_request_forces_idr() {
+    let log = SArc::new(SMutex::new(StubLog::default()));
+    let mut enc = LrdEncoder::new();
+    enc.enable_video(stub_factory(log.clone(), false), 8_000_000);
+    for t in 0..4 {
+        enc.encode(&video_frame(t, 768), 60);
+    }
+    let idrs = log.lock().unwrap().idrs;
+    enc.force_keyframe();
+    let b = enc.encode(&video_frame(9, 768), 60).unwrap();
+    assert!(lrd_protocol::lrd::parse(&b).unwrap().0.keyframe);
+    assert_eq!(log.lock().unwrap().idrs, idrs + 1);
+}
+
+#[test]
+fn encoder_failure_falls_back_to_jpeg() {
+    let log = SArc::new(SMutex::new(StubLog::default()));
+    let mut enc = LrdEncoder::new();
+    enc.enable_video(stub_factory(log, true), 8_000_000);
     let mut last = Vec::new();
-    for t in 0..12 {
+    for t in 0..4 {
         last = enc.encode(&video_frame(t, 768), 60).unwrap();
     }
     let (v, j) = count_ops(&last);
     assert_eq!(v, 0);
-    assert!(j > 0, "a área deveria seguir em JPEG");
-}
-
-#[test]
-fn static_text_with_blinking_caret_turns_region_off_and_stays_exact() {
-    // Vídeo para e vira texto parado com um cursor de texto piscando (≈ a cada 500 ms) dentro
-    // da antiga região: a região precisa desligar e o texto voltar exato (sem ficar embaçado).
-    let log = SArc::new(SMutex::new(StubLog::default()));
-    let mut enc = LrdEncoder::new();
-    enc.enable_video(stub_factory(log.clone(), false), 8_000_000);
-    let mut now = Instant::now();
-    let mut frames = Vec::new();
-    for t in 0..10 {
-        now += Duration::from_millis(33);
-        frames.extend(enc.encode_at(&video_frame(t, 768), 60, now));
-    }
-    let text = |on: bool| frame(1024, 512, move |x, y| if on && (300..302).contains(&x) && (200..216).contains(&y) { [0, 0, 0] } else { ui(x, y, 0) });
-    let mut last = None;
-    for k in 0..90 {
-        now += Duration::from_millis(33);
-        let f = text((k / 15) % 2 == 0);
-        let b = enc.encode_at(&f, 60, now);
-        if k >= 60 {
-            if let Some(b) = &b {
-                assert_eq!(count_ops(b).0, 0, "região de vídeo ainda ligada no quadro {k}");
-            }
-        }
-        frames.extend(b);
-        last = Some(f);
-    }
-    let (fb, _) = decode(&frames);
-    assert!(bgr_eq(&fb, &last.unwrap().data), "texto parado não voltou exato");
+    assert!(j > 0);
 }
 
 #[test]
@@ -506,31 +503,4 @@ fn screen_stops_without_new_frames_still_refines() {
     }
     let (fb, _) = decode(&frames);
     assert!(bgr_eq(&fb, &last.data), "texto parado ficou com perdas");
-}
-
-#[test]
-fn video_region_turns_off_when_frames_stop() {
-    let log = SArc::new(SMutex::new(StubLog::default()));
-    let mut enc = LrdEncoder::new();
-    enc.enable_video(stub_factory(log.clone(), false), 8_000_000);
-    let mut now = Instant::now();
-    let mut frames = Vec::new();
-    for t in 0..10 {
-        now += Duration::from_millis(33);
-        frames.extend(enc.encode_at(&video_frame(t, 768), 60, now));
-    }
-    // A tela para no último quadro do vídeo e a captura não entrega mais nada.
-    for _ in 0..40 {
-        now += Duration::from_millis(50);
-        frames.extend(enc.idle_tick(60, now));
-        if enc.refine_due_at(now) {
-            frames.extend(enc.refine_at(0, now));
-        }
-    }
-    assert!(!enc.needs_idle_tick(), "deveria ter terminado");
-    let (fb, _) = decode(&frames);
-    // O decodificador de referência pinta a região de vídeo como [1,2,3]: depois que a região
-    // desliga, a área é reenviada pelo caminho normal e nenhum pixel pode ficar assim.
-    let painted = fb.chunks_exact(4).filter(|p| p[..3] == [1, 2, 3]).count();
-    assert!(painted == 0, "região de vídeo não desligou: {painted} pixels do vídeo");
 }

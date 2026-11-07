@@ -63,12 +63,12 @@ export async function supportedCodecs(): Promise<string[]> {
       const r = await VideoDecoder.isConfigSupported({ codec: "avc1.42E033", optimizeForLatency: true });
       if (r.supported) {
         out.unshift("h264");
-        // codecLRD com região de vídeo (H.265 de preferência, H.264 de reserva).
-        out.push("lrd-video");
-        const h = await VideoDecoder.isConfigSupported({ codec: "hvc1.1.6.L120.B0", optimizeForLatency: true }).catch(
+        // codecLRD com vídeo da tela inteira (H.265 de preferência, H.264 de reserva).
+        out.push("lrd-video2");
+        const h = await VideoDecoder.isConfigSupported({ codec: "hvc1.1.6.L153.B0", optimizeForLatency: true }).catch(
           () => ({ supported: false }),
         );
-        if (h.supported) out.push("lrd-video-h265");
+        if (h.supported) out.push("lrd-video2-h265");
       }
     }
   } catch {

@@ -40,8 +40,8 @@ try {
   h265 = !!RTCRtpReceiver.getCapabilities("video")?.codecs.some((c) => c.mimeType.toLowerCase() === "video/h265");
 } catch {}
 const caps = await supportedCodecs();
-const lrdvideo = caps.includes("lrd-video") ? 1 : 0;
-const lrdh265 = caps.includes("lrd-video-h265") ? 1 : 0;
+const lrdvideo = caps.includes("lrd-video2") ? 1 : 0;
+const lrdh265 = caps.includes("lrd-video2-h265") ? 1 : 0;
 log(`capacidades: ${caps.join(",")}`);
 const sdp = await (await fetch(`/offer?h265=${h265 ? 1 : 0}&lrdvideo=${lrdvideo}&lrdh265=${lrdh265}`)).text();
 const engine = new MediaEngine(null);
@@ -216,7 +216,7 @@ const result = {
     const p = engine.lrdProfile();
     if (!p || !p.frames) return null;
     const f = p.frames;
-    return { opsPerFrame: p.ops / f, fillMs: p.fill / f, lz4Ms: p.lz4 / f, jpegDrawMs: p.jpeg / f, jpegDecodeWaitMs: p.jpegWait / f, copyMs: p.copy / f };
+    return { videoLate: p.videoLate, opsPerFrame: p.ops / f, fillMs: p.fill / f, lz4Ms: p.lz4 / f, jpegDrawMs: p.jpeg / f, jpegDecodeWaitMs: p.jpegWait / f, copyMs: p.copy / f };
   })(),
   ua: navigator.userAgent,
   browserH265: h265,
