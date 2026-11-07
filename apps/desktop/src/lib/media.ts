@@ -537,7 +537,12 @@ export class MediaEngine {
         }
         this.cb?.onDrawn();
       })
-      .catch((e) => console.warn("codecLRD", e))
+      .catch((e) => {
+        // Erro inesperado no meio de um quadro: não dá para confiar no que está na tela.
+        console.warn("codecLRD", e);
+        dec.reset();
+        this.requestKeyframe();
+      })
       .finally(() => {
         this.lrdBacklog--;
         // Confirma ao host: ele só manda mais quando a tela daqui acompanha.

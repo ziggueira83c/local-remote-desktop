@@ -155,8 +155,17 @@ export class LrdDecoder {
     }
     // JPEGs decodificam em paralelo; as operações são aplicadas na ordem do quadro.
     const tWait = performance.now();
-    const bitmaps = await Promise.all(ops.map((o) => (o.kind === OP_JPEG ? o.img : null)));
+    const settled = await Promise.allSettled(ops.map((o) => (o.kind === OP_JPEG ? o.img : null)));
     this.prof.jpegWait += performance.now() - tWait;
+    const bitmaps = settled.map((r) => (r.status === "fulfilled" ? r.value : null));
+    if (settled.some((r) => r.status === "rejected")) {
+      // Um bloco não decodificou: a tela daqui ficaria errada ⇒ pede um quadro completo.
+      console.warn("codecLRD: falha ao decodificar JPEG", settled.find((r) => r.status === "rejected"));
+      for (const bm of bitmaps) bm?.close();
+      this.waitingKey = true;
+      this.needKeyframe();
+      return null;
+    }
     this.prof.ops += ops.length;
     this.prof.frames++;
     const ctx = this.ctx;
