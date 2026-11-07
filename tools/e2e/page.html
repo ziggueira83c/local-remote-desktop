@@ -12,6 +12,27 @@ const log = (m) => fetch("/log", { method: "POST", body: String(m) });
 window.onerror = (e) => log("erro: " + e);
 
 const cfg = await (await fetch("/config")).json();
+
+// Autoteste do canvas do navegador: putImageData → getImageData e → drawImage em outro canvas.
+try {
+  const a = document.createElement("canvas");
+  a.width = 64; a.height = 32;
+  const ac = a.getContext("2d", { alpha: false });
+  const img = new ImageData(64, 32);
+  for (let i = 0; i < 64 * 32; i++) { const v = (i % 2) * 255; img.data[i * 4] = v; img.data[i * 4 + 1] = v; img.data[i * 4 + 2] = v; img.data[i * 4 + 3] = 255; }
+  ac.putImageData(img, 0, 0);
+  const back = ac.getImageData(0, 0, 64, 32).data;
+  const b = document.createElement("canvas");
+  b.width = 64; b.height = 32;
+  const bc = b.getContext("2d", { willReadFrequently: true });
+  bc.drawImage(a, 0, 0);
+  const copy = bc.getImageData(0, 0, 64, 32).data;
+  let okBack = 0, okCopy = 0;
+  for (let i = 0; i < 64 * 32; i++) { const v = (i % 2) * 255; if (back[i * 4] === v) okBack++; if (copy[i * 4] === v) okCopy++; }
+  log(`autoteste canvas: getImageData ${okBack}/2048, cópia drawImage ${okCopy}/2048; px1 direto ${back[4]} cópia ${copy[4]}`);
+} catch (e) {
+  log("autoteste canvas falhou: " + (e && (e.name + ": " + e.message)));
+}
 let h265 = false;
 try {
   h265 = !!RTCRtpReceiver.getCapabilities("video")?.codecs.some((c) => c.mimeType.toLowerCase() === "video/h265");
@@ -120,7 +141,16 @@ const sharpTimer = setInterval(() => {
     // Pixels exatos do xadrez (região parada): sem perdas ⇒ 100%.
     exactSamples.push(exactOf(ctx.getImageData(100, 100, 256, 128).data));
     // codecLRD: também direto do canvas exibido (sem a cópia por drawImage).
-    if (cfg.lrd) exactDirectSamples.push(exactOf(lrdCanvas.getContext("2d").getImageData(100, 100, 256, 128).data));
+    if (cfg.lrd) {
+      try {
+        const c2 = lrdCanvas.getContext("2d");
+        if (!c2) throw new Error("getContext(2d) devolveu null");
+        exactDirectSamples.push(exactOf(c2.getImageData(100, 100, 256, 128).data));
+      } catch (e) {
+        if (!window.__directErr) log("leitura direta do canvas falhou: " + (e && (e.name + ": " + e.message)));
+        window.__directErr = true;
+      }
+    }
   }
   const sx = srcW() / 1280, sy = srcH() / 720;
   const d = ctx.getImageData(Math.round(110 * sx), Math.round(110 * sy), Math.round(200 * sx), Math.round(100 * sy)).data;
@@ -136,6 +166,14 @@ const sharpTimer = setInterval(() => {
 }, 500);
 
 await new Promise((r) => setTimeout(r, cfg.seconds * 1000));
+if (cfg.lrd) {
+  try {
+    const d = lrdCanvas.getContext("2d").getImageData(100, 100, 4, 1).data;
+    log(`canvas codecLRD (100..103,100): ${Array.from(d).join(",")}`);
+  } catch (e) {
+    log("leitura final do canvas codecLRD falhou: " + (e && (e.name + ": " + e.message)));
+  }
+}
 clearInterval(inputTimer);
 clearInterval(clickTimer);
 clearInterval(sharpTimer);
