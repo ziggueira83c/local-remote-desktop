@@ -221,8 +221,15 @@ export class LrdDecoder {
           this.vrects.delete(frame.timestamp);
           const ctx = this.ctx;
           if (job && ctx && dec === this.vdec) {
+            // Um único drawImage recortado pelos retângulos: cada drawImage de um VideoFrame
+            // converte o quadro inteiro, então um por retângulo custaria centenas de conversões.
             const a = job.area;
-            for (const r of job.rects) ctx.drawImage(frame, r.x - a.x, r.y - a.y, r.w, r.h, r.x, r.y, r.w, r.h);
+            ctx.save();
+            ctx.beginPath();
+            for (const r of job.rects) ctx.rect(r.x, r.y, r.w, r.h);
+            ctx.clip();
+            ctx.drawImage(frame, a.x, a.y, a.w, a.h);
+            ctx.restore();
           }
           frame.close();
           const wake = this.vwaiters.get(frame.timestamp);
