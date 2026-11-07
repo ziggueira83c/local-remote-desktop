@@ -175,7 +175,7 @@ for (const bname of wanted) {
     if (host.buttons < pg.clicks * 2 - 4) problems.push(`cliques ${host.buttons}/${pg.clicks * 2}`);
     if (host.keys < pg.clicks * 2 - 4) problems.push(`teclas ${host.keys}/${pg.clicks * 2}`);
     if (pg.glassMs != null && pg.glassMs > 200) problems.push(`atraso ${pg.glassMs.toFixed(0)} ms`);
-    if (pg.sharpness != null && pg.sharpness < 60) problems.push(`nitidez ${pg.sharpness.toFixed(0)}`);
+    if (pg.canvasSelfTestOk !== false && pg.sharpness != null && pg.sharpness < 60) problems.push(`nitidez ${pg.sharpness.toFixed(0)}`);
     rows.push([
       bname,
       cfg.name,

@@ -39,6 +39,9 @@ const MOTION_COLORS: u32 = 160;
 const MOTION_STREAK: u8 = 3;
 /// Quadros enviados e ainda não aplicados no controlador, no máximo.
 const MAX_IN_FLIGHT: u32 = 3;
+/// Vídeo para interface: quadros seguidos mudando e fração mínima da tela (1/N) alterada.
+const LARGE_MOTION_STREAK: u8 = 2;
+const LARGE_MOTION_FRACTION: u64 = 12;
 
 /// Faixa de 16 colunas com mais cores que isso vai com perdas (dentro de um bloco com perdas).
 const STRIP_COLORS: u32 = 96;
@@ -329,7 +332,23 @@ impl LrdEncoder {
             let t = &mut self.tiles[i];
             t.streak = if d.is_some() { t.streak.saturating_add(1) } else { 0 };
         }
-        let classes = self.classify(cur, &dirty, key);
+        let mut classes = self.classify(cur, &dirty, key);
+        // Área grande de interface mudando em sequência (janela arrastada, animação): vai pelo
+        // vídeo enquanto se mexe e é refinada sem perdas quando para. Digitação e mudanças
+        // pequenas continuam sem perdas.
+        if video_on && !key {
+            let moving_px: u64 = (0..n)
+                .filter(|&i| classes[i] == Class::Lossless && self.tiles[i].streak >= LARGE_MOTION_STREAK)
+                .filter_map(|i| dirty[i].map(|d| d.2 as u64 * d.3 as u64))
+                .sum();
+            if moving_px * LARGE_MOTION_FRACTION > w as u64 * h as u64 {
+                for i in 0..n {
+                    if classes[i] == Class::Lossless && self.tiles[i].streak >= LARGE_MOTION_STREAK {
+                        classes[i] = Class::Lossy { photo: false, mask: 0b1111 };
+                    }
+                }
+            }
+        }
         stats.classify_us = t_classify.elapsed().as_micros() as u32;
 
         // 4. Agrupa blocos vizinhos inteiros da mesma classe em faixas horizontais; blocos com

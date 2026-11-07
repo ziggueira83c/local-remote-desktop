@@ -504,3 +504,48 @@ fn screen_stops_without_new_frames_still_refines() {
     let (fb, _) = decode(&frames);
     assert!(bgr_eq(&fb, &last.data), "texto parado ficou com perdas");
 }
+
+#[test]
+fn dragging_a_big_window_goes_through_video() {
+    // Janela de interface (poucas cores) de 512×320 arrastada: área grande mudando a cada quadro
+    // ⇒ vídeo (não reenviar centenas de KB sem perdas por quadro); exata de novo ao parar.
+    let log = SArc::new(SMutex::new(StubLog::default()));
+    let mut enc = LrdEncoder::new();
+    enc.enable_video(stub_factory(log.clone(), false), 8_000_000);
+    let win = |dx: u32| {
+        frame(1024, 512, move |x, y| {
+            if (100 + dx..612 + dx).contains(&x) && (80..400).contains(&y) {
+                ui(x - dx, y, 7)
+            } else {
+                [40, 40, 40]
+            }
+        })
+    };
+    let mut now = Instant::now();
+    let mut frames = Vec::new();
+    let mut video = 0;
+    let mut big_lossless = 0;
+    for t in 0..12 {
+        now += Duration::from_millis(33);
+        if let Some(b) = enc.encode_at(&win(t * 9), 60, now) {
+            if t >= 3 {
+                video += count_ops(&b).0;
+                if enc.last.lz4_bytes > 20_000 {
+                    big_lossless += 1;
+                }
+            }
+            frames.push(b);
+        }
+    }
+    assert!(video >= 8, "janela arrastada foi pelo vídeo só em {video} quadros");
+    assert_eq!(big_lossless, 0, "quadros com muito LZ4 durante o arraste");
+    for _ in 0..20 {
+        now += Duration::from_millis(50);
+        frames.extend(enc.idle_tick(60, now));
+        if enc.refine_due_at(now) {
+            frames.extend(enc.refine_at(0, now));
+        }
+    }
+    let (fb, _) = decode(&frames);
+    assert!(bgr_eq(&fb, &win(11 * 9).data), "janela não ficou exata depois de parar");
+}
