@@ -13,6 +13,7 @@ window.onerror = (e) => log("erro: " + e);
 
 const cfg = await (await fetch("/config")).json();
 
+let canvasSelfTestOk = null;
 // Autoteste do canvas do navegador: putImageData → getImageData e → drawImage em outro canvas.
 try {
   const a = document.createElement("canvas");
@@ -29,6 +30,7 @@ try {
   const copy = bc.getImageData(0, 0, 64, 32).data;
   let okBack = 0, okCopy = 0;
   for (let i = 0; i < 64 * 32; i++) { const v = (i % 2) * 255; if (back[i * 4] === v) okBack++; if (copy[i * 4] === v) okCopy++; }
+  canvasSelfTestOk = okBack === 2048 && okCopy === 2048;
   log(`autoteste canvas: getImageData ${okBack}/2048, cópia drawImage ${okCopy}/2048; px1 direto ${back[4]} cópia ${copy[4]}`);
 } catch (e) {
   log("autoteste canvas falhou: " + (e && (e.name + ": " + e.message)));
@@ -221,6 +223,7 @@ const result = {
   codec: cfg.lrd ? "codecLRD" : codec, decoder,
   width: srcW(), height: srcH(),
   exactPct: exactSamples.length ? exactSamples[exactSamples.length - 1] : null,
+  canvasSelfTestOk,
   exactDirectPct: exactDirectSamples.length ? exactDirectSamples[exactDirectSamples.length - 1] : null,
   fps: dur > 0 ? frames / dur : 0,
   frames, freezes, maxGapMs: Math.round(maxGap),
