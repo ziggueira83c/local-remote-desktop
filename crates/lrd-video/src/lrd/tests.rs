@@ -560,3 +560,44 @@ fn dragging_a_big_window_goes_through_video() {
     let (fb, _) = decode(&frames);
     assert!(bgr_eq(&fb, &win(11 * 9).data), "janela não ficou exata depois de parar");
 }
+
+#[test]
+fn game_mode_sends_every_change_through_video() {
+    // Jogo: até a interface (poucas cores) vai pelo vídeo — fluxo constante e leve.
+    let log = SArc::new(SMutex::new(StubLog::default()));
+    let mut enc = LrdEncoder::new();
+    enc.enable_video(stub_factory(log.clone(), false), 8_000_000);
+    enc.set_mode(ContentMode::Game);
+    // Menu/HUD do jogo (poucas cores) rolando dentro de uma caixa.
+    let hud = |k: u32| frame(1024, 512, move |x, y| if (100..420).contains(&x) && (40..200).contains(&y) { ui(x + k * 5, y + k * 3, 0) } else { [20, 30, 40] });
+    let mut video = 0;
+    for k in 1..8 {
+        if let Some(b) = enc.encode(&hud(k), 60) {
+            video += count_ops(&b).0;
+            if k > 1 {
+                // (o 1º é o quadro-chave inicial, sem perdas de propósito)
+                assert_eq!(enc.last.lz4_bytes, 0, "jogo não deveria mandar sem perdas durante o movimento");
+            }
+        }
+    }
+    assert!(video >= 6, "{video}");
+}
+
+#[test]
+fn reading_mode_keeps_dragged_window_lossless() {
+    // Leitura: janela de texto arrastada continua sem perdas (nunca pelo vídeo).
+    let log = SArc::new(SMutex::new(StubLog::default()));
+    let mut enc = LrdEncoder::new();
+    enc.enable_video(stub_factory(log.clone(), false), 8_000_000);
+    enc.set_mode(ContentMode::Reading);
+    let win = |dx: u32| frame(1024, 512, move |x, y| if (100 + dx..612 + dx).contains(&x) && (80..400).contains(&y) { ui(x - dx, y, 7) } else { [40, 40, 40] });
+    let mut frames = Vec::new();
+    for t in 0..10 {
+        if let Some(b) = enc.encode(&win(t * 9), 60) {
+            assert_eq!(count_ops(&b).0, 0, "texto foi pelo vídeo no modo leitura (quadro {t})");
+            frames.push(b);
+        }
+    }
+    let (fb, _) = decode(&frames);
+    assert!(bgr_eq(&fb, &win(81).data));
+}

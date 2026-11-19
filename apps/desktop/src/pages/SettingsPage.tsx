@@ -154,6 +154,8 @@ export function SettingsPage() {
               <option value="speed">Fluidez (até 1600 px, ~3 Mbps)</option>
               <option value="balanced">Equilibrado (até 1920 px, ~7 Mbps)</option>
               <option value="quality">Nitidez (até 2560 px, ~14 Mbps)</option>
+              <option value="game">Gamer (60 FPS, resolução cheia, ~30 Mbps)</option>
+              <option value="reading">Leitura (texto sempre nítido, ~8 Mbps)</option>
             </select>
           </label>
           <label className="field">
@@ -252,11 +254,19 @@ export function SettingsPage() {
               Sem isto, o Windows não deixa quem acessa este computador controlar janelas de administrador — como o
               Gerenciador de Tarefas, instaladores e o Editor do Registro — nem responder aos pedidos de permissão (UAC).
               Ligando, o LRD passa a abrir sempre como administrador (e também ao entrar no Windows), pedindo a
-              confirmação do UAC só agora, uma vez.
+              confirmação do UAC só agora, uma vez. Para os pedidos de permissão, que o Windows protege até de
+              programas de administrador, um assistente do sistema (uma cópia do LRD em Arquivos de Programas) cuida
+              do mouse e do teclado; só o LRD elevado consegue falar com ele.
             </p>
             <p className="small">
               Agora: {admin.elevated ? <span className="pill pill--ok">rodando como administrador</span> : <span className="pill pill--warn">rodando sem privilégios de administrador</span>}{" "}
-              {admin.enabled && <span className="pill pill--ok">acesso total ligado</span>}
+              {admin.enabled && <span className="pill pill--ok">acesso total ligado</span>}{" "}
+              {admin.enabled &&
+                (admin.systemAgent ? (
+                  <span className="pill pill--ok">pedidos do administrador controláveis</span>
+                ) : (
+                  <span className="pill pill--warn">clique em Aplicar para controlar os pedidos do administrador</span>
+                ))}
             </p>
             <label className="check">
               <input type="checkbox" checked={uacNormal} onChange={(e) => setUacNormal(e.target.checked)} disabled={adminBusy} />

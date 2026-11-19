@@ -57,7 +57,7 @@ pub fn hardware_region_encoder(hevc: bool, fps: u32, bitrate_bps: u32) -> Region
     }
 
     Box::new(move |w, h| {
-        let q = QualitySettings { jpeg_quality: 80, max_width: w, max_fps: fps, bitrate_bps };
+        let q = QualitySettings { jpeg_quality: 80, max_width: w, max_fps: fps, bitrate_bps, mode: Default::default() };
         match H264Encoder::new(&q) {
             Ok(mut e) => {
                 e.set_hevc(hevc);

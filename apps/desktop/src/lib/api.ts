@@ -117,7 +117,7 @@ export interface AppSettings {
   deviceName: string;
   listenPort: number;
   discoveryEnabled: boolean;
-  qualityProfile: "speed" | "balanced" | "quality";
+  qualityProfile: "speed" | "balanced" | "quality" | "game" | "reading";
   maxFps: number;
   swapCtrlCmd: boolean;
   requireApproval: boolean;
@@ -208,6 +208,7 @@ export interface AdminStatus {
   elevated: boolean;
   enabled: boolean;
   uacOnNormalDesktop: boolean;
+  systemAgent: boolean;
 }
 
 export const api = {

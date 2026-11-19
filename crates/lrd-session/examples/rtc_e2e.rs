@@ -199,7 +199,7 @@ async fn start_rtc(st: &Arc<State>, browser_hevc: bool, video_region: Option<boo
     let bitrate = st.args.bitrate;
     let info = st.encoder_info.clone();
     std::thread::spawn(move || {
-        let q = QualitySettings { jpeg_quality: 80, max_width: W, max_fps: FPS, bitrate_bps: bitrate };
+        let q = QualitySettings { jpeg_quality: 80, max_width: W, max_fps: FPS, bitrate_bps: bitrate, mode: Default::default() };
         if lrd {
             // codecLRD: nenhum quadro pode ser descartado depois de codificado (espera a fila).
             let mut enc = lrd_video::lrd::LrdEncoder::new();

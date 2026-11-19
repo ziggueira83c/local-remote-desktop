@@ -34,7 +34,7 @@ pub struct AppSettings {
     pub device_name: String,
     pub listen_port: u16,
     pub discovery_enabled: bool,
-    /// "speed" | "balanced" | "quality"
+    /// "speed" | "balanced" | "quality" | "game" | "reading"
     pub quality_profile: String,
     pub max_fps: u32,
     /// Ao controlar um computador de outra plataforma, troca Ctrl ↔ Cmd automaticamente.

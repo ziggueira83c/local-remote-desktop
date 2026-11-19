@@ -128,7 +128,7 @@ impl Node {
         }
         new.max_fps = new.max_fps.clamp(5, 60);
         new.enhance_strength = if new.enhance_strength.is_finite() { new.enhance_strength.clamp(0.0, 1.0) } else { 0.5 };
-        if !matches!(new.quality_profile.as_str(), "speed" | "balanced" | "quality") {
+        if !matches!(new.quality_profile.as_str(), "speed" | "balanced" | "quality" | "game" | "reading") {
             new.quality_profile = "balanced".into();
         }
         let old = self.settings();

@@ -3,6 +3,7 @@
 
 mod admin;
 mod commands;
+mod system_agent;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,6 +33,11 @@ fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    // Agente do sistema / ajudante de entrada (acesso total no Windows).
+    if system_agent::handle_args() {
+        return;
+    }
 
     // Acesso total ligado e o app foi aberto sem ser administrador: abre pela tarefa elevada.
     if admin::redirect_to_elevated() {

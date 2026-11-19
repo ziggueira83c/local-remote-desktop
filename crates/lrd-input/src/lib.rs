@@ -8,6 +8,8 @@
 //! - Movimentos acumulados na fila são fundidos: só o mais recente é aplicado.
 //! - Ao encerrar a sessão, tudo que ficou pressionado é liberado (RN-014).
 
+#[cfg(target_os = "windows")]
+pub mod elevated;
 pub mod hid;
 mod keyboard;
 
@@ -35,11 +37,21 @@ pub struct InputInjector {
 
 impl InputInjector {
     pub fn start() -> Result<Self> {
+        Self::start_inner(false)
+    }
+
+    /// Windows, ajudante do sistema: injeta na área de trabalho ativa (inclusive a do UAC).
+    #[cfg(target_os = "windows")]
+    pub fn start_following_desktop() -> Result<Self> {
+        Self::start_inner(true)
+    }
+
+    fn start_inner(follow_desktop: bool) -> Result<Self> {
         let (tx, rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
         std::thread::Builder::new()
             .name("lrd-input".into())
-            .spawn(move || run(rx, ready_tx))?;
+            .spawn(move || run(rx, ready_tx, follow_desktop))?;
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(InputInjector { tx }),
             Ok(Err(e)) => Err(anyhow::anyhow!(e)),
@@ -52,7 +64,17 @@ impl InputInjector {
     }
 }
 
-fn run(rx: Receiver<InjectCmd>, ready: Sender<Result<(), String>>) {
+fn run(rx: Receiver<InjectCmd>, ready: Sender<Result<(), String>>, follow_desktop: bool) {
+    #[cfg(target_os = "windows")]
+    let mut desktop = follow_desktop.then(elevated::DesktopFollower::new);
+    #[cfg(target_os = "windows")]
+    if let Some(d) = desktop.as_mut() {
+        d.sync();
+    }
+    #[cfg(target_os = "windows")]
+    let mut forward = (!follow_desktop).then(elevated::Forwarder::new);
+    #[cfg(not(target_os = "windows"))]
+    let _ = follow_desktop;
     let mut enigo = match Enigo::new(&Settings::default()) {
         Ok(e) => e,
         Err(e) => {
@@ -83,6 +105,15 @@ fn run(rx: Receiver<InjectCmd>, ready: Sender<Result<(), String>>) {
         // Movimento seguido de outro movimento: pula direto para o mais novo.
         if matches!(cmd, InjectCmd::MoveAbs { .. }) && matches!(queue.front(), Some(InjectCmd::MoveAbs { .. })) {
             continue;
+        }
+        // Acesso total (Windows): o ajudante do sistema injeta, inclusive nos pedidos do UAC.
+        #[cfg(target_os = "windows")]
+        if forward.as_mut().is_some_and(|f| f.send(&cmd)) {
+            continue;
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(d) = desktop.as_mut() {
+            d.sync();
         }
         let result: Result<(), String> = match cmd {
             #[cfg(target_os = "macos")]

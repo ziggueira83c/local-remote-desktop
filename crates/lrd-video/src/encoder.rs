@@ -16,11 +16,14 @@ pub struct QualitySettings {
     pub max_fps: u32,
     /// Taxa alvo do H.264 em bits por segundo.
     pub bitrate_bps: u32,
+    /// Tipo de uso (modos Gamer e Leitura do codecLRD).
+    pub mode: crate::lrd::ContentMode,
 }
 
 impl QualitySettings {
     pub fn from_profile(profile: &str, max_fps: u32) -> Self {
         let fps = match max_fps {
+            0 if profile == "game" => 60,
             0 => 30,
             f => f.clamp(5, 60),
         };
@@ -29,13 +32,23 @@ impl QualitySettings {
         let (q, w, mbps) = match profile {
             "speed" => (55, 1600, 3.0),
             "quality" => (88, 2560, 14.0),
+            // Jogo: resolução cheia e taxa alta (H.265 de hardware na rede local).
+            "game" => (78, 2560, 20.0),
+            // Leitura: texto sem perdas; fotos e refino em qualidade alta.
+            "reading" => (92, 2560, 8.0),
             _ => (72, 1920, 7.0),
+        };
+        let mode = match profile {
+            "game" => crate::lrd::ContentMode::Game,
+            "reading" => crate::lrd::ContentMode::Reading,
+            _ => crate::lrd::ContentMode::Normal,
         };
         QualitySettings {
             jpeg_quality: q,
             max_width: w,
             max_fps: fps,
             bitrate_bps: (mbps * fps_factor * 1_000_000.0) as u32,
+            mode,
         }
     }
 }

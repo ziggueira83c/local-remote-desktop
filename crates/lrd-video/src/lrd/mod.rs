@@ -152,7 +152,20 @@ struct VideoState {
     force_idr: bool,
 }
 
+/// Tipo de uso escolhido na sessão.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ContentMode {
+    /// Texto sem perdas; o que se mexe muito vai pelo vídeo.
+    #[default]
+    Normal,
+    /// Jogo: tudo que muda vai pelo vídeo (fluxo constante); refino só depois de 1 s parado.
+    Game,
+    /// Leitura/edição: interface e texto nunca vão pelo vídeo; refino logo que para.
+    Reading,
+}
+
 pub struct LrdEncoder {
+    mode: ContentMode,
     width: u32,
     height: u32,
     cols: u32,
@@ -193,6 +206,7 @@ impl LrdEncoder {
             force_key: true,
             workers: (cpus / 2).clamp(1, 6),
             refine_after: Duration::from_millis(350),
+            mode: ContentMode::Normal,
             ack: None,
             blocked_since: None,
             video: None,
@@ -234,6 +248,15 @@ impl LrdEncoder {
     /// por `factory` (H.265/H.264) na resolução da tela.
     pub fn enable_video(&mut self, factory: RegionFactory, profile_bitrate_bps: u32) {
         self.video = Some(Mutex::new(VideoState { factory, profile_bitrate: profile_bitrate_bps, enc: None, disabled: false, force_idr: true }));
+    }
+
+    pub fn set_mode(&mut self, mode: ContentMode) {
+        self.mode = mode;
+        self.refine_after = Duration::from_millis(match mode {
+            ContentMode::Normal => 350,
+            ContentMode::Game => 1000,
+            ContentMode::Reading => 150,
+        });
     }
 
     fn video_on(&mut self) -> bool {
@@ -336,7 +359,17 @@ impl LrdEncoder {
         // Área grande de interface mudando em sequência (janela arrastada, animação): vai pelo
         // vídeo enquanto se mexe e é refinada sem perdas quando para. Digitação e mudanças
         // pequenas continuam sem perdas.
-        if video_on && !key {
+        if video_on && !key && self.mode == ContentMode::Game {
+            // Jogo: tudo que mudou (menos cor sólida) vai pelo vídeo.
+            for c in classes.iter_mut() {
+                match *c {
+                    Class::Lossless => *c = Class::Lossy { photo: false, mask: 0b1111 },
+                    Class::Lossy { photo, .. } => *c = Class::Lossy { photo, mask: 0b1111 },
+                    _ => {}
+                }
+            }
+        }
+        if video_on && !key && self.mode == ContentMode::Normal {
             let moving_px: u64 = (0..n)
                 .filter(|&i| classes[i] == Class::Lossless && self.tiles[i].streak >= LARGE_MOTION_STREAK)
                 .filter_map(|i| dirty[i].map(|d| d.2 as u64 * d.3 as u64))

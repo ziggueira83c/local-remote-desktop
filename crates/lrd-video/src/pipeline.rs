@@ -156,6 +156,7 @@ fn make_encoder(
     if codec == VideoCodec::Lrd {
         let mut e = crate::lrd::LrdEncoder::new();
         e.ack = ack.clone();
+        e.set_mode(q.mode);
         if let Some(h265) = lrd_video {
             e.enable_video(
                 crate::lrd::hardware_region_encoder(h265, q.max_fps, q.bitrate_bps),

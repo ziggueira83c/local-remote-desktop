@@ -223,6 +223,14 @@ input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px v
 .toolbar select, .toolbar .btn:not(.btn--danger) { background: #222a33; border-color: #343d48; color: #e6eaf0; height: 30px; font-size: 13px; }
 .toolbar .btn:not(.btn--danger):hover { background: #2c3540; }
 .toolbar .check { color: #c9d1db; font-size: 13px; margin: 0; }
+/* Barra escondida: sobreposta à tela remota, desliza do topo ao encostar o mouse. */
+.toolbar--auto {
+  position: absolute; top: 0; left: 0; right: 0; z-index: 6;
+  transition: transform 0.18s ease, opacity 0.18s ease;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+}
+.toolbar--hidden { transform: translateY(-100%); opacity: 0; pointer-events: none; }
+@media (prefers-reduced-motion: reduce) { .toolbar--auto { transition: none; } }
 .toolbar__group { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .toolbar__title { font-weight: 600; }
 .toolbar .pill { background: #2a323c; color: #c9d1db; }

@@ -192,7 +192,7 @@ pub struct SelectDisplay {
     pub display_id: String,
 }
 
-/// `profile`: "speed" | "balanced" | "quality".
+/// `profile`: "speed" | "balanced" | "quality" | "game" | "reading".
 #[derive(Clone, PartialEq, Message)]
 pub struct SetQuality {
     #[prost(string, tag = "1")]

@@ -24,6 +24,8 @@ pub struct AdminStatus {
     pub enabled: bool,
     /// Os pedidos do UAC aparecem na área de trabalho normal (controláveis remotamente).
     pub uac_on_normal_desktop: bool,
+    /// O agente do sistema (mouse/teclado nos pedidos do administrador) está registrado.
+    pub system_agent: bool,
 }
 
 #[cfg(not(windows))]
@@ -31,7 +33,7 @@ mod imp {
     use super::AdminStatus;
 
     pub fn status() -> AdminStatus {
-        AdminStatus { supported: false, elevated: false, enabled: false, uac_on_normal_desktop: false }
+        AdminStatus { supported: false, elevated: false, enabled: false, uac_on_normal_desktop: false, system_agent: false }
     }
     pub fn enable(_uac_normal: bool) -> Result<(), String> {
         Err("Disponível só no Windows.".into())
@@ -63,6 +65,56 @@ mod imp {
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
     const TASK: &str = "LRD Elevated";
+    /// Tarefa como SISTEMA que mantém o ajudante de entrada na sessão do usuário.
+    const AGENT_TASK: &str = "LRD System Agent";
+    /// Cópia protegida (só administradores alteram) que roda como SISTEMA.
+    const AGENT_DIR: &str = r"Local Remote Desktop Agent";
+    const AGENT_EXE: &str = "lrd-agent.exe";
+
+    fn agent_path() -> PathBuf {
+        let pf = std::env::var_os("ProgramFiles").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
+        pf.join(AGENT_DIR).join(AGENT_EXE)
+    }
+
+    fn agent_registered() -> bool {
+        hidden("schtasks").args(["/Query", "/TN", AGENT_TASK]).output().is_ok_and(|o| o.status.success())
+    }
+
+    fn agent_xml(exe: &Path) -> String {
+        // SISTEMA (S-1-5-18), ao ligar o computador e a cada logon; sem limite de tempo.
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Local Remote Desktop: mouse e teclado nos pedidos de permissão do administrador (acesso total)</Description></RegistrationInfo>
+  <Triggers><BootTrigger><Enabled>true</Enabled></BootTrigger><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
+  <Principals><Principal id="Author"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>4</Priority>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>{exe}</Command><Arguments>--system-agent</Arguments></Exec></Actions>
+</Task>
+"#,
+            exe = escape(&exe.to_string_lossy()),
+        )
+    }
+
+    fn write_utf16(path: &Path, xml: &str) -> Result<(), String> {
+        // schtasks /XML exige UTF-16 com BOM.
+        let mut bytes = vec![0xFF, 0xFE];
+        for u in xml.encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        std::fs::write(path, bytes).map_err(|e| e.to_string())
+    }
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const POLICY: &str = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";
     const ERROR_CANCELLED: u32 = 1223;
@@ -125,7 +177,13 @@ mod imp {
             (Some(_), None) => true,
             _ => false,
         };
-        AdminStatus { supported: true, elevated: is_elevated(), enabled, uac_on_normal_desktop: uac_on_normal_desktop() }
+        AdminStatus {
+            supported: true,
+            elevated: is_elevated(),
+            enabled,
+            uac_on_normal_desktop: uac_on_normal_desktop(),
+            system_agent: agent_registered(),
+        }
     }
 
     /// Roda um script .cmd como administrador (um pedido do UAC) e espera terminar.
@@ -227,27 +285,42 @@ mod imp {
 
     pub fn enable(uac_normal: bool) -> Result<(), String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let xml_path: PathBuf = std::env::temp_dir().join(format!("lrd-task-{}.xml", std::process::id()));
-        // schtasks /XML exige UTF-16 com BOM.
-        let mut bytes = vec![0xFF, 0xFE];
-        for u in task_xml(&exe, &current_user()).encode_utf16() {
-            bytes.extend_from_slice(&u.to_le_bytes());
-        }
-        std::fs::write(&xml_path, bytes).map_err(|e| e.to_string())?;
+        let tmp = std::env::temp_dir();
+        let xml_path: PathBuf = tmp.join(format!("lrd-task-{}.xml", std::process::id()));
+        let agent_xml_path: PathBuf = tmp.join(format!("lrd-agent-{}.xml", std::process::id()));
+        let agent = agent_path();
+        let agent_dir = agent.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        write_utf16(&xml_path, &task_xml(&exe, &current_user()))?;
+        write_utf16(&agent_xml_path, &agent_xml(&agent))?;
         let mut body = format!("schtasks /Create /TN \"{TASK}\" /XML \"{}\" /F >nul || exit /b 2", xml_path.display());
         body += &format!(
             "\r\nreg add \"{POLICY}\" /v PromptOnSecureDesktop /t REG_DWORD /d {} /f >nul || exit /b 3",
             if uac_normal { 0 } else { 1 }
         );
+        // Agente do sistema: para o antigo, copia o LRD para a pasta protegida e registra.
+        body += &format!("\r\nschtasks /End /TN \"{AGENT_TASK}\" >nul 2>nul");
+        body += &format!("\r\ntaskkill /F /IM {AGENT_EXE} >nul 2>nul");
+        body += "\r\nping -n 2 127.0.0.1 >nul";
+        body += &format!("\r\nif not exist \"{d}\" mkdir \"{d}\" || exit /b 4", d = agent_dir.display());
+        body += &format!("\r\ncopy /Y \"{}\" \"{}\" >nul || exit /b 5", exe.display(), agent.display());
+        body += &format!("\r\nschtasks /Create /TN \"{AGENT_TASK}\" /XML \"{}\" /F >nul || exit /b 6", agent_xml_path.display());
+        body += &format!("\r\nschtasks /Run /TN \"{AGENT_TASK}\" >nul || exit /b 7");
         let r = run_elevated_script(&body);
         let _ = std::fs::remove_file(&xml_path);
+        let _ = std::fs::remove_file(&agent_xml_path);
         r
     }
 
     pub fn disable() -> Result<(), String> {
-        let body = format!(
+        let agent = agent_path();
+        let mut body = format!(
             "schtasks /Delete /TN \"{TASK}\" /F >nul 2>nul\r\nreg add \"{POLICY}\" /v PromptOnSecureDesktop /t REG_DWORD /d 1 /f >nul || exit /b 3"
         );
+        body += &format!("\r\nschtasks /End /TN \"{AGENT_TASK}\" >nul 2>nul");
+        body += &format!("\r\nschtasks /Delete /TN \"{AGENT_TASK}\" /F >nul 2>nul");
+        body += &format!("\r\ntaskkill /F /IM {AGENT_EXE} >nul 2>nul");
+        body += "\r\nping -n 2 127.0.0.1 >nul";
+        body += &format!("\r\ndel /F /Q \"{}\" >nul 2>nul", agent.display());
         run_elevated_script(&body)
     }
 

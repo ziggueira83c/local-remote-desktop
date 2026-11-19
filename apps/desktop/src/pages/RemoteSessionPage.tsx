@@ -37,6 +37,66 @@ export function RemoteSessionPage() {
   const [audioOn, setAudioOn] = useState(outbound.audioEnabled);
   const [volume, setVolume] = useState(1);
   const viewportRef = useRef<HTMLDivElement>(null);
+
+  // Barra do topo: escondida; aparece ao encostar o mouse na borda de cima (ou fixada).
+  const sessionRef = useRef<HTMLDivElement>(null);
+  const barRef = useRef<HTMLDivElement>(null);
+  const [barPinned, setBarPinned] = useState(() => {
+    try {
+      return localStorage.getItem("lrd.barPinned") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const [barVisible, setBarVisible] = useState(true);
+  const barShowTimer = useRef(0);
+  const barHideTimer = useRef(0);
+  const hideBarSoon = useCallback((ms = 500) => {
+    window.clearTimeout(barHideTimer.current);
+    barHideTimer.current = window.setTimeout(() => {
+      // Lista de seleção aberta na barra: espera fechar.
+      const a = document.activeElement;
+      if (a && a.tagName === "SELECT" && barRef.current?.contains(a)) {
+        hideBarSoon(800);
+        return;
+      }
+      setBarVisible(false);
+    }, ms);
+  }, []);
+  useEffect(() => {
+    // Mostra ao entrar na sessão, para lembrar que ela existe, e esconde.
+    hideBarSoon(3000);
+    return () => {
+      window.clearTimeout(barShowTimer.current);
+      window.clearTimeout(barHideTimer.current);
+    };
+  }, [hideBarSoon]);
+  const onSessionPointerMove = (e: React.PointerEvent) => {
+    if (barPinned || barVisible) return;
+    const top = sessionRef.current?.getBoundingClientRect().top ?? 0;
+    if (e.clientY - top <= 3) {
+      // Precisa parar um instante na borda (passar rápido pela tela remota não abre).
+      if (!barShowTimer.current) {
+        barShowTimer.current = window.setTimeout(() => {
+          barShowTimer.current = 0;
+          window.clearTimeout(barHideTimer.current);
+          setBarVisible(true);
+        }, 180);
+      }
+    } else if (barShowTimer.current) {
+      window.clearTimeout(barShowTimer.current);
+      barShowTimer.current = 0;
+    }
+  };
+  const togglePin = () => {
+    const v = !barPinned;
+    setBarPinned(v);
+    setBarVisible(true);
+    try {
+      localStorage.setItem("lrd.barPinned", v ? "1" : "0");
+    } catch {}
+    if (!v) hideBarSoon(1500);
+  };
   const [frame, setFrame] = useState({ w: 0, h: 0 });
   const [cssSize, setCssSize] = useState({ w: 0, h: 0 });
   const [cursor, setCursor] = useState<CursorState>({ visible: true, x: 0, y: 0, kind: 0 });
@@ -335,6 +395,8 @@ export function RemoteSessionPage() {
     api.selectDisplay(id).catch(() => {});
   };
   const changeQuality = (q: AppSettings["qualityProfile"], f: number) => {
+    // Modo Gamer: 60 FPS (o que um jogo precisa) ao escolher.
+    if (q === "game" && quality !== "game") f = 60;
     setQuality(q);
     setFps(f);
     api.setVideoQuality(q, f).catch(() => {});
@@ -356,8 +418,13 @@ export function RemoteSessionPage() {
   };
 
   return (
-    <div className="session">
-      <div className="toolbar">
+    <div className="session" ref={sessionRef} onPointerMove={onSessionPointerMove}>
+      <div
+        ref={barRef}
+        className={barPinned ? "toolbar" : barVisible ? "toolbar toolbar--auto" : "toolbar toolbar--auto toolbar--hidden"}
+        onMouseEnter={() => window.clearTimeout(barHideTimer.current)}
+        onMouseLeave={() => !barPinned && hideBarSoon()}
+      >
         <div className="toolbar__group">
           <span className="toolbar__title">{outbound.remoteName}</span>
           <span className={canControl ? "pill pill--ok" : "pill"}>{canControl ? "Controle" : "Somente visualização"}</span>
@@ -383,6 +450,8 @@ export function RemoteSessionPage() {
             <option value="speed">Fluidez</option>
             <option value="balanced">Equilibrado</option>
             <option value="quality">Nitidez</option>
+            <option value="game">🎮 Gamer</option>
+            <option value="reading">📄 Leitura</option>
           </select>
           <select value={fps} onChange={(e) => changeQuality(quality, Number(e.target.value))} title="Quadros por segundo">
             <option value={15}>15 FPS</option>
@@ -459,6 +528,13 @@ export function RemoteSessionPage() {
             title="Diagnóstico de desempenho"
           >
             📊
+          </button>
+          <button
+            className={barPinned ? "btn btn--small btn--on" : "btn btn--small"}
+            onClick={togglePin}
+            title={barPinned ? "Esconder a barra (aparece ao encostar o mouse no topo)" : "Fixar a barra"}
+          >
+            📌
           </button>
           <button className="btn btn--small btn--danger" onClick={() => api.disconnect()}>
             Desconectar
