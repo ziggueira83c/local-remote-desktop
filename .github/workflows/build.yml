@@ -151,6 +151,13 @@ jobs:
           LRD_SCENARIOS: "1"
         run: node tools/e2e/run.mjs target/release/examples/${{ matrix.exe }} ${{ matrix.browsers }}
 
+      - name: Teste de resistência (memória em sessão longa)
+        if: always()
+        shell: bash
+        env:
+          LRD_SOAK: "300"
+        run: node tools/e2e/run.mjs target/release/examples/${{ matrix.exe }} chromium
+
   release:
     name: publicar versão
     needs: build

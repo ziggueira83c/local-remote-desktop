@@ -169,7 +169,13 @@ const sharpTimer = setInterval(() => {
   sharpSamples.push(sum / Math.max(1, n));
 }, 500);
 
+// Memória do visualizador a cada 10 s (teste de resistência).
+const memSamples = [];
+const memTimer = setInterval(() => {
+  memSamples.push({ t: Math.round(performance.now() / 1000), heapMb: performance.memory ? performance.memory.usedJSHeapSize / 1048576 : null, ...engine.internals() });
+}, 10_000);
 await new Promise((r) => setTimeout(r, cfg.seconds * 1000));
+clearInterval(memTimer);
 if (cfg.lrd) {
   try {
     const d = lrdCanvas.getContext("2d").getImageData(100, 100, 4, 1).data;
@@ -224,6 +230,7 @@ const result = {
   width: srcW(), height: srcH(),
   exactPct: exactSamples.length ? exactSamples[exactSamples.length - 1] : null,
   canvasSelfTestOk,
+  memSamples,
   exactDirectPct: exactDirectSamples.length ? exactDirectSamples[exactDirectSamples.length - 1] : null,
   fps: dur > 0 ? frames / dur : 0,
   frames, freezes, maxGapMs: Math.round(maxGap),

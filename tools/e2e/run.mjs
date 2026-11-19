@@ -1,6 +1,32 @@
 // Roda o teste de ponta a ponta em navegadores reais e confere os resultados.
 //   node tools/e2e/run.mjs <binário rtc_e2e> [chromium,webkit]
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
+
+// Memória (MB) do processo do host.
+function processMb(pid) {
+  try {
+    if (process.platform === "win32") {
+      const out = execFileSync("powershell", ["-NoProfile", "-Command", `(Get-Process -Id ${pid}).WorkingSet64`]).toString();
+      return Number(out.trim()) / 1048576;
+    }
+    return (Number(execFileSync("ps", ["-o", "rss=", "-p", String(pid)]).toString().trim()) * 1024) / 1048576;
+  } catch {
+    return null;
+  }
+}
+
+// Inclinação (MB/min) por mínimos quadrados de [{t (s), v (MB)}].
+function slopeMbPerMin(pts) {
+  const p = pts.filter((x) => x.v != null);
+  if (p.length < 3) return null;
+  const n = p.length, mt = p.reduce((a, x) => a + x.t, 0) / n, mv = p.reduce((a, x) => a + x.v, 0) / n;
+  let num = 0, den = 0;
+  for (const x of p) {
+    num += (x.t - mt) * (x.v - mv);
+    den += (x.t - mt) ** 2;
+  }
+  return den ? (num / den) * 60 : null;
+}
 import { chromium, webkit } from "playwright";
 
 const bin = process.argv[2];
@@ -16,7 +42,12 @@ const scenarioConfigs = scenarioNames.map((n) => ({
   scenario: n,
   informative: true,
 }));
-const configs = process.env.LRD_SCENARIOS ? scenarioConfigs : [
+// LRD_SOAK=<segundos>: teste de resistência (vazamentos de memória em sessão longa).
+const soakConfigs = [
+  { name: "resistência · vídeo + texto", args: ["--scenario", "video-720p"], lrd: true, soak: true, seconds: Number(process.env.LRD_SOAK) },
+  { name: "resistência · arrastar janela", args: ["--scenario", "arrastar-janela"], lrd: true, soak: true, seconds: Math.round(Number(process.env.LRD_SOAK) / 2) },
+];
+const configs = process.env.LRD_SOAK ? soakConfigs : process.env.LRD_SCENARIOS ? scenarioConfigs : [
   { name: "codecLRD", args: ["--lrd"], lrd: true },
   { name: "H.264", args: [] },
   { name: "H.264, 3% de perda", args: [], env: { LRD_TEST_DROP_PCT: "3" }, lossy: true },
@@ -26,7 +57,7 @@ const configs = process.env.LRD_SCENARIOS ? scenarioConfigs : [
 
 function runHost(port, cfg) {
   return new Promise((resolve, reject) => {
-    const p = spawn(bin, ["--port", String(port), "--seconds", String(SECONDS), ...cfg.args], {
+    const p = spawn(bin, ["--port", String(port), "--seconds", String(cfg.seconds ?? SECONDS), ...cfg.args], {
       env: { ...process.env, RUST_LOG: "info", LRD_TEST_LOOPBACK: "1", ...(cfg.env ?? {}) },
       stdio: ["ignore", "pipe", "inherit"],
     });
@@ -57,7 +88,7 @@ const launchers = {
   chromium: () =>
     chromium.launch({
       channel: process.platform === "win32" ? "msedge" : "chrome",
-      args: ["--autoplay-policy=no-user-gesture-required", "--use-fake-ui-for-media-stream"],
+      args: ["--autoplay-policy=no-user-gesture-required", "--use-fake-ui-for-media-stream", "--enable-precise-memory-info"],
     }),
   webkit: () => webkit.launch(),
   // Safari de verdade (mesmo motor do WKWebView do app no Mac), via safaridriver.
@@ -100,10 +131,22 @@ for (const bname of wanted) {
     page.on("console", (m) => console.log("    console:", m.text()));
     page.on("pageerror", (e) => console.log("    pageerror:", e.message));
     page.goto(`http://127.0.0.1:${port}/`).catch((e) => console.log("    goto:", e.message));
+    const hostMem = [];
+    const t0 = Date.now();
+    const memTimer = cfg.soak
+      ? setInterval(() => {
+          const v = processMb(runHost.last.p.pid);
+          const t = Math.round((Date.now() - t0) / 1000);
+          hostMem.push({ t, v });
+          console.log(`    memória do host aos ${t} s: ${v?.toFixed(1)} MB`);
+        }, 10_000)
+      : null;
     let res;
     try {
       res = (await done).result;
+      if (memTimer) clearInterval(memTimer);
     } catch (e) {
+      if (memTimer) clearInterval(memTimer);
       console.log(e.message);
       failures++;
       await page.close();
@@ -117,6 +160,24 @@ for (const bname of wanted) {
     }
     const { host, page: pg } = res;
     console.log("   host:", JSON.stringify(host));
+    if (cfg.soak) {
+      // Ignora o primeiro minuto (caches, JIT, decodificador aquecendo).
+      const warm = (x) => x.t >= 60;
+      const hostSlope = slopeMbPerMin(hostMem.filter(warm));
+      const heap = (pg.memSamples ?? []).map((m) => ({ t: m.t, v: m.heapMb }));
+      const heapSlope = slopeMbPerMin(heap.filter(warm));
+      const last = (pg.memSamples ?? []).at(-1) ?? {};
+      console.log(`   memória do visualizador: ${heap.map((h) => h.v?.toFixed(1)).join(" → ")} MB`);
+      console.log(`   filas internas no fim: ${JSON.stringify(last)}`);
+      const problems = [];
+      if (hostSlope != null && hostSlope > 5) problems.push(`host cresce ${hostSlope.toFixed(1)} MB/min`);
+      if (heapSlope != null && heapSlope > 3) problems.push(`visualizador cresce ${heapSlope.toFixed(1)} MB/min`);
+      if ((last.videoPending ?? 0) > 5 || (last.decodeQueue ?? 0) > 5 || (last.backlog ?? 0) > 10) problems.push("filas internas crescendo");
+      if (!(pg.fps >= (process.platform === "darwin" ? 8 : 20))) problems.push(`fps ${pg.fps?.toFixed(1)}`);
+      rows.push([bname, cfg.name, problems.length ? "FALHOU" : "ok", "codecLRD", pg.fps?.toFixed(1), pg.freezes, `host ${hostSlope?.toFixed(2) ?? "-"} MB/min`, `visualizador ${heapSlope?.toFixed(2) ?? "-"} MB/min`, "", "", problems.join("; ")]);
+      if (problems.length) failures++;
+      continue;
+    }
     if (cfg.scenario) {
       const l = host.lrd;
       // Metas da especificação 2026-11-05 (região de vídeo), medidas no Windows.

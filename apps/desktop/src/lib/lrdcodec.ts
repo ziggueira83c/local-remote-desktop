@@ -134,6 +134,11 @@ export class LrdDecoder {
     };
   }
 
+  /** Tamanho das estruturas internas (diagnóstico de vazamentos). */
+  internals() {
+    return { videoPending: this.vrects.size, videoWaiters: this.vwaiters.size, decodeQueue: this.vdec?.decodeQueueSize ?? 0 };
+  }
+
   /** Aplica um quadro. Devolve as informações do quadro se ele foi desenhado. */
   async apply(b: Uint8Array): Promise<LrdFrameInfo | null> {
     const info = LrdDecoder.header(b);
@@ -181,7 +186,10 @@ export class LrdDecoder {
     this.prof.ops += ops.length;
     this.prof.frames++;
     const ctx = this.ctx;
-    if (!ctx) return null;
+    if (!ctx) {
+      for (const bm of bitmaps) bm?.close();
+      return null;
+    }
     try {
       // Cada quadro espera o próprio vídeo ser desenhado (ver `video`): quadros seguintes
       // nunca são cobertos por um vídeo atrasado. (Sem `flush()`: ele obrigaria o próximo
@@ -252,6 +260,13 @@ export class LrdDecoder {
     }
     if (!this.vdec || this.vconfig !== config) {
       throw new Error("vídeo sem quadro inicial (IDR)");
+    }
+    if (this.vdec.decodeQueueSize > 8) {
+      // O decodificador do sistema parou de devolver quadros: recomeça do zero em vez de
+      // deixar a fila (memória de vídeo) crescer.
+      console.warn("codecLRD: decodificador de vídeo travado; reiniciando");
+      this.closeVideo();
+      throw new Error("decodificador de vídeo travado");
     }
     this.vrects.set(frameId, { area: { x: o.x, y: o.y, w: o.w, h: o.h }, rects: o.rects });
     const done = new Promise<boolean>((resolve) => {

@@ -276,6 +276,11 @@ export class MediaEngine {
     if (this.glass.length > 60) this.glass.shift();
   }
 
+  /** Estruturas internas do visualizador (diagnóstico de vazamentos). */
+  internals() {
+    return { backlog: this.lrdBacklog, queued: this.queue.length, pending: this.pending.length, chunks: this.chunks.length, ...(this.lrd?.internals() ?? {}) };
+  }
+
   /** Diagnóstico do decodificador codecLRD (ms acumulados por etapa). */
   lrdProfile() {
     return this.lrd?.prof ?? null;
