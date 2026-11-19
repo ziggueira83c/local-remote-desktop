@@ -16,7 +16,9 @@ pub enum Source {
     #[cfg(target_os = "windows")]
     Dxgi {
         recorder: xcap::VideoRecorder,
-        rx: std::sync::mpsc::Receiver<xcap::Frame>,
+        /// Só o quadro mais recente (a fila do xcap é ilimitada: se o envio atrasar, quadros
+        /// de 8 MB se acumulariam até esgotar a memória do computador).
+        latest: std::sync::Arc<(std::sync::Mutex<Option<xcap::Frame>>, std::sync::Condvar)>,
         display: Display,
     },
     /// Windows: DXGI Desktop Duplication próprio, com o quadro mantido na GPU.
@@ -45,17 +47,43 @@ impl Source {
 
         #[cfg(target_os = "windows")]
         {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            // Falhas seguidas da captura na GPU. Ela falha de propósito enquanto o UAC ou a
+            // tela de bloqueio estão na frente: insiste (o pipeline tenta de novo a cada 1 s)
+            // em vez de cair de vez para a captura com cópia.
+            static GPU_FAILS: AtomicU32 = AtomicU32::new(0);
             if std::env::var_os("LRD_NO_GPU_CAPTURE").is_none() {
                 match crate::win_gpu::DuplSource::open(&capturer.display) {
-                    Ok(s) => return Ok(Source::Gpu(s)),
-                    Err(e) => tracing::warn!("captura na GPU indisponível ({e:#}); usando DXGI com cópia"),
+                    Ok(s) => {
+                        GPU_FAILS.store(0, Ordering::Relaxed);
+                        return Ok(Source::Gpu(s));
+                    }
+                    Err(e) => {
+                        let n = GPU_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n < 10 {
+                            return Err(e.context("captura na GPU (tentando de novo)"));
+                        }
+                        tracing::warn!("captura na GPU indisponível ({e:#}); usando DXGI com cópia");
+                    }
                 }
             }
             match capturer.monitor.video_recorder() {
                 Ok((recorder, rx)) => match recorder.start() {
                     Ok(()) => {
                         let display = capturer.display.clone();
-                        return Ok(Source::Dxgi { recorder, rx, display });
+                        let latest = std::sync::Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
+                        let slot = latest.clone();
+                        // Esvazia a fila do xcap continuamente, guardando só o último quadro.
+                        std::thread::Builder::new()
+                            .name("lrd-xcap".into())
+                            .spawn(move || {
+                                while let Ok(f) = rx.recv() {
+                                    *slot.0.lock().unwrap() = Some(f);
+                                    slot.1.notify_one();
+                                }
+                            })
+                            .ok();
+                        return Ok(Source::Dxgi { recorder, latest, display });
                     }
                     Err(e) => tracing::warn!("DXGI indisponível ({e}), usando captura por cópia"),
                 },
@@ -108,18 +136,12 @@ impl Source {
                 c.capture().map(Some)
             }
             #[cfg(target_os = "windows")]
-            Source::Dxgi { rx, .. } => {
-                let first = match rx.recv_timeout(timeout) {
-                    Ok(f) => f,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Ok(None),
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        return Err(anyhow::anyhow!("captura DXGI encerrada"))
-                    }
-                };
-                let mut latest = first;
-                while let Ok(f) = rx.try_recv() {
-                    latest = f;
-                }
+            Source::Dxgi { latest: slot, .. } => {
+                let (lock, cv) = &**slot;
+                let guard = lock.lock().unwrap();
+                let (mut guard, _) = cv.wait_timeout_while(guard, timeout, |f| f.is_none()).unwrap();
+                let Some(latest) = guard.take() else { return Ok(None) };
+                drop(guard);
                 let expected = latest.width as usize * latest.height as usize * 4;
                 if latest.raw.len() < expected {
                     return Ok(None);

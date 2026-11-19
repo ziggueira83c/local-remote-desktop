@@ -122,12 +122,12 @@ mod imp {
 /// Modos especiais do executável; `true` se este processo era um deles (já terminou).
 pub fn handle_args() -> bool {
     let args: Vec<String> = std::env::args().collect();
-    match args.get(1).map(String::as_str) {
-        #[cfg(windows)]
+    let mode = args.get(1).map(String::as_str);
+    #[cfg(windows)]
+    match mode {
         Some("--system-agent") => imp::run_agent(),
-        #[cfg(windows)]
         Some("--input-helper") => imp::run_helper(args.get(2).and_then(|p| p.parse().ok()).unwrap_or(0)),
-        Some("--system-agent") | Some("--input-helper") => true,
-        _ => false,
+        _ => {}
     }
+    matches!(mode, Some("--system-agent") | Some("--input-helper"))
 }

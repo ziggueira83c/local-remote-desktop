@@ -45,7 +45,7 @@ const scenarioConfigs = scenarioNames.map((n) => ({
 // LRD_SOAK=<segundos>: teste de resistência (vazamentos de memória em sessão longa).
 const soakConfigs = [
   { name: "resistência · vídeo + texto", args: ["--scenario", "video-720p"], lrd: true, soak: true, seconds: Number(process.env.LRD_SOAK) },
-  { name: "resistência · arrastar janela", args: ["--scenario", "arrastar-janela"], lrd: true, soak: true, seconds: Math.round(Number(process.env.LRD_SOAK) / 2) },
+  { name: "resistência · arrastar janela", args: ["--scenario", "arrastar-janela"], lrd: true, soak: true, seconds: Math.round(Number(process.env.LRD_SOAK) * 0.8) },
 ];
 const configs = process.env.LRD_SOAK ? soakConfigs : process.env.LRD_SCENARIOS ? scenarioConfigs : [
   { name: "codecLRD", args: ["--lrd"], lrd: true },
@@ -170,8 +170,20 @@ for (const bname of wanted) {
       console.log(`   memória do visualizador: ${heap.map((h) => h.v?.toFixed(1)).join(" → ")} MB`);
       console.log(`   filas internas no fim: ${JSON.stringify(last)}`);
       const problems = [];
-      if (hostSlope != null && hostSlope > 5) problems.push(`host cresce ${hostSlope.toFixed(1)} MB/min`);
-      if (heapSlope != null && heapSlope > 3) problems.push(`visualizador cresce ${heapSlope.toFixed(1)} MB/min`);
+      // Crescimento real = média do último terço − média do primeiro terço (após o aquecimento);
+      // a inclinação sozinha engana com poucos pontos (o alocador oscila ±20 MB).
+      const growth = (pts) => {
+        const p = pts.filter((x) => x.v != null);
+        if (p.length < 6) return 0;
+        const k = Math.floor(p.length / 3);
+        const mean = (a) => a.reduce((x, y) => x + y.v, 0) / a.length;
+        return mean(p.slice(-k)) - mean(p.slice(0, k));
+      };
+      const hostGrowth = growth(hostMem.filter(warm));
+      const heapGrowth = growth(heap.filter(warm));
+      console.log(`   crescimento (último terço − primeiro): host ${hostGrowth.toFixed(1)} MB · visualizador ${heapGrowth.toFixed(1)} MB`);
+      if (hostSlope != null && hostSlope > 5 && hostGrowth > 25) problems.push(`host cresce ${hostSlope.toFixed(1)} MB/min (+${hostGrowth.toFixed(0)} MB)`);
+      if (heapSlope != null && heapSlope > 3 && heapGrowth > 15) problems.push(`visualizador cresce ${heapSlope.toFixed(1)} MB/min (+${heapGrowth.toFixed(0)} MB)`);
       if ((last.videoPending ?? 0) > 5 || (last.decodeQueue ?? 0) > 5 || (last.backlog ?? 0) > 10) problems.push("filas internas crescendo");
       if (!(pg.fps >= (process.platform === "darwin" ? 8 : 20))) problems.push(`fps ${pg.fps?.toFixed(1)}`);
       rows.push([bname, cfg.name, problems.length ? "FALHOU" : "ok", "codecLRD", pg.fps?.toFixed(1), pg.freezes, `host ${hostSlope?.toFixed(2) ?? "-"} MB/min`, `visualizador ${heapSlope?.toFixed(2) ?? "-"} MB/min`, "", "", problems.join("; ")]);

@@ -215,6 +215,7 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
     let mut last_idle_tick = Instant::now();
     let mut last_cursor: Option<(u16, u16, u8, bool)> = None;
     let mut failures = 0u32;
+    let mut source_opened = Instant::now();
 
     loop {
         // ---- comandos ----
@@ -315,6 +316,7 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
                         st.source = s.name().to_string();
                     }
                     source = Some(s);
+                    source_opened = Instant::now();
                     want_keyframe = true;
                     failures = 0;
                 }
@@ -324,6 +326,15 @@ fn run(params: CaptureParams, rx: Receiver<CaptureCmd>, out: mpsc::Sender<Vec<u8
                     continue;
                 }
             }
+        }
+        // Windows: na captura com cópia (reserva), tenta voltar à captura na GPU de tempos em
+        // tempos (ela falha só enquanto o UAC/tela de bloqueio estão na frente).
+        if cfg!(target_os = "windows")
+            && source.as_ref().is_some_and(|s| s.name() == "DXGI")
+            && source_opened.elapsed() > Duration::from_secs(10)
+        {
+            source = None;
+            continue;
         }
         let src = source.as_mut().unwrap();
 
