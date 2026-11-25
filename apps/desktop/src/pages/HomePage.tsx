@@ -50,6 +50,17 @@ export function HomePage() {
   };
 
   const connectKnown = (d: DeviceRecord) => {
+    // O roteador pode trocar o IP do outro computador: se ele está anunciando na rede agora,
+    // usa o endereço anunciado; o último IP conhecido fica só como reserva.
+    const live = discovered.find((x) => x.deviceId === d.id && x.addresses.length > 0);
+    if (live) {
+      const addr = live.addresses.includes(d.lastIp ?? "") ? d.lastIp! : live.addresses[0];
+      connectTo(
+        { address: addr, port: live.port, expectedFingerprint: live.fingerprint, label: `${d.displayName} (${addr})` },
+        profile,
+      );
+      return;
+    }
     if (!d.lastIp) return toast("warning", "Endereço desconhecido; digite o IP.");
     connectTo(
       { address: d.lastIp, port: d.lastPort ?? undefined, label: `${d.displayName} (${d.lastIp})` },

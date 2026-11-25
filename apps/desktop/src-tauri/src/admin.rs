@@ -70,6 +70,8 @@ mod imp {
     /// Cópia protegida (só administradores alteram) que roda como SISTEMA.
     const AGENT_DIR: &str = r"Local Remote Desktop Agent";
     const AGENT_EXE: &str = "lrd-agent.exe";
+    /// Regra do firewall do Windows criada pelo acesso total.
+    const FW_RULE: &str = "Local Remote Desktop";
 
     fn agent_path() -> PathBuf {
         let pf = std::env::var_os("ProgramFiles").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
@@ -305,6 +307,15 @@ mod imp {
         body += &format!("\r\ncopy /Y \"{}\" \"{}\" >nul || exit /b 5", exe.display(), agent.display());
         body += &format!("\r\nschtasks /Create /TN \"{AGENT_TASK}\" /XML \"{}\" /F >nul || exit /b 6", agent_xml_path.display());
         body += &format!("\r\nschtasks /Run /TN \"{AGENT_TASK}\" >nul || exit /b 7");
+        // Firewall: o aviso da primeira abertura cria "permitir" só nas redes privadas e
+        // "bloquear" nas públicas (e bloquear vence). Se o Windows trocar o perfil da rede, o
+        // LRD para de receber conexões sem aviso. Troca as regras do programa por uma só,
+        // permitindo em qualquer perfil (só este executável).
+        body += &format!("\r\nnetsh advfirewall firewall delete rule name=all program=\"{}\" >nul 2>nul", exe.display());
+        body += &format!(
+            "\r\nnetsh advfirewall firewall add rule name=\"{FW_RULE}\" dir=in action=allow program=\"{}\" enable=yes profile=any >nul || exit /b 8",
+            exe.display()
+        );
         let r = run_elevated_script(&body);
         let _ = std::fs::remove_file(&xml_path);
         let _ = std::fs::remove_file(&agent_xml_path);
@@ -321,6 +332,7 @@ mod imp {
         body += &format!("\r\ntaskkill /F /IM {AGENT_EXE} >nul 2>nul");
         body += "\r\nping -n 2 127.0.0.1 >nul";
         body += &format!("\r\ndel /F /Q \"{}\" >nul 2>nul", agent.display());
+        // A regra do firewall fica: o LRD continua acessível como antes de ligar o acesso total.
         run_elevated_script(&body)
     }
 

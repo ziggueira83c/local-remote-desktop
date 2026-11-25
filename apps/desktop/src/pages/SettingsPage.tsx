@@ -256,7 +256,8 @@ export function SettingsPage() {
               Ligando, o LRD passa a abrir sempre como administrador (e também ao entrar no Windows), pedindo a
               confirmação do UAC só agora, uma vez. Para os pedidos de permissão, que o Windows protege até de
               programas de administrador, um assistente do sistema (uma cópia do LRD em Arquivos de Programas) cuida
-              do mouse e do teclado; só o LRD elevado consegue falar com ele.
+              do mouse e do teclado; só o LRD elevado consegue falar com ele. O firewall do Windows também passa a
+              liberar o LRD em qualquer tipo de rede (Privada ou Pública).
             </p>
             <p className="small">
               Agora: {admin.elevated ? <span className="pill pill--ok">rodando como administrador</span> : <span className="pill pill--warn">rodando sem privilégios de administrador</span>}{" "}

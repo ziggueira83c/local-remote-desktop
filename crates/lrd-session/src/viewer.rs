@@ -113,7 +113,8 @@ impl Node {
             Err(_) => {
                 self.emit_outbound_state("failed", None, None, None);
                 bail!(
-                    "Sem resposta de {addr}. Confira o IP e a porta, se o LRD está aberto no outro computador \
+                    "Sem resposta de {addr}. Confira se o LRD está aberto no outro computador, se o IP dele não \
+                     mudou (ele aparece com o IP atual em \"Na rede local\"), se a rede dele está como Privada \
                      e se o firewall permite UDP {port}."
                 )
             }
