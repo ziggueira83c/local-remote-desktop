@@ -521,9 +521,10 @@ impl Node {
                     *slot = None;
                 }
             }
-            let status = if why == "connection_lost" { "failed" } else { "closed" };
+            let lost = why == "connection_lost";
+            let status = if lost { "failed" } else { "closed" };
             let _ = node_w.storage.session_ended(&session_id, status, Some(&why));
-            node_w.events.emit(NodeEvent::OutboundEnded { session_id, reason: describe_reason(&why) });
+            node_w.events.emit(NodeEvent::OutboundEnded { session_id, reason: describe_reason(&why), lost });
         });
 
         Ok(())

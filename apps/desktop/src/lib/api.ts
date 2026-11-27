@@ -127,6 +127,7 @@ export interface AppSettings {
   enhanceStrength: number;
   passwordAccess: boolean;
   shareClipboard: boolean;
+  autoReconnect: boolean;
 }
 
 export type NodeEvent =
@@ -166,7 +167,7 @@ export type NodeEvent =
       videoCodec: string;
       audioEnabled: boolean;
     }
-  | { type: "outboundEnded"; sessionId: string; reason: string }
+  | { type: "outboundEnded"; sessionId: string; reason: string; lost: boolean }
   | { type: "webRtcOffer"; sessionId: string; sdp: string }
   | ({ type: "hostStats"; sessionId: string } & HostStats)
   | { type: "permissionsChanged"; sessionId: string; permissions: Permissions }

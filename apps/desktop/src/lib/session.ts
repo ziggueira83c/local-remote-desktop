@@ -26,12 +26,18 @@ export interface ConnectTarget {
   rememberPassword?: boolean;
 }
 
-export async function connectTo(target: ConnectTarget, profile: Profile) {
+// Última conexão bem-sucedida (só em memória), para reconectar se a rede cair.
+let lastTarget: { target: ConnectTarget; profile: Profile } | null = null;
+let reconnectRun = 0;
+
+/** Conecta; devolve `true` se a sessão abriu. `silent`: sem avisos (reconexão automática). */
+export async function connectTo(target: ConnectTarget, profile: Profile, opts: { silent?: boolean } = {}): Promise<boolean> {
   const { setProgress, toast, progress, outbound } = useStore.getState();
   if (progress || outbound) {
-    toast("warning", "Já existe uma conexão em andamento.");
-    return;
+    if (!opts.silent) toast("warning", "Já existe uma conexão em andamento.");
+    return false;
   }
+  if (!opts.silent) cancelReconnect();
   // O AudioContext precisa nascer dentro do clique do usuário (política de autoplay).
   try {
     if (!audioCtx) {
@@ -72,10 +78,61 @@ export async function connectTo(target: ConnectTarget, profile: Profile) {
       },
       channel,
     );
+    lastTarget = { target: { ...target, rememberPassword: false }, profile };
+    return true;
   } catch (e) {
     useStore.getState().setProgress(null);
     if (engine === current) endMedia();
     const msg = errorMessage(e);
-    if (!/cancel|closed_by_user|encerrada antes/i.test(msg)) toast("error", msg);
+    if (!opts.silent && !/cancel|closed_by_user|encerrada antes/i.test(msg)) toast("error", msg);
+    return false;
   }
+}
+
+const RECONNECT_FOR_MS = 5 * 60_000;
+const RECONNECT_EVERY_MS = 3000;
+
+/**
+ * A conexão caiu (rede): se a opção estiver ligada, tenta reconectar a cada 3 s por até
+ * 5 minutos, mostrando "Reconectando…".
+ */
+export async function reconnectAfterLoss(reason: string) {
+  const { toast, setReconnecting } = useStore.getState();
+  const last = lastTarget;
+  let enabled = true;
+  try {
+    enabled = (await api.getSettings()).autoReconnect;
+  } catch {
+    /* padrão: ligado */
+  }
+  if (!last || !enabled) {
+    toast("info", reason);
+    return;
+  }
+  const run = ++reconnectRun;
+  const started = Date.now();
+  let attempt = 0;
+  while (run === reconnectRun && Date.now() - started < RECONNECT_FOR_MS) {
+    attempt++;
+    setReconnecting({ label: last.target.label, attempt });
+    if (await connectTo(last.target, last.profile, { silent: true })) {
+      if (run === reconnectRun) {
+        setReconnecting(null);
+        toast("info", "Reconectado.");
+      }
+      return;
+    }
+    if (run !== reconnectRun) return;
+    await new Promise((r) => setTimeout(r, RECONNECT_EVERY_MS));
+  }
+  if (run === reconnectRun) {
+    setReconnecting(null);
+    toast("error", `Não foi possível reconectar a ${last.target.label}. Confira se o outro computador está ligado e na rede.`);
+  }
+}
+
+/** Para a reconexão automática (botão Cancelar ou nova conexão manual). */
+export function cancelReconnect() {
+  reconnectRun++;
+  useStore.getState().setReconnecting(null);
 }

@@ -9,6 +9,8 @@ import { currentEngine } from "../lib/session";
 import { useStore } from "../store";
 
 type ScaleMode = "fit" | "actual";
+/** Altura do menu + barra de título do macOS em tela cheia (px), com folga para o notch. */
+const MAC_MENU_OFFSET = 56;
 type FrameMeta = { rtpTimestamp?: number; expectedDisplayTime?: number; presentationTime?: number };
 
 export function RemoteSessionPage() {
@@ -49,6 +51,20 @@ export function RemoteSessionPage() {
     }
   });
   const [barVisible, setBarVisible] = useState(true);
+  // Mac em tela cheia: o macOS mostra o menu e a barra de título ao encostar no topo, por cima
+  // do app. A barra do LRD desce para ficar logo abaixo deles.
+  const isMac = local?.platform === "macos";
+  const [macFullscreen, setMacFullscreen] = useState(false);
+  useEffect(() => {
+    if (!isMac) return;
+    const win = getCurrentWindow();
+    const check = () => win.isFullscreen().then(setMacFullscreen).catch(() => {});
+    check();
+    const un = win.onResized(check);
+    return () => {
+      un.then((f) => f());
+    };
+  }, [isMac]);
   const barShowTimer = useRef(0);
   const barHideTimer = useRef(0);
   const hideBarSoon = useCallback((ms = 500) => {
@@ -417,19 +433,37 @@ export function RemoteSessionPage() {
     for (const hid of [...seq].reverse()) sendInput({ type: "key", hid, pressed: false });
   };
 
+  // Resumo da transmissão (painel Diagnóstico).
+  const statsText =
+    mediaMode === "webrtc"
+      ? rtc
+        ? `WebRTC · ${rtc.fps.toFixed(0)} fps · ${(rtc.kbps / 1000).toFixed(1)} Mbps · ${(rtc.rttMs ?? metrics?.rttMs ?? 0).toFixed(0)} ms${lat?.glassMs != null ? ` · atraso ${lat.glassMs.toFixed(0)} ms` : ""}${rtc.lossPct >= 0.5 ? ` · perda ${rtc.lossPct.toFixed(1)}%` : ""}`
+        : "WebRTC"
+      : mediaMode === "lrd"
+        ? `codecLRD${lrdVideo ? ` + vídeo ${lrdVideo.startsWith("hvc1") ? "H.265" : "H.264"}` : ""} · ${lrdStats ? `${lrdStats.fps.toFixed(0)} fps · ${(lrdStats.kbps / 1000).toFixed(1)} Mbps` : "—"}${lat?.glassMs != null ? ` · atraso ${lat.glassMs.toFixed(0)} ms` : ""}`
+        : `${mediaMode === "quic" ? (outbound.videoCodec === "h264" ? "H.264" : "JPEG") : "Conectando mídia"} · ${
+            metrics ? `${metrics.fps.toFixed(0)} fps · ${(metrics.kbps / 1000).toFixed(1)} Mbps · ${metrics.rttMs.toFixed(0)} ms` : "—"
+          }`;
+  const belowMenu = macFullscreen && !barPinned;
+  const barClass = [
+    "toolbar",
+    !barPinned && "toolbar--auto",
+    !barPinned && !barVisible && "toolbar--hidden",
+    belowMenu && "toolbar--below-mac-menu",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  // O painel fica abaixo da barra (fixada) e, no Mac em tela cheia, abaixo do menu do macOS.
+  const diagTop = (barPinned ? 52 : 12) + (macFullscreen ? MAC_MENU_OFFSET : 0);
+
   return (
     <div className="session" ref={sessionRef} onPointerMove={onSessionPointerMove}>
       <div
         ref={barRef}
-        className={barPinned ? "toolbar" : barVisible ? "toolbar toolbar--auto" : "toolbar toolbar--auto toolbar--hidden"}
+        className={barClass}
         onMouseEnter={() => window.clearTimeout(barHideTimer.current)}
         onMouseLeave={() => !barPinned && hideBarSoon()}
       >
-        <div className="toolbar__group">
-          <span className="toolbar__title">{outbound.remoteName}</span>
-          <span className={canControl ? "pill pill--ok" : "pill"}>{canControl ? "Controle" : "Somente visualização"}</span>
-        </div>
-
         <div className="toolbar__group">
           {outbound.displays.length > 1 && (
             <select
@@ -511,23 +545,12 @@ export function RemoteSessionPage() {
         </div>
 
         <div className="toolbar__group">
-          <span className="stats mono small" title="Quadros por segundo · banda · latência">
-            {mediaMode === "webrtc"
-              ? rtc
-                ? `WebRTC · ${rtc.fps.toFixed(0)} fps · ${(rtc.kbps / 1000).toFixed(1)} Mbps · ${(rtc.rttMs ?? metrics?.rttMs ?? 0).toFixed(0)} ms${lat?.glassMs != null ? ` · atraso ${lat.glassMs.toFixed(0)} ms` : ""}${rtc.lossPct >= 0.5 ? ` · perda ${rtc.lossPct.toFixed(1)}%` : ""}`
-                : "WebRTC"
-              : mediaMode === "lrd"
-                ? `codecLRD${lrdVideo ? ` + vídeo ${lrdVideo.startsWith("hvc1") ? "H.265" : "H.264"}` : ""} · ${lrdStats ? `${lrdStats.fps.toFixed(0)} fps · ${(lrdStats.kbps / 1000).toFixed(1)} Mbps` : "—"}${lat?.glassMs != null ? ` · atraso ${lat.glassMs.toFixed(0)} ms` : ""}`
-              : `${mediaMode === "quic" ? (outbound.videoCodec === "h264" ? "H.264" : "JPEG") : "Conectando mídia"} · ${
-                  metrics ? `${metrics.fps.toFixed(0)} fps · ${(metrics.kbps / 1000).toFixed(1)} Mbps · ${metrics.rttMs.toFixed(0)} ms` : "—"
-                }`}
-          </span>
           <button
             className={showDiag ? "btn btn--small btn--on" : "btn btn--small"}
             onClick={() => setShowDiag(!showDiag)}
-            title="Diagnóstico de desempenho"
+            title="Diagnóstico: conexão, qualidade, fps, banda e atraso"
           >
-            📊
+            📊 Diagnóstico
           </button>
           <button
             className={barPinned ? "btn btn--small btn--on" : "btn btn--small"}
@@ -618,8 +641,16 @@ export function RemoteSessionPage() {
         </div>
       </div>
       {showDiag && (
-        <div className="diag mono small">
+        <div className="diag mono small" style={{ top: diagTop }}>
           <div className="diag__title">Diagnóstico</div>
+          <div>
+            Computador: {outbound.remoteName} · {canControl ? "controle" : "somente visualização"}
+          </div>
+          <div>Recebendo: {statsText}</div>
+          <div>
+            Qualidade:{" "}
+            {{ speed: "Fluidez", balanced: "Equilibrado", quality: "Nitidez", game: "Gamer", reading: "Leitura" }[quality]} · até {fps} fps
+          </div>
           <div>Transporte: {hostStats?.transport === "webrtc" ? "WebRTC" : hostStats?.transport === "quic" ? "QUIC (reserva)" : "negociando"}</div>
           <div>Captura: {hostStats ? `${hostStats.captureSource} · ${hostStats.captureFps.toFixed(0)} quadros/s` : "—"}</div>
           <div>Codificador: {hostStats?.encoder ?? "—"}</div>

@@ -11,7 +11,7 @@ import type {
   RemoteDisplay,
 } from "./lib/api";
 import { api } from "./lib/api";
-import { currentEngine, endMedia } from "./lib/session";
+import { currentEngine, endMedia, reconnectAfterLoss } from "./lib/session";
 
 export type Page = "home" | "session" | "settings" | "history";
 
@@ -78,6 +78,8 @@ interface State {
   outbound: OutboundSession | null;
   metrics: Metrics | null;
   hostStats: HostStats | null;
+  /** Reconexão automática em andamento (a conexão caiu). */
+  reconnecting: { label: string; attempt: number } | null;
   toasts: Toast[];
   knownVersion: number;
 
@@ -85,6 +87,7 @@ interface State {
   setLocal: (l: LocalDeviceInfo) => void;
   setDiscovered: (d: DiscoveredDevice[]) => void;
   setProgress: (p: OutboundProgress | null) => void;
+  setReconnecting: (r: { label: string; attempt: number } | null) => void;
   setActiveDisplay: (id: string) => void;
   setInboundPermissions: (p: Permissions) => void;
   removeIncoming: (sessionId: string) => void;
@@ -106,6 +109,7 @@ export const useStore = create<State>((set, get) => ({
   outbound: null,
   metrics: null,
   hostStats: null,
+  reconnecting: null,
   toasts: [],
   knownVersion: 0,
 
@@ -113,6 +117,7 @@ export const useStore = create<State>((set, get) => ({
   setLocal: (local) => set({ local }),
   setDiscovered: (discovered) => set({ discovered }),
   setProgress: (progress) => set({ progress }),
+  setReconnecting: (reconnecting) => set({ reconnecting }),
   setActiveDisplay: (id) => {
     const o = get().outbound;
     if (o) set({ outbound: { ...o, activeDisplay: id } });
@@ -211,7 +216,8 @@ export const useStore = create<State>((set, get) => ({
         if (s.outbound?.sessionId === e.sessionId) {
           endMedia();
           set({ outbound: null, metrics: null, hostStats: null, page: s.page === "session" ? "home" : s.page });
-          s.toast("info", e.reason);
+          if (e.lost) reconnectAfterLoss(e.reason);
+          else s.toast("info", e.reason);
         }
         break;
       case "hostStats":

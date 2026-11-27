@@ -119,6 +119,14 @@ export function SettingsPage() {
           Texto copiado (Ctrl+C / Cmd+C) em um computador fica pronto para colar no outro, nos dois sentidos. Vale
           quando o acesso é de controle remoto; desligue aqui para não compartilhar.
         </span>
+        <label className="check">
+          <input type="checkbox" checked={s.autoReconnect} onChange={(e) => update("autoReconnect", e.target.checked)} />
+          Reconectar automaticamente se a conexão cair
+        </label>
+        <span className="field__help">
+          Se a rede oscilar ou o outro computador ficar fora do ar por um tempo, o LRD tenta reconectar a cada 3
+          segundos por até 5 minutos. Sem senha salva, o outro computador pode precisar aprovar de novo.
+        </span>
       </div>
 
       <div className="card">

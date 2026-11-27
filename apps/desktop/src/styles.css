@@ -230,6 +230,9 @@ input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px v
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
 }
 .toolbar--hidden { transform: translateY(-100%); opacity: 0; pointer-events: none; }
+/* Mac em tela cheia: abaixo do menu e da barra de título que o macOS mostra no topo. */
+.toolbar--below-mac-menu { top: 56px; border-radius: 0 0 10px 10px; }
+.toolbar--below-mac-menu.toolbar--hidden { transform: translateY(calc(-100% - 56px)); }
 @media (prefers-reduced-motion: reduce) { .toolbar--auto { transition: none; } }
 .toolbar__group { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .toolbar__title { font-weight: 600; }

@@ -1,4 +1,5 @@
 import { api } from "../lib/api";
+import { cancelReconnect } from "../lib/session";
 import { useStore } from "../store";
 
 const LABEL: Record<string, string> = {
@@ -10,12 +11,35 @@ const LABEL: Record<string, string> = {
 
 export function ConnectingDialog() {
   const progress = useStore((s) => s.progress);
-  if (!progress) return null;
+  const reconnecting = useStore((s) => s.reconnecting);
+  if (!progress && !reconnecting) return null;
 
   const cancel = () => {
+    cancelReconnect();
     api.disconnect().catch(() => {});
     useStore.getState().setProgress(null);
   };
+
+  // Reconexão automática: entre as tentativas (ou tentando sem precisar de aprovação).
+  if (reconnecting && (!progress || progress.state === "connecting" || progress.state === "failed")) {
+    return (
+      <div className="modal-backdrop">
+        <div className="modal modal--narrow" role="dialog" aria-modal="true">
+          <div className="spinner" aria-hidden />
+          <h2 className="modal__title">Conexão perdida · reconectando…</h2>
+          <p className="muted">
+            {reconnecting.label} · tentativa {reconnecting.attempt}
+          </p>
+          <div className="modal__actions">
+            <button className="btn btn--ghost" onClick={cancel}>
+              Cancelar
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+  if (!progress) return null;
 
   return (
     <div className="modal-backdrop">

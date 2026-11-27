@@ -53,6 +53,8 @@ pub struct AppSettings {
     pub password_access: bool,
     /// Copiar e colar texto entre os computadores durante a sessão.
     pub share_clipboard: bool,
+    /// Se a conexão cair, tentar reconectar sozinho.
+    pub auto_reconnect: bool,
 }
 
 impl Default for AppSettings {
@@ -71,6 +73,7 @@ impl Default for AppSettings {
             enhance_strength: 0.5,
             password_access: false,
             share_clipboard: true,
+            auto_reconnect: true,
         }
     }
 }
@@ -141,6 +144,8 @@ pub enum NodeEvent {
     OutboundEnded {
         session_id: String,
         reason: String,
+        /// A conexão caiu (rede), em vez de ser encerrada por alguém: dá para reconectar.
+        lost: bool,
     },
     /// Diagnóstico do computador acessado (a cada segundo).
     HostStats {
